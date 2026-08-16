@@ -38,8 +38,15 @@ if (-not $GoExe) {
     }
 }
 
-# -- build -------------------------------------------------------------------
-& $GoExe build -ldflags '-X main.BuildVersion=smoke' -o chainsmoke.exe .
+# -- vet + build -------------------------------------------------------------
+# vet first: the whole module, so a broken pkg/* is caught here rather than
+# silently excluded because only ./cmd/chainsmoke gets compiled.
+& $GoExe vet ./...
+if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go vet failed (output above).'; exit 2 }
+
+# The entry point moved to cmd/chainsmoke when main.go was split into cmd/+pkg/
+# (T0.4). Building '.' now fails with "no Go files in <repo root>".
+& $GoExe build -ldflags '-X main.BuildVersion=smoke' -o chainsmoke.exe .\cmd\chainsmoke
 if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go build failed (output above).'; exit 2 }
 
 # -- case table: args / stdin / expected exit / expected output substring ----
@@ -64,7 +71,24 @@ $cases = @(
     @{ Name = 'purge-ok';     Args = @('purge');             Exit = 0; Match = '' },
     @{ Name = 'stop-ok';      Args = @('stop');              Exit = 0; Match = '' },
     # urfave/cli exits 3 (not 1) for unknown commands
-    @{ Name = 'unknown-verb'; Args = @('bogus');             Exit = 3; Match = 'No help topic' }
+    @{ Name = 'unknown-verb'; Args = @('bogus');             Exit = 3; Match = 'No help topic' },
+
+    # -- Phase 1A regression cases (T1.1-T1.7) --------------------------------
+    # T1.1: search establishes the chokepoint before the resolver runs. With no
+    # proxy up, that surfaces as the DIRECT warning — proof Up() was called at
+    # all, which it previously was not for this verb.
+    @{ Name = 'search-egress'; Args = @('search', 'roshina'); Exit = 1; Match = 'NOT anonymized' },
+    # T1.2: --proxy is actually wired into the bridge now. Port 9 is the
+    # discard port: reliably refuses, no network egress, deterministic offline.
+    # Before this fix the flag was parsed by urfave/cli and then ignored.
+    @{ Name = 'proxy-wired';   Args = @('--proxy', 'http://127.0.0.1:9', 'play', '1'); Exit = 1; Match = 'not reachable' },
+    # T1.5: strconv.Atoi rejects an out-of-range index instead of the old
+    # accumulator silently wrapping it to a negative number.
+    @{ Name = 'index-overflow'; Args = @('play', '99999999999999999999'); Exit = 1; Match = 'out of range' },
+    # Input validation on the transport verbs: mpv must never receive an empty
+    # or non-numeric argument (cli-developer: "validate user input early").
+    @{ Name = 'seek-arity';    Args = @('seek');              Exit = 1; Match = 'usage' },
+    @{ Name = 'vol-range';     Args = @('vol', '900');        Exit = 1; Match = '0-100' }
 )
 
 # -- run ---------------------------------------------------------------------

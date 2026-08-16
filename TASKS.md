@@ -41,6 +41,7 @@ behavior also flips the corresponding expectation in
   6. **Phase 10:** the TUI is a *second front-end over the same runtime store*,
      never the source of truth. It may cache in memory for rendering, but one-shot
      `play N` and an open TUI must always resolve against the same result set.
+     **dev's conclusion: approved, fixed**
 - **T0.2 — Define fail-closed egress semantics.** Write down the contract:
   no Resolver/Player call may run unless `Net.Up()` has *verified* the
   bridge accepts CONNECTs. Decide enforcement (resolver constructed only
@@ -50,6 +51,7 @@ behavior also flips the corresponding expectation in
   reference (fix nothing except annotating known bugs), and port lessons
   into Go. If instead it stays a *working* prototype, Phase 1B becomes
   mandatory.
+  **dev's conclusion: approved !- *freeze the script but keep it for future references for golang*** 
 - **T0.4 — Repo hygiene.** `git init` + first commit; split `main.go` into
   the planned `cmd/` + `pkg/{net,resolver,player,scrub,store}` layout
   (move code verbatim, no behavior change); one `gofmt` commit. **dev's conclusion: fixed**

@@ -3,12 +3,13 @@ name: run-chainsmoke
 description: Build, run, and test chainsmoke, the privacy-focused SoundCloud Go CLI in this repo. Use when asked to run, start, build, launch, or test the app, verify CLI behavior, or re-check the verb baseline after implementing a subsystem. Make sure to read the Gotchas section.
 ---
 
-`chainsmoke` is a privacy-focused SoundCloud CLI over Tor. The unit is
-`main.go` — a Go carcass whose CLI surface (verbs, flags, stdin contract) is
-real but whose subsystems (net/resolver/player/scrub) are `ErrNotImplemented`
-stubs. Drive it via `.claude\skills\run-chainsmoke\smoke.ps1`, which builds
-`chainsmoke.exe` and asserts the current behavior baseline. `script.sh` is the
-Linux-only bash prototype — **unrunnable on this machine**, see Gotchas.
+`chainsmoke` is a privacy-focused SoundCloud CLI over Tor. The entry point is
+`cmd/chainsmoke/main.go` — CLI surface and wiring only — over `pkg/{core,net,
+resolver,player,scrub,store}`, whose subsystems are still largely
+`ErrNotImplemented` stubs. Drive it via
+`.claude\skills\run-chainsmoke\smoke.ps1`, which vets, builds `chainsmoke.exe`,
+and asserts the current behavior baseline. `script.sh` is the frozen bash
+prototype (T0.3) — reference only, never edited to fix bugs.
 
 All commands below are PowerShell, run from the repo root.
 
@@ -53,9 +54,13 @@ go mod tidy
 
 ## Build
 
+The build target is `.\cmd\chainsmoke`, **not** `.` — the repo root has held no
+Go files since the T0.4 split, and `go build .` fails with `no Go files in
+<repo root>`.
+
 ```powershell
 $env:Path = "$env:LOCALAPPDATA\go-portable\go\bin;$env:Path"   # skip if go is on PATH
-go build -o chainsmoke.exe .
+go build -o chainsmoke.exe .\cmd\chainsmoke
 .\chainsmoke.exe --version
 # → chainsmoke version development
 ```
@@ -63,10 +68,12 @@ go build -o chainsmoke.exe .
 Release-style version stamp (works, verified):
 
 ```powershell
-go build -ldflags "-X main.BuildVersion=0.0.1" -o chainsmoke.exe .
+go build -ldflags "-X main.BuildVersion=0.0.1" -o chainsmoke.exe .\cmd\chainsmoke
 ```
 
-`chainsmoke.exe` lands in the repo root.
+`chainsmoke.exe` lands in the repo root. Note `go build .\cmd\chainsmoke`
+compiles only that package's dependency graph — run `go vet ./...` (as smoke.ps1
+now does first) to catch a broken `pkg/*` that nothing imports yet.
 
 ## Run (agent path)
 
@@ -75,7 +82,7 @@ and output against the current baseline:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .claude\skills\run-chainsmoke\smoke.ps1
-# → PASS x10, "smoke: all 10 cases pass", exit 0
+# → PASS x16, "smoke: all 16 cases pass", exit 0
 ```
 
 **When you implement a subsystem, flip the corresponding expectations in the
@@ -87,13 +94,15 @@ Verified behavior baseline (what the carcass does today):
 |---|---|---|
 | `.\chainsmoke.exe --help` | 0 | full command/flag table |
 | `.\chainsmoke.exe --version` | 0 | `chainsmoke version development` |
-| `.\chainsmoke.exe search kendrick` | 1 | `not implemented` + a (misleading, see Gotchas) `yt-dlp -U` hint (Search still stubbed) |
+| `.\chainsmoke.exe search kendrick` | 1 | DIRECT warning (T1.1: `Up()` now runs first), then bare `not implemented` — the `yt-dlp -U` hint is correctly suppressed for stubs (T1.7) |
 | `.\chainsmoke.exe np`, `toggle` | 1 | `chainsmoke: not implemented` (no IPC daemon in the raw player) |
-| `.\chainsmoke.exe play 1` | 1 | `net.Up` warns DIRECT (no proxy), then `no cached result #1` — the store is empty until you `search`. No egress. |
+| `.\chainsmoke.exe play 1` | 1 | `net.Up` warns DIRECT (no proxy), then `no cached result #1 — run \`chainsmoke search <term>\` first`. No egress. |
+| `.\chainsmoke.exe --proxy http://127.0.0.1:9 play 1` | 1 | `--proxy ... not reachable` — proves the flag reaches the bridge (T1.2) |
 | `.\chainsmoke.exe daemon start` | 0 | `Ensure()` finds mpv on PATH and returns nil (raw player has no real daemon yet) |
 | `"https://soundcloud.com/artist/track" \| .\chainsmoke.exe get` | 1 | stdin URL is read (no-URLs-in-argv contract), then dies in the scrubber stub |
 | `.\chainsmoke.exe purge`, `.\chainsmoke.exe stop` | 0 | silent success (memStore purge / player.Down are real no-ops) |
-| `.\chainsmoke.exe audit` | 1 | prints `egress: <down>` + version, then SelfTest reports DIRECT (no proxy to test) |
+| `.\chainsmoke.exe audit` | 1 | `Up()` runs first (T7.1 posture is probed, not printed from config), so it warns DIRECT, prints `egress: DIRECT (no proxy)` + runtime dir + version, then SelfTest fails with "egress is DIRECT" |
+| `.\chainsmoke.exe seek` / `vol 900` | 1 | arity/range rejected before mpv ever sees the argument |
 | `.\chainsmoke.exe bogus` | 3 | `No help topic for 'bogus'` |
 
 Raw `play` is implemented: `net.Up` (detect Privoxy `:8118` / `--proxy`, else
@@ -107,11 +116,12 @@ tor+privoxy are up), so it is not part of the offline smoke baseline.
 Most PRs here implement a stub. Find what's left with:
 
 ```powershell
-findstr /n "ErrNotImplemented" main.go
+findstr /s /n "ErrNotImplemented" cmd\*.go pkg\*.go
 ```
 
-Then `go vet` + the smoke driver are the inner loop; there is no way to reach
-SoundCloud until `pkg/net` + `pkg/resolver` exist.
+Then `go vet ./...` + the smoke driver are the inner loop. Real egress needs
+tor+privoxy on :9050/:8118; without them every verb falls back to DIRECT with a
+warning.
 
 ## Test
 
@@ -121,30 +131,47 @@ go test ./...   # → "?  chainsmoke  [no test files]" — no tests exist yet
 ```
 
 ## Gotchas
-- **The `search` failure hint lies while the resolver is a stub.** `Search` is
-  still `ErrNotImplemented`; the error appends "SoundCloud extractor may be
-  stale — run: yt-dlp -U", but the real cause is the stub. Don't chase yt-dlp.
-  (`Stream`, which raw `play` uses, IS implemented.)
-- **`audit` reporting `egress: <down>` is not a regression** — `audit` never
-  calls `net.Up()`, so the proxy field is empty by design (today).
-- **Unknown verbs exit 3, not 1** (urfave/cli's `CommandNotFound` path).
-- **`gofmt -l .` flags `main.go` as-written.** Don't let an editor reformat
-  the whole file inside an unrelated change; `go vet` is clean.
-- **The raw `play` path DOES work on native Windows** (foreground
-  `mpv --no-video <resolved-url>`, no IPC socket) with mpv+yt-dlp on PATH — it
-  is not gated on Tor (falls back to a DIRECT, non-anonymized connection with a
-  warning; TASKS.md T0.2 wants that flipped to fail-closed before shipping).
-  What still **won't** work on native Windows is the *IPC daemon* model —
-  `np`/`toggle`/`seek` and the future Phase-5 player speak mpv JSON-IPC over a
-  unix socket at `$XDG_RUNTIME_DIR/chainsmoke/mpv.sock`; on Windows mpv IPC uses
-  named pipes, so that development targets Linux/WSL.
+- **Build `.\cmd\chainsmoke`, never `.`** — see Build. This is the single most
+  common way to think the tree is broken when it isn't.
+- **`go build` alone does not prove the module is sound.** It only compiles the
+  target's import graph, so an unreferenced or malformed `pkg/*` file slips
+  through. `go vet ./...` is the check that covers everything; smoke.ps1 runs it
+  before building for exactly this reason.
+- **`search` no longer lies about yt-dlp.** `Search` is still
+  `ErrNotImplemented`, and `core.YtdlpHint` now suppresses the "run: yt-dlp -U"
+  advice for stub errors (T1.7). A bare `not implemented` is correct output.
+- **`search` → `play N` cannot work yet, by design.** Under T0.1(a) the two
+  verbs are separate short-lived processes and the default store is in-memory,
+  so results never survive. This is T4.1 (runtime store), not a bug to chase.
+- **Unknown verbs exit 3, not 1** (urfave/cli's `CommandNotFound` path). Every
+  other failure is exit 1 — there is no MISUSE/NOT_FOUND differentiation yet.
+- **The banner prints on stdout for every verb**, before argument parsing. It
+  pollutes pipes and corrupts `--generate-bash-completion`. Known, deliberate,
+  and owned by T10.1/T10.2 — do not "fix" it in an unrelated change.
+- **The raw `play` path works on native Windows** (foreground
+  `mpv --no-video <resolved-url>`, no IPC socket) with mpv+yt-dlp on PATH. It is
+  not gated on Tor: it falls back to a DIRECT, non-anonymized connection with a
+  warning (TASKS.md T0.2 wants that flipped to fail-closed before shipping).
+- **mpv JSON-IPC works on BOTH targets** — unix socket under WSL, named pipe
+  (`\\.\pipe\chainsmoke-mpv`) on native Windows; verified against mpv 0.41 with
+  a live `get_property` round-trip. Same protocol, different dial. `core.SocketPath()`
+  already returns the right endpoint per platform; the Phase-5 client must
+  abstract the dial (T10.7) rather than assume `net.Dial("unix", ...)`.
 
 ## Troubleshooting
 
 - **`go : The term 'go' is not recognized`**: no Go on PATH. Run the portable
   bootstrap in Prerequisites (needs no admin), or pass the toolchain
   explicitly: `smoke.ps1 -GoExe <path-to-go.exe>`.
-- **`wsl -d Ubuntu-26.04` fails mounting `ext4.vhdx` (ERROR_PATH_NOT_FOUND)**:
-  the distro's virtual disk is gone; every WSL-based path (including
-  `bash.exe`) is dead until the distro is reinstalled. Don't attempt a WSL
-  repair as part of running this app.
+- **`no Go files in D:\sccli`**: you built `.` instead of `.\cmd\chainsmoke`.
+- **`expected 'package', found 'EOF'`**: an empty `.go` file somewhere under
+  `pkg/`. `go build .\cmd\chainsmoke` may still succeed while `go vet ./...`
+  fails — trust vet.
+- **WSL works** (Ubuntu-26.04, kernel 6.18, `ext4.vhdx` present) and carries
+  `go`, `mpv`, `yt-dlp`, `ffmpeg`, `curl`. It is the target for unix-socket IPC
+  work: `wsl -e bash -c "cd /mnt/d/sccli && go vet ./..."`. Note
+  `XDG_RUNTIME_DIR` is **unset** there and the default user is uid 0, so
+  `core.RuntimeDir()` resolves via the `/run/user/0` fallback — that path is
+  exercised on every WSL run, not just in theory.
+- **`git` is not on the native Windows PATH.** Reach it through WSL:
+  `wsl -e bash -c "cd /mnt/d/sccli && git status"`.
