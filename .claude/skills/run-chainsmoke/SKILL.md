@@ -121,14 +121,6 @@ go test ./...   # → "?  chainsmoke  [no test files]" — no tests exist yet
 ```
 
 ## Gotchas
-
-- **`script.sh` cannot run on this machine.** It needs bash plus
-  mpv/yt-dlp/ffmpeg/jq/socat/tor/privoxy. The only `bash.exe` here is WSL's,
-  and the registered WSL distro (Ubuntu-26.04) fails to start — its
-  `ext4.vhdx` is missing (`Wsl/Service/CreateInstance/MountDisk/HCS/`
-  `ERROR_PATH_NOT_FOUND`). Git (and Git Bash) is not installed either. Also
-  note `deps_check` runs before *every* verb, so even `script.sh help` would
-  demand the full dependency stack.
 - **The `search` failure hint lies while the resolver is a stub.** `Search` is
   still `ErrNotImplemented`; the error appends "SoundCloud extractor may be
   stale — run: yt-dlp -U", but the real cause is the stub. Don't chase yt-dlp.

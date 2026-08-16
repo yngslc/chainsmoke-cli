@@ -46,7 +46,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go build failed (output above).'; 
 $cases = @(
     @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version' },
     @{ Name = 'help';         Args = @('--help');            Exit = 0; Match = 'privacy-focused SoundCloud CLI' },
-    @{ Name = 'search-stub';  Args = @('search', 'kendrick'); Exit = 1; Match = 'not implemented' },
+    @{ Name = 'search-stub';  Args = @('search', 'roshina'); Exit = 1; Match = 'not implemented' },
     # With mpv+yt-dlp installed, play/daemon clear the tool checks. `play 1` then
     # fails in the store (empty cache) BEFORE any egress — deterministic, no
     # network. `daemon start` = Ensure() = mpv present, so it now succeeds.

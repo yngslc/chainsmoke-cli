@@ -1,16 +1,18 @@
 // =============================================================================
-//  cmd/main.go — `chainsmoke`, a privacy-focused SoundCloud CLI (Go CARCASS)
+//  cmd/chainsmoke/main.go — `chainsmoke`, a privacy-focused SoundCloud CLI (MAIN ENTRYPOINT)
 // -----------------------------------------------------------------------------
-//  This is the shippable counterpart to script.sh. The bash prototype proves the
-//  pipeline; this is the single static binary you actually ship (CGO_ENABLED=0).
+//  This is the main file of this project.
 //
 //  Layout it grows into (mirrors timoknapp/soundcloud-cli):
-//    cmd/main.go            <- this file: CLI surface + wiring only
-//    pkg/net/               <- Tor+Privoxy bridge, proxy env, NEWNYM, DNS self-test
-//    pkg/resolver/          <- the ONE egress chokepoint: yt-dlp wrapper (meta+stream)
-//    pkg/player/            <- mpv daemon + JSON-IPC client over the unix socket
-//    pkg/scrub/             <- ffmpeg +bitexact -> mutagen -> xattr -> mat2
-//    pkg/store/             <- Store interface, memory + disk backends
+//    cmd/chainsmoke/main.go            <- this file: CLI surface + wiring only
+//    pkg/net/bridge.go              <- Tor+Privoxy bridge, proxy env, NEWNYM, DNS self-test
+//    pkg/resolver/ytdlp.go          <- the ONE egress chokepoint: yt-dlp wrapper (meta+stream)
+//    pkg/player/mpv.go            <- mpv daemon + JSON-IPC client over the unix socket
+//    pkg/scrub/ffmpeg.go             <- ffmpeg +bitexact -> mutagen -> xattr -> mat2
+//    pkg/store/store.go             <- Store interface, memory + disk backends
+//    pkg/core/core.go               <- shared Track model, helpers, 5 interfaces and any cross-cutting concerns
+//    cmd/chainsmoke/tui.go                <- TUI for search/np table, progress bars, etc. (not yet wired)
+// The main() wiring is final; the concrete impls are stubs returning ErrNotImplemented
 //
 //  Load-bearing invariants (retrofitting any of these is a rewrite):
 //    1. ONE Store interface, two backends. Every persisted byte goes through it.

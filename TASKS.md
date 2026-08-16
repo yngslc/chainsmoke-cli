@@ -9,36 +9,54 @@ behavior also flips the corresponding expectation in
 
 ## Phase 0 — Decisions & groundwork (gates everything else)
 
-- **T0.1 — Decide the process model.** Short-lived `chainsmoke` invocations cannot
-  own an in-process result cache or a preload-ahead goroutine. Pick one:
-  (a) *mpv is the only daemon* (bash model): results cache lives in
-  `$XDG_RUNTIME_DIR/chainsmoke` (tmpfs), preload-ahead becomes "enqueue N+1
-  synchronously before exiting" or an mpv event hook; or
-  (b) a small `chainsmoke daemon` that owns cache + queue + preload.
-  Everything in Phases 4–5 depends on this choice.
-  **Revisit under the TUI decision (Phase 10):** the TUI is itself a long-lived
-  foreground process, so *while it is open* it can own the result cache, the
-  queue, and preload-ahead in memory — the very things (a)/(b) exist to solve.
-  That makes a third option viable: (c) *the TUI is the session owner*, and the
-  one-shot verbs keep using the runtime-dir store (T4.1) so both front-ends stay
-  consistent. Note (c) does not remove the need for T4.1 — one-shot
-  `search` → `play N` across two processes still needs on-disk results.
+- **T0.1 — Process model. DECIDED 2026-08-16: option (a), mpv is the only daemon**
+  (the bash model). `chainsmoke` invocations stay short-lived and own no state
+  between runs; the result cache lives in `$XDG_RUNTIME_DIR/chainsmoke` (tmpfs)
+  and mpv is the single long-lived process. Options (b) *a `chainsmoke daemon`*
+  and (c) *the TUI is the session owner* are **rejected**.
+  *Why:* (b) means writing, supervising, and securing a second daemon that does
+  strictly less than the one we already depend on — mpv is already long-lived,
+  already supervised, and already speaks a documented JSON-IPC protocol. That
+  protocol is confirmed working on both dev targets (unix socket under WSL,
+  named pipe on native Windows — see T0.5), so (a) costs no portability.
+
+  Binding consequences — these stop being options:
+  1. **No in-process state survives an invocation.** The preload goroutine at
+     `main.go:259` is dead code: a goroutine dies the instant `main()` returns,
+     unlike bash `&` (script.sh:237), which forks a process that outlives its
+     parent. The idiom was ported; its semantics were not.
+  2. **T4.1 (runtime store) is now mandatory and load-bearing**, not a default
+     among alternatives. One-shot `search` → `play N` spans two processes and has
+     nowhere else to keep results.
+  3. **T1.4 (XDG_RUNTIME_DIR fallback) is a prerequisite for T4.1**, since it
+     resolves the path the store lives at. WSL ships with the var *unset*
+     (verified), so the `/run/user/$UID` fallback is on the primary dev path,
+     not an edge case.
+  4. **T5.4 resolves to: enqueue N+1 synchronously before exit.** Simplest
+     correct option, no new machinery. Escalate to an mpv event hook
+     (`observe_property` on `playlist-pos`) only if the synchronous resolve makes
+     track boundaries audibly gappy. Delete the goroutine either way.
+  5. **The `daemon start|stop|status` verbs (`main.go:236`) stay** — under (a)
+     they manage *mpv*, which is precisely their job. They are not vestigial (b).
+  6. **Phase 10:** the TUI is a *second front-end over the same runtime store*,
+     never the source of truth. It may cache in memory for rendering, but one-shot
+     `play N` and an open TUI must always resolve against the same result set.
 - **T0.2 — Define fail-closed egress semantics.** Write down the contract:
   no Resolver/Player call may run unless `Net.Up()` has *verified* the
   bridge accepts CONNECTs. Decide enforcement (resolver constructed only
   from a live Net handle; refuse-to-run otherwise). "Proxy env exported"
-  is not the invariant — "traffic cannot leave except through the bridge" is.
+  is not the invariant — "traffic cannot leave except through the bridge" is. **dev's conclusion: fixed**
 - **T0.3 — Decide the fate of script.sh.** Recommended: freeze it as a
   reference (fix nothing except annotating known bugs), and port lessons
   into Go. If instead it stays a *working* prototype, Phase 1B becomes
   mandatory.
 - **T0.4 — Repo hygiene.** `git init` + first commit; split `main.go` into
   the planned `cmd/` + `pkg/{net,resolver,player,scrub,store}` layout
-  (move code verbatim, no behavior change); one `gofmt` commit.
+  (move code verbatim, no behavior change); one `gofmt` commit. **dev's conclusion: fixed**
 - **T0.5 — Dev/test environment for playback.** Native Windows can never run
   the player (unix socket IPC) and local WSL is broken (missing ext4.vhdx).
   Options: repair/reinstall WSL, a Linux box, or Linux CI. Needed by
-  Phase 2+ integration testing; the pure-Go unit tests don't need it.
+  Phase 2+ integration testing; the pure-Go unit tests don't need it. **dev's conclusion: fixed**
 
 ## Phase 1 — Correctness fixes in the existing carcass (cheap, do before subsystems)
 
@@ -73,6 +91,41 @@ behavior also flips the corresponding expectation in
   restructure) instead of dying under `set -e`.
 - **T1.15** `player_up`: liveness probe (IPC round-trip) instead of
   socket-file existence; remove stale sockets.
+
+<!-- ------------------------------------------------------------------------ -->
+<!-- Local reference only — NOT tasks. Do not assign T-numbers to these.       -->
+<!-- ------------------------------------------------------------------------ -->
+
+> #### Reference: `shellcheck script.sh` (run 2026-08-15) — 4 findings, regrouped
+>
+> Verdict: **clean**. Zero errors, four warnings, and nothing shellcheck found is
+> a new bug. It corroborates the hand-written T1.x inventory rather than extending
+> it, which is what makes the T0.3 freeze safe.
+>
+> **Covered by an existing task**
+>
+> - `SC2046` line 135 — `$(_impersonate_args)` unquoted, in `resolve_meta` → **T1.11's function.**
+> - `SC2046` line 257 — same expression, in `cmd_get` → **T1.10's function.**
+>
+> **No task owns these**
+>
+> - `SC2046` line 144 — same expression, in `resolve_stream`. 1B has no
+>   `resolve_stream` item; this is the only orphan of the four.
+> - `SC2034` line 44 — `TOR_CTRL_PORT` unused. Not a defect: `net_rotate()`
+>   (script.sh:106) is a `TODO(impl)` stub and its only consumer is commented out
+>   on line 109. The warning is *evidence the stub is still a stub*. Already
+>   implemented on the Go side (`torCtrlAddr`, main.go:330) → **T2.4**.
+>
+> **On the three SC2046 hits:** one defect in three places, and the unquoted
+> expansion is *deliberate* — `_impersonate_args` (script.sh:129) emits two
+> newline-separated words and relies on word splitting to become two argv items.
+> Quoting it, as shellcheck suggests, would collapse it into the single argument
+> `"--impersonate chrome"` and break yt-dlp. The correct bash fix is an array,
+> not a quote. Left as-is under the freeze.
+>
+> **Lesson for the port → T3.4:** this bug class cannot exist in Go.
+> `exec.Command` takes a `[]string`, so argv boundaries are explicit and no
+> value of `CS_IMPERSONATE` (spaces, globs, empty) can change the argument count.
 
 ## Phase 2 — pkg/net (spec ordering: network before playback)
 
