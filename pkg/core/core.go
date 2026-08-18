@@ -56,11 +56,21 @@ type Playlist struct {
 // Net is the egress seam. Up() must establish the proxy BEFORE any Resolver or
 // Player call. Swap the concrete impl (bridge <-> netns) without touching callers.
 type Net interface {
-	Up() error       // start Tor+Privoxy bridge, export proxy env, block until ready
+	Up() error       // bring egress up and VERIFY it; error means no traffic may leave
 	Down() error     // tear down anything we own
 	Rotate() error   // NEWNYM: new Tor circuit (rate-limited by Tor)
-	SelfTest() error // assert no plaintext DNS leaks for soundcloud hosts
+	SelfTest() error // probe the live path (audit calls this, T7.1)
 	ProxyURL() string
+
+	// Assert is the fail-closed gate (T0.2). Every method that causes a network
+	// call must call it first and refuse on error. Having it on the interface is
+	// what makes the invariant enforceable rather than documented — a fake Net in
+	// a unit test has to answer the same question a real one does.
+	Assert() error
+
+	// Verified reports whether the path was proven private, as opposed to merely
+	// permitted. Assert can pass while this is false (--allow-direct).
+	Verified() bool
 }
 
 // Resolver is the ONLY component that talks to SoundCloud. Wraps yt-dlp.
@@ -156,18 +166,27 @@ func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
 		// silently falling through to a stdin read: argv is visible to other
 		// processes (Linux /proc, Windows Win32_Process), so URLs ride on
 		// stdin only (invariant #3 / TASKS.md T1.3).
+		// Note the ordering: the prompt is listed first because it is the only
+		// route that leaks nothing. Piping keeps the URL out of argv but still
+		// writes it to the shell's history file, so it is the fallback for
+		// scripts, not the recommendation for humans.
 		return Track{}, fmt.Errorf(
-			"URLs go on stdin, not argv (argv is visible in the OS process list) — pipe it instead:\n"+
-				"  echo %q | chainsmoke play", arg)
+			"URLs are not accepted in argv — the OS process list is world-readable,\n"+
+				"and this one already reached it. Treat %q as exposed.\n\n"+
+				"  chainsmoke play              # prompts; leaks neither argv nor shell history\n"+
+				"  chainsmoke play < url.txt    # for scripts\n"+
+				"  chainsmoke search <term> && chainsmoke play 1   # no URL anywhere (needs T4.1)",
+			arg)
 	}
-	// Fail fast on an interactive terminal. Without this the ReadString below
-	// blocks forever with no prompt and no output, which reads as a hung or
-	// crashed CLI rather than as "this verb wants stdin".
+	// On an interactive terminal, prompt instead of blocking silently — a bare
+	// ReadString here looks like a hung CLI. The prompt is also the most
+	// private way in: typing a URL at it puts the URL in neither argv (visible
+	// via /proc) nor the shell's history file. Piping achieves the first but
+	// not the second.
+	//
+	// The prompt goes to stderr so `chainsmoke play | ...` keeps a clean stdout.
 	if a.Stdin == nil && stdinIsTerminal() {
-		return Track{}, errors.New(
-			"no result index given, and stdin is a terminal — pass an index or pipe a URL:\n" +
-				"  chainsmoke search <term>   then   chainsmoke play 1\n" +
-				"  echo \"https://soundcloud.com/artist/track\" | chainsmoke play")
+		fmt.Fprint(os.Stderr, "URL (stays out of argv and shell history): ")
 	}
 	line, err := bufio.NewReader(a.stdin()).ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -225,12 +244,34 @@ func (a *App) EnqueueAhead(entries []Track) error {
 	return nil
 }
 
-// Audit prints the runtime privacy posture. Everything it reports is probed at
-// runtime, never read back from config (TASKS.md T7.1).
+// DNSAuditor is optionally implemented by a Net that can report what the local
+// resolver is able to observe (T2.5). Optional because it is a property of the
+// bridge implementation, not of the egress contract — a netns-based Net would
+// have nothing to say here.
+type DNSAuditor interface {
+	AuditLocalDNS() (visible bool, lines []string)
+}
+
+// Audit prints the runtime privacy posture. Everything it reports is PROBED at
+// runtime, never read back from config (TASKS.md T7.1) — that distinction is
+// the whole point of the verb.
 func (a *App) Audit() error {
-	fmt.Fprintf(a.out(), "egress:      %s\n", a.Net.ProxyURL())
+	posture := "DIRECT ⚠  (not anonymized)"
+	if a.Net.Verified() {
+		posture = "TOR ✓  (verified by a live CONNECT)"
+	}
+	fmt.Fprintf(a.out(), "egress:      %s\n", posture)
+	fmt.Fprintf(a.out(), "proxy:       %s\n", a.Net.ProxyURL())
 	fmt.Fprintf(a.out(), "runtime dir: %s\n", RuntimeDir())
 	fmt.Fprintf(a.out(), "version:     %s\n", a.Version)
+
+	if d, ok := a.Net.(DNSAuditor); ok {
+		_, lines := d.AuditLocalDNS()
+		fmt.Fprintln(a.out(), "local DNS:")
+		for _, ln := range lines {
+			fmt.Fprintf(a.out(), "  %s\n", ln)
+		}
+	}
 	return a.Net.SelfTest()
 }
 

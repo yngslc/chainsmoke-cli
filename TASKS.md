@@ -1,8 +1,9 @@
 # chainsmoke — development plan
 
-Ordered task list. `main.go` is the shippable unit; `script.sh` is the
-reference prototype. Rule of thumb throughout: every task that changes CLI
-behavior also flips the corresponding expectation in
+Ordered task list. `cmd/chainsmoke` over `pkg/*` is the shippable unit;
+`script.sh` is a frozen reference (T0.3) and is never run or fixed. Rule of
+thumb throughout: every task that changes CLI behavior also flips the
+corresponding expectation in
 `.claude/skills/run-chainsmoke/smoke.ps1` (the wiring-regression harness).
 
 ---
@@ -80,7 +81,22 @@ behavior also flips the corresponding expectation in
 - **T1.7 — Honest stub errors.** Only append the "run: yt-dlp -U" hint for
   real resolver failures, never for `ErrNotImplemented`.
 
-### 1B — Bash (only if T0.3 keeps it alive)
+### 1B — Bash — CLOSED, none of these will be done (T0.3)
+
+T0.3 froze `script.sh` as a reference. These eight were explicitly conditional
+on it staying a *working* prototype, and it isn't — so they are closed, not
+pending. **Do not implement any of them.** They stay in the file because each
+names a real bug whose lesson is already carried by a Go task, and the Go tasks
+back-reference these numbers:
+
+`T1.8 -> T4.3` (--private inside the store) · `T1.9 -> T4.4/T5.1` ·
+`T1.10 -> T6.1/T6.2` · `T1.11 -> T3.1` (webpage_url) · `T1.12` no owner (Go uses
+`net/http`, curl is not a dependency) · `T1.13 -> T4.4` · `T1.14 -> T5.3`
+(skip-not-abort) · `T1.15 -> T5.1` (liveness probe).
+
+The `shellcheck` block below closes with the same verdict: nothing it found was
+a new bug, which is what made the freeze safe.
+
 - **T1.8** `results_write`: real `CS_PRIVATE` guard (`[[ $CS_PRIVATE == 1 ]] && return 0`).
 - **T1.9** `cleanup()`: implement the ephemeral wipe (and only kill an mpv we own).
 - **T1.10** `cmd_get`: don't pre-create the output file (mktemp -u a dir, let
@@ -133,18 +149,35 @@ behavior also flips the corresponding expectation in
 
 - **T2.1** Tor lifecycle: detect a listening system tor on 9050; else spawn a
   private one; readiness = SOCKS handshake, not sleep.
-- **T2.2** Privoxy lifecycle: generate config (`forward-socks5t` for remote
-  DNS), spawn, wait until :8118 accepts CONNECT.
-- **T2.3** `Up()` = both up + verified end-to-end (a CONNECT through the
-  chain), else hard error. Implements T0.2.
+  **done**
+- **T2.2 — SUPERSEDED. No Privoxy, no generated config.** The CONNECT->SOCKS5
+  hop runs *in-process* (INSTRUCTIONS.md:47, decided 2026-08-15). Write
+  `StartConnectBridge`: listen on `127.0.0.1:0`, accept `CONNECT host:port`,
+  dial Tor's SOCKS5 with `ATYP=0x03`, splice. Working tested code:
+  TORNAGO-REFERENCE.md 4.2; SOCKS5 handshake 4.1.
+  Consequences: `privoxy` leaves the dependency list (`tor` stays);
+  `Bridge.ProxyURL()` returns our own ephemeral listener instead of the
+  hardcoded `:8118`; remote DNS is true by construction, so T2.5 becomes a
+  regression guard rather than a proof; per-track `IsolateSOCKSAuth` becomes
+  possible, which no external bridge can do. Port 4.1/4.4 => MIT attribution
+  header in `pkg/net/bridge.go`.
+  **done**
+- **T2.3** `Up()` = tor up -> bootstrapped -> bridge listening -> one real CONNECT through it, else hard error. Implements T0.2.
+**done**
 - **T2.4** `Rotate()`: control-port auth + `SIGNAL NEWNYM`, surface Tor's
   rate limiting.
+  **done**
 - **T2.5** `SelfTest()`: DNS-leak assertion (resolve through bridge; verify
   the local resolver never saw soundcloud/sndcdn hostnames).
+  **done**
 - **T2.6** `--proxy` override path: user-supplied proxy replaces the bridge
   but keeps the same verified-up contract.
+  **done**
 - **T2.7** Honest-caveat doc: Tor exits vs media CDNs; note the WireGuard
   netns swap seam.
+  **done**
+
+  `Phase 2 is complete. Meet me you know where...`
 
 ## Phase 3 — pkg/resolver (yt-dlp wrapper)
 

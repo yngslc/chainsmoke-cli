@@ -62,8 +62,8 @@ var BuildVersion = "development"
 // replaces (TASKS.md T1.2). That scanning had real bugs: `hasFlag` matched any
 // argv token, so `chainsmoke search -- --remember` silently flipped the store to
 // disk, breaking ephemeral-by-default.
-func wire(app *core.App, remember, private bool, proxy, impersonate string) {
-	n := csnet.New(proxy)
+func wire(app *core.App, remember, private bool, proxy, impersonate string, allowDirect bool) {
+	n := csnet.New(proxy, allowDirect)
 	app.Net = n
 	app.Res = resolver.New(n, impersonate)
 	app.Play = player.New(core.SocketPath())
@@ -177,7 +177,7 @@ func commands(app *core.App) []*cli.Command {
 			},
 		},
 		{
-			Name: "toggle", Aliases: []string{"pause"}, Usage: "Toggle pause",
+			Name: "toggle", Usage: "Toggle pause/play",
 			Action: func(*cli.Context) error { _, err := app.Play.Command("cycle", "pause"); return err },
 		},
 		{
@@ -220,6 +220,10 @@ func commands(app *core.App) []*cli.Command {
 		{
 			Name: "prev", Usage: "Back to the previous track",
 			Action: func(*cli.Context) error { _, err := app.Play.Command("playlist-prev"); return err },
+		},
+		{
+			Name: "pause", Usage: "Pause the current track",
+			Action: func(*cli.Context) error { _, err := app.Play.Command("set_property", "pause", true); return err },
 		},
 		{
 			Name: "stop", Usage: "Kill the player daemon",
@@ -287,6 +291,7 @@ func main() {
 			&cli.BoolFlag{Name: "private", Usage: "force memory-only for this run (overrides --remember)"},
 			&cli.StringFlag{Name: "proxy", Usage: "override egress proxy (else the built-in Tor bridge)"},
 			&cli.StringFlag{Name: "impersonate", Value: "chrome", Usage: "yt-dlp curl_cffi target ('' to disable)"},
+			&cli.BoolFlag{Name: "allow-direct", Usage: "permit UNANONYMIZED egress when Tor cannot be brought up (T0.2 escape hatch)"},
 		},
 		// Before is the single place global flags are read. Constructing the
 		// runtime here (rather than in main, from raw argv) is what lets
@@ -295,7 +300,8 @@ func main() {
 		Before: func(c *cli.Context) error {
 			wire(app,
 				c.Bool("remember"), c.Bool("private"),
-				c.String("proxy"), c.String("impersonate"))
+				c.String("proxy"), c.String("impersonate"),
+				c.Bool("allow-direct"))
 			return nil
 		},
 		Commands: commands(app),

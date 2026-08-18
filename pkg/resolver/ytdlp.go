@@ -45,14 +45,27 @@ func New(n core.Net, impersonate string) *YTDLP {
 // Meta (raw): treats the input as one track and defers to Stream. Playlist/set
 // expansion (yt-dlp --flat-playlist -J, TASKS.md T3.1) is not wired yet.
 func (r *YTDLP) Meta(pageURL string) ([]core.Track, error) {
+	if err := r.net.Assert(); err != nil { // T0.2: fail closed before any egress
+		return nil, err
+	}
+	if _, err := exec.LookPath("yt-dlp"); err != nil {
+		return nil, ErrToolMissing
+	}
 	if strings.TrimSpace(pageURL) == "" {
 		return nil, errors.New("empty URL")
 	}
+	// TODO(T3.1): real expansion is
+	//   exec.Command("yt-dlp", "--flat-playlist", "-J", "--", pageURL)
+	// Two separate args — "--flat-playlist -J" as ONE string is a single
+	// argument containing a space, which yt-dlp rejects.
 	return []core.Track{{Permalink: pageURL, Title: pageURL}}, nil
 }
 
 // Stream resolves a permalink to a fresh, direct audio URL via `yt-dlp -g`.
 func (r *YTDLP) Stream(permalink string) (string, error) {
+	if err := r.net.Assert(); err != nil { // T0.2: fail closed before any egress
+		return "", err
+	}
 	if _, err := exec.LookPath("yt-dlp"); err != nil {
 		return "", ErrToolMissing
 	}
@@ -88,6 +101,9 @@ func (r *YTDLP) Stream(permalink string) (string, error) {
 
 // Search stays stubbed — the raw milestone covers play, not search (T3.3).
 func (r *YTDLP) Search(string, int) ([]core.Track, error) {
+	if err := r.net.Assert(); err != nil { // T0.2: fail closed before any egress
+		return nil, err
+	}
 	return nil, core.ErrNotImplemented
 }
 

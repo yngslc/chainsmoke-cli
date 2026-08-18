@@ -53,21 +53,23 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go build failed (output above).'; 
 $cases = @(
     @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version' },
     @{ Name = 'help';         Args = @('--help');            Exit = 0; Match = 'privacy-focused SoundCloud CLI' },
-    @{ Name = 'search-stub';  Args = @('search', 'roshina'); Exit = 1; Match = 'not implemented' },
+    @{ Name = 'search-stub';  Args = @('--allow-direct', 'search', 'roshina'); Exit = 1; Match = 'not implemented' },
     # With mpv+yt-dlp installed, play/daemon clear the tool checks. `play 1` then
     # fails in the store (empty cache) BEFORE any egress — deterministic, no
     # network. `daemon start` = Ensure() = mpv present, so it now succeeds.
     # np stays stubbed (raw play has no IPC daemon to query).
     # (If mpv/yt-dlp are NOT installed, play/daemon instead fail with 'mpv not
     # found on PATH' — reinstall per SKILL.md or adjust these two rows.)
-    @{ Name = 'play-nocache'; Args = @('play', '1');         Exit = 1; Match = 'no cached result' },
+    @{ Name = 'play-nocache'; Args = @('--allow-direct', 'play', '1'); Exit = 1; Match = 'no cached result' },
     # URL in argv is refused (invariant #3 / T1.3): must arrive on stdin.
-    @{ Name = 'url-in-argv';  Args = @('play', 'https://soundcloud.com/a/b'); Exit = 1; Match = 'stdin' },
+    # Match the invariant itself, not an incidental word in the remediation
+    # text — the previous 'stdin' match broke when the message was reworded.
+    @{ Name = 'url-in-argv';  Args = @('--allow-direct', 'play', 'https://soundcloud.com/a/b'); Exit = 1; Match = 'not accepted in argv' },
     @{ Name = 'np-stub';      Args = @('np');                Exit = 1; Match = 'not implemented' },
     @{ Name = 'daemon-start'; Args = @('daemon', 'start');   Exit = 0; Match = '' },
     # stdin contract: URLs never ride in argv; `get` reads one line from stdin,
     # then dies in the scrubber stub. Proves the stdin path is wired.
-    @{ Name = 'get-stdin';    Args = @('get');               Exit = 1; Match = 'not implemented'; Stdin = 'https://soundcloud.com/artist/track' },
+    @{ Name = 'get-stdin';    Args = @('--allow-direct', 'get'); Exit = 1; Match = 'not implemented'; Stdin = 'https://soundcloud.com/artist/track' },
     @{ Name = 'purge-ok';     Args = @('purge');             Exit = 0; Match = '' },
     @{ Name = 'stop-ok';      Args = @('stop');              Exit = 0; Match = '' },
     # urfave/cli exits 3 (not 1) for unknown commands
@@ -77,18 +79,25 @@ $cases = @(
     # T1.1: search establishes the chokepoint before the resolver runs. With no
     # proxy up, that surfaces as the DIRECT warning — proof Up() was called at
     # all, which it previously was not for this verb.
-    @{ Name = 'search-egress'; Args = @('search', 'roshina'); Exit = 1; Match = 'NOT anonymized' },
+    @{ Name = 'search-egress'; Args = @('--allow-direct', 'search', 'roshina'); Exit = 1; Match = 'NOT anonymized' },
     # T1.2: --proxy is actually wired into the bridge now. Port 9 is the
     # discard port: reliably refuses, no network egress, deterministic offline.
     # Before this fix the flag was parsed by urfave/cli and then ignored.
     @{ Name = 'proxy-wired';   Args = @('--proxy', 'http://127.0.0.1:9', 'play', '1'); Exit = 1; Match = 'not reachable' },
     # T1.5: strconv.Atoi rejects an out-of-range index instead of the old
     # accumulator silently wrapping it to a negative number.
-    @{ Name = 'index-overflow'; Args = @('play', '99999999999999999999'); Exit = 1; Match = 'out of range' },
+    @{ Name = 'index-overflow'; Args = @('--allow-direct', 'play', '99999999999999999999'); Exit = 1; Match = 'out of range' },
     # Input validation on the transport verbs: mpv must never receive an empty
     # or non-numeric argument (cli-developer: "validate user input early").
     @{ Name = 'seek-arity';    Args = @('seek');              Exit = 1; Match = 'usage' },
-    @{ Name = 'vol-range';     Args = @('vol', '900');        Exit = 1; Match = '0-100' }
+    @{ Name = 'vol-range';     Args = @('vol', '900');        Exit = 1; Match = '0-100' },
+
+    # -- Phase 2 T2.3: fail-closed egress -------------------------------------
+    # THE case for T0.2. With no tor and no --allow-direct, an egress verb must
+    # REFUSE, not warn-and-continue. If this ever goes green-by-warning again,
+    # the fail-closed invariant has silently regressed.
+    @{ Name = 'failclosed';    Args = @('play', '1');         Exit = 1; Match = 'refusing to run unanonymized' },
+    @{ Name = 'failclosed-search'; Args = @('search', 'x');   Exit = 1; Match = 'refusing to run unanonymized' }
 )
 
 # -- run ---------------------------------------------------------------------

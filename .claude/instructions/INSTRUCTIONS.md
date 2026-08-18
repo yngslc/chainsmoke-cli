@@ -2,6 +2,8 @@
 
 **Audience:** CLI users on linux/mac/windows. Stack: Go and Python core, bash orchestration of mpv + yt-dlp. All findings current as of August 11, 2026; dates flagged where staleness matters.
 
+**Project deadline:** 22.08.2026
+
 ## TL;DR
 - SoundCloud completed its progressive-MP3 → HLS/AAC migration on Dec 31 2025 and its official developer API is closed to new registrations, so you must build on the undocumented `api-v2.soundcloud.com` with a scraped `client_id` — practically, wrap yt-dlp's SoundCloud extractor (maintained, HLS/AAC + browser-impersonation support shipped in the 2026.02.21 release) rather than reimplement the stream flow.
 - The hard privacy problem is that mpv/ffmpeg have **no native SOCKS5 support**: route Python traffic via `socks5h://` (httpx/aiohttp-socks with `rdns=True`) and bridge mpv/ffmpeg/yt-dlp through a local HTTP-to-SOCKS proxy (Privoxy `forward-socks5t / 127.0.0.1:9050 .` or gost) onto Tor's SOCKS port 9050.
