@@ -175,7 +175,7 @@ func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
 				"and this one already reached it. Treat %q as exposed.\n\n"+
 				"  chainsmoke play              # prompts; leaks neither argv nor shell history\n"+
 				"  chainsmoke play < url.txt    # for scripts\n"+
-				"  chainsmoke search <term> && chainsmoke play 1   # no URL anywhere (needs T4.1)",
+				"  chainsmoke search <term> && chainsmoke play 1   # no URL anywhere",
 			arg)
 	}
 	// On an interactive terminal, prompt instead of blocking silently — a bare
@@ -275,6 +275,28 @@ func (a *App) Audit() error {
 	return a.Net.SelfTest()
 }
 
+// Purge wipes stored state, and does it in the ONE order that works: the player
+// goes down first (TASKS.md T4.4, bash lesson T1.13).
+//
+// The bash prototype's cmd_purge was `rm -rf "$RUNDIR"` with no teardown, and
+// the mpv IPC socket lives in that very directory. Deleting it out from under a
+// running mpv leaves a daemon nobody can talk to — still playing, unreachable,
+// and invisible to the next invocation, which finds no socket and starts a
+// second one. On Windows the same ordering is not a nicety but a requirement:
+// an open file cannot be removed at all.
+//
+// Player teardown failing is reported, not fatal: a purge that stops halfway
+// because mpv was already gone would leave exactly the state the user asked to
+// destroy.
+func (a *App) Purge() error {
+	if a.Play != nil {
+		if err := a.Play.Down(); err != nil {
+			fmt.Fprintf(os.Stderr, "chainsmoke: player teardown failed (%v) — purging anyway\n", err)
+		}
+	}
+	return a.Store.Purge()
+}
+
 // PrintResults writes the numbered result set: index and title only. Permalinks
 // stay in the store so they never reach a terminal, a scrollback buffer, or a
 // shell history (invariant #3).
@@ -285,12 +307,23 @@ func (a *App) PrintResults(ts []Track) {
 	}
 }
 
-// YtdlpHint wraps resolver errors with the one recovery action that matters —
-// but never for a stub, where "run: yt-dlp -U" would send the user chasing a
+// YtdlpHint appends the ONE recovery action that fits the failure — and nothing
+// at all for a stub, where "run: yt-dlp -U" would send the user chasing a
 // dependency that is not the problem (TASKS.md T1.7).
+//
+// The T3.5 taxonomy below is what makes the advice honest: before it, a blocked Tor
+// exit and a dead bridge were both reported as a stale extractor, so the hint
+// pointed at yt-dlp for two failures yt-dlp cannot fix (T3.5). Anything
+// unclassified still gets the -U hint — a resolve that failed for a reason we
+// do not recognise is most often the extractor.
 func YtdlpHint(err error) error {
-	if err == nil || errors.Is(err, ErrNotImplemented) {
+	switch {
+	case err == nil, errors.Is(err, ErrNotImplemented):
 		return err
+	case errors.Is(err, ErrEgress):
+		return err // pkg/net's problem; the error already says so
+	case errors.Is(err, ErrRateLimited):
+		return fmt.Errorf("%w\n  the exit is likely blocked — run: chainsmoke rotate", err)
 	}
 	return fmt.Errorf("%w\n  SoundCloud extractor may be stale — run: yt-dlp -U", err)
 }
@@ -342,3 +375,64 @@ func SocketPath() string {
 	}
 	return filepath.Join(RuntimeDir(), "mpv.sock")
 }
+
+// StateDir is where `--remember` persists (TASKS.md T4.2). It is the OPPOSITE
+// of RuntimeDir in one respect that matters: nothing here is wiped by a reboot
+// or a logout, which is exactly what the user asked for by passing the flag —
+// and exactly why it is not the default.
+//
+// Precedence mirrors RuntimeDir:
+//   - $XDG_STATE_HOME/chainsmoke when set (INSTRUCTIONS.md:76 — state is for
+//     history, not cache and not config)
+//   - %LOCALAPPDATA%\chainsmoke\state on Windows, which has no XDG state dir.
+//     Roaming is deliberately avoided: a listening history must not follow the
+//     user onto every machine their profile syncs to.
+//   - $HOME/.local/state/chainsmoke otherwise, per the XDG spec's default
+func StateDir() string {
+	if base := os.Getenv("XDG_STATE_HOME"); base != "" {
+		return filepath.Join(base, "chainsmoke")
+	}
+	if runtime.GOOS == "windows" {
+		if base := os.Getenv("LOCALAPPDATA"); base != "" {
+			return filepath.Join(base, "chainsmoke", "state")
+		}
+		return filepath.Join(os.TempDir(), "chainsmoke", "state")
+	}
+	return filepath.Join(os.Getenv("HOME"), ".local", "state", "chainsmoke")
+}
+
+// EnsureStateDir creates StateDir() with mode 0700 and returns it. Same 0700
+// reasoning as EnsureRuntimeDir, with more at stake: this one persists.
+func EnsureStateDir() (string, error) {
+	dir := StateDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("state dir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// -----------------------------------------------------------------------------
+// Resolver error taxonomy (TASKS.md T3.5)
+// -----------------------------------------------------------------------------
+//
+// These live in core rather than in pkg/resolver because the CLI edge has to
+// react to the CAUSE of a failed resolve without importing the resolver, and
+// because each one maps to a DIFFERENT recovery action. Getting that mapping
+// wrong is exactly the failure T3.5 names: sending a user to `yt-dlp -U` when
+// the real problem is a dead bridge. Test them with errors.Is, never by string
+// match — the wrapped text comes from yt-dlp and changes between releases.
+
+// ErrStaleExtractor means yt-dlp reached SoundCloud but could not parse what it
+// got back: the extractor is behind a site change. The only recovery action is
+// `yt-dlp -U` — never a patch in pkg/resolver (see that package's doc comment).
+var ErrStaleExtractor = errors.New("yt-dlp could not extract this page — its SoundCloud extractor is likely stale")
+
+// ErrRateLimited is SoundCloud refusing us outright (403/429), which over Tor
+// usually means the exit we drew is one it blocks. Recovery is a new circuit,
+// not an update: `chainsmoke rotate`, then retry.
+var ErrRateLimited = errors.New("SoundCloud refused the request (403/429) — the current exit is likely blocked")
+
+// ErrEgress means yt-dlp never got out at all: the proxy in front of it did not
+// carry the connection. This is a pkg/net fault surfaced through the resolver,
+// and must NOT be reported as a SoundCloud or yt-dlp problem.
+var ErrEgress = errors.New("yt-dlp could not reach the network through the proxy")

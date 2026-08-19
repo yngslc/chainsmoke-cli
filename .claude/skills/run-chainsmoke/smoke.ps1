@@ -49,18 +49,37 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go vet failed (output above).'; ex
 & $GoExe build -ldflags '-X main.BuildVersion=smoke' -o chainsmoke.exe .\cmd\chainsmoke
 if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go build failed (output above).'; exit 2 }
 
+# Cases that must observe "no anonymized egress available" point at a port
+# nothing can be listening on. Without this the baseline silently depends on
+# whether THIS machine happens to be running tor — it passed on a box with no
+# tor and failed the moment one appeared, which is a harness bug, not a
+# regression. Port 1 (tcpmux) is never bound in practice.
+$noTor = @('--tor-socks', '127.0.0.1:1')
+
 # -- case table: args / stdin / expected exit / expected output substring ----
 $cases = @(
     @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version' },
     @{ Name = 'help';         Args = @('--help');            Exit = 0; Match = 'privacy-focused SoundCloud CLI' },
-    @{ Name = 'search-stub';  Args = @('--allow-direct', 'search', 'roshina'); Exit = 1; Match = 'not implemented' },
+    # T3.3: `search` is implemented now, so a bare search would leave the box —
+    # and with no tor up, leave it UNANONYMIZED. Pointing --impersonate at a
+    # target yt-dlp cannot load kills it before it opens a socket: the case
+    # stays offline AND proves the resolver injected our flag (T3.4).
+    @{ Name = 'search-flags'; Args = @('--allow-direct', '--impersonate', 'smoke-invalid', 'search', 'roshina'); Exit = 1; Match = 'rejected --impersonate' },
     # With mpv+yt-dlp installed, play/daemon clear the tool checks. `play 1` then
     # fails in the store (empty cache) BEFORE any egress — deterministic, no
     # network. `daemon start` = Ensure() = mpv present, so it now succeeds.
     # np stays stubbed (raw play has no IPC daemon to query).
     # (If mpv/yt-dlp are NOT installed, play/daemon instead fail with 'mpv not
     # found on PATH' — reinstall per SKILL.md or adjust these two rows.)
+    # T4.1 made the result cache survive between processes, so this case is no
+    # longer deterministic on its own: a real `search` from an earlier session
+    # would leave a result #1 sitting in $XDG_RUNTIME_DIR and `play 1` would go
+    # resolve it. Purge first, then assert the empty-cache message.
+    @{ Name = 'purge-first';  Args = @('purge');               Exit = 0; Match = '' },
     @{ Name = 'play-nocache'; Args = @('--allow-direct', 'play', '1'); Exit = 1; Match = 'no cached result' },
+    # T4.3: --private is memory-only, so a cache written by a normal run must be
+    # invisible to it. Nothing to set up — a fresh process has no memory.
+    @{ Name = 'private-nocache'; Args = @('--private', '--allow-direct', 'play', '1'); Exit = 1; Match = 'no cached result' },
     # URL in argv is refused (invariant #3 / T1.3): must arrive on stdin.
     # Match the invariant itself, not an incidental word in the remediation
     # text — the previous 'stdin' match broke when the message was reworded.
@@ -78,8 +97,9 @@ $cases = @(
     # -- Phase 1A regression cases (T1.1-T1.7) --------------------------------
     # T1.1: search establishes the chokepoint before the resolver runs. With no
     # proxy up, that surfaces as the DIRECT warning — proof Up() was called at
-    # all, which it previously was not for this verb.
-    @{ Name = 'search-egress'; Args = @('--allow-direct', 'search', 'roshina'); Exit = 1; Match = 'NOT anonymized' },
+    # all, which it previously was not for this verb. The invalid impersonate
+    # target is what keeps the (now real) resolver call from reaching the wire.
+    @{ Name = 'search-egress'; Args = @($noTor + @('--allow-direct', '--impersonate', 'smoke-invalid', 'search', 'roshina')); Exit = 1; Match = 'NOT anonymized' },
     # T1.2: --proxy is actually wired into the bridge now. Port 9 is the
     # discard port: reliably refuses, no network egress, deterministic offline.
     # Before this fix the flag was parsed by urfave/cli and then ignored.
@@ -96,8 +116,8 @@ $cases = @(
     # THE case for T0.2. With no tor and no --allow-direct, an egress verb must
     # REFUSE, not warn-and-continue. If this ever goes green-by-warning again,
     # the fail-closed invariant has silently regressed.
-    @{ Name = 'failclosed';    Args = @('play', '1');         Exit = 1; Match = 'refusing to run unanonymized' },
-    @{ Name = 'failclosed-search'; Args = @('search', 'x');   Exit = 1; Match = 'refusing to run unanonymized' }
+    @{ Name = 'failclosed';    Args = @($noTor + @('play', '1')); Exit = 1; Match = 'refusing to run unanonymized' },
+    @{ Name = 'failclosed-search'; Args = @($noTor + @('search', 'x')); Exit = 1; Match = 'refusing to run unanonymized' }
 )
 
 # -- run ---------------------------------------------------------------------

@@ -62,8 +62,8 @@ var BuildVersion = "development"
 // replaces (TASKS.md T1.2). That scanning had real bugs: `hasFlag` matched any
 // argv token, so `chainsmoke search -- --remember` silently flipped the store to
 // disk, breaking ephemeral-by-default.
-func wire(app *core.App, remember, private bool, proxy, impersonate string, allowDirect bool) {
-	n := csnet.New(proxy, allowDirect)
+func wire(app *core.App, remember, private bool, proxy, impersonate string, allowDirect bool, torSocks string) {
+	n := csnet.New(proxy, allowDirect, torSocks)
 	app.Net = n
 	app.Res = resolver.New(n, impersonate)
 	app.Play = player.New(core.SocketPath())
@@ -232,8 +232,17 @@ func commands(app *core.App) []*cli.Command {
 
 		// --- privacy / lifecycle -----------------------------------------------
 		{
-			Name: "rotate", Usage: "New Tor circuit (NEWNYM)",
-			Action: func(*cli.Context) error { return app.Net.Rotate() },
+			Name: "rotate", Usage: "New Tor circuit (NEWNYM, or re-isolated SOCKS credentials)",
+			Action: func(*cli.Context) error {
+				// Up() first, for the same reason audit does it: without a live
+				// bridge there is nothing to re-isolate, so a tor with no
+				// ControlPort made this verb fail outright even though a fresh
+				// circuit was one credential away.
+				if err := app.Net.Up(); err != nil {
+					return err
+				}
+				return app.Net.Rotate()
+			},
 		},
 		{
 			Name: "audit", Usage: "Show runtime privacy posture",
@@ -248,8 +257,10 @@ func commands(app *core.App) []*cli.Command {
 			},
 		},
 		{
-			Name: "purge", Usage: "Wipe transient/persistent state",
-			Action: func(*cli.Context) error { return app.Store.Purge() },
+			Name: "purge", Usage: "Wipe transient/persistent state (both stores)",
+			// app.Purge, not app.Store.Purge: the player has to come down
+			// before the directory its IPC socket lives in is removed (T4.4).
+			Action: func(*cli.Context) error { return app.Purge() },
 		},
 		{
 			Name: "daemon", Usage: "player daemon lifecycle",
@@ -292,6 +303,7 @@ func main() {
 			&cli.StringFlag{Name: "proxy", Usage: "override egress proxy (else the built-in Tor bridge)"},
 			&cli.StringFlag{Name: "impersonate", Value: "chrome", Usage: "yt-dlp curl_cffi target ('' to disable)"},
 			&cli.BoolFlag{Name: "allow-direct", Usage: "permit UNANONYMIZED egress when Tor cannot be brought up (T0.2 escape hatch)"},
+			&cli.StringFlag{Name: "tor-socks", Value: "127.0.0.1:9050", Usage: "Tor SOCKS address (use 127.0.0.1:9150 for the Tor Browser bundle)"},
 		},
 		// Before is the single place global flags are read. Constructing the
 		// runtime here (rather than in main, from raw argv) is what lets
@@ -301,7 +313,20 @@ func main() {
 			wire(app,
 				c.Bool("remember"), c.Bool("private"),
 				c.String("proxy"), c.String("impersonate"),
-				c.Bool("allow-direct"))
+				c.Bool("allow-direct"), c.String("tor-socks"))
+			return nil
+		},
+		// After runs on every exit path the CLI controls. Without it a private
+		// tor spawned by Up() is ORPHANED: the process exits, Down() never runs,
+		// and the daemon plus its temp DataDirectory outlive us forever. A
+		// DETECTED system tor is never touched — Down() only kills what we own.
+		//
+		// NOT covered: SIGINT. Ctrl+C during playback skips this entirely
+		// (T10.9 territory), so a private tor can still leak that way.
+		After: func(*cli.Context) error {
+			if app.Net != nil {
+				return app.Net.Down()
+			}
 			return nil
 		},
 		Commands: commands(app),

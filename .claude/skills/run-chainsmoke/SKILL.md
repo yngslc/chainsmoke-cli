@@ -82,7 +82,7 @@ and output against the current baseline:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .claude\skills\run-chainsmoke\smoke.ps1
-# → PASS x16, "smoke: all 16 cases pass", exit 0
+# → PASS x20, "smoke: all 20 cases pass", exit 0
 ```
 
 **When you implement a subsystem, flip the corresponding expectations in the
@@ -94,13 +94,14 @@ Verified behavior baseline (what the carcass does today):
 |---|---|---|
 | `.\chainsmoke.exe --help` | 0 | full command/flag table |
 | `.\chainsmoke.exe --version` | 0 | `chainsmoke version development` |
-| `.\chainsmoke.exe search kendrick` | 1 | DIRECT warning (T1.1: `Up()` now runs first), then bare `not implemented` — the `yt-dlp -U` hint is correctly suppressed for stubs (T1.7) |
+| `.\chainsmoke.exe search kendrick` | 0/1 | real scsearch through the chokepoint (T3.3) — needs egress; fails closed without it |
 | `.\chainsmoke.exe np`, `toggle` | 1 | `chainsmoke: not implemented` (no IPC daemon in the raw player) |
 | `.\chainsmoke.exe play 1` | 1 | `net.Up` warns DIRECT (no proxy), then `no cached result #1 — run \`chainsmoke search <term>\` first`. No egress. |
 | `.\chainsmoke.exe --proxy http://127.0.0.1:9 play 1` | 1 | `--proxy ... not reachable` — proves the flag reaches the bridge (T1.2) |
 | `.\chainsmoke.exe daemon start` | 0 | `Ensure()` finds mpv on PATH and returns nil (raw player has no real daemon yet) |
 | `"https://soundcloud.com/artist/track" \| .\chainsmoke.exe get` | 1 | stdin URL is read (no-URLs-in-argv contract), then dies in the scrubber stub |
-| `.\chainsmoke.exe purge`, `.\chainsmoke.exe stop` | 0 | silent success (memStore purge / player.Down are real no-ops) |
+| `.\chainsmoke.exe purge` | 0 | really wipes both stores now (T4.4): runtime + state dirs, with the player taken down first |
+| `.\chainsmoke.exe stop` | 0 | silent success (player.Down is still a no-op) |
 | `.\chainsmoke.exe audit` | 1 | `Up()` runs first (T7.1 posture is probed, not printed from config), so it warns DIRECT, prints `egress: DIRECT (no proxy)` + runtime dir + version, then SelfTest fails with "egress is DIRECT" |
 | `.\chainsmoke.exe seek` / `vol 900` | 1 | arity/range rejected before mpv ever sees the argument |
 | `.\chainsmoke.exe bogus` | 3 | `No help topic for 'bogus'` |
@@ -137,12 +138,36 @@ go test ./...   # → "?  chainsmoke  [no test files]" — no tests exist yet
   target's import graph, so an unreferenced or malformed `pkg/*` file slips
   through. `go vet ./...` is the check that covers everything; smoke.ps1 runs it
   before building for exactly this reason.
-- **`search` no longer lies about yt-dlp.** `Search` is still
-  `ErrNotImplemented`, and `core.YtdlpHint` now suppresses the "run: yt-dlp -U"
-  advice for stub errors (T1.7). A bare `not implemented` is correct output.
-- **`search` → `play N` cannot work yet, by design.** Under T0.1(a) the two
-  verbs are separate short-lived processes and the default store is in-memory,
-  so results never survive. This is T4.1 (runtime store), not a bug to chase.
+- **`search` is real now (T3.3), so it LEAVES THE BOX.** It runs
+  `yt-dlp scsearchN:<term>` through the chokepoint. Do not add a smoke case
+  that searches for real: with no tor up, that is an unanonymized request to
+  SoundCloud from the dev machine. The two search cases pass
+  `--impersonate smoke-invalid`, which yt-dlp rejects before it opens a socket
+  — offline, and it still proves the flag reached yt-dlp (T3.4).
+- **A slow `search`/`play` is the retry policy, not a hang.** Over Tor the exit
+  you draw decides everything: yt-dlp is given a 15s socket timeout and up to 3
+  attempts, rotating the circuit between the slow ones, so a bad draw can take
+  ~65s before it gives up. `chainsmoke: ... rotating circuit, retrying (2/3)` on
+  stderr is the policy working. Measured 2026-08-19: roughly 1 in 3 fresh
+  circuits completes a SoundCloud request at all.
+- **`rotate` now brings egress up first.** Without a live bridge there is
+  nothing to re-isolate, and on a system tor with no ControlPort (this box) the
+  verb used to fail outright. It now exits 0 and says which half it managed.
+- **`search` → `play N` works now (T4.1), and that has a cost.** Results live in
+  `$XDG_RUNTIME_DIR/chainsmoke/results.json` (`%TEMP%\chainsmoke` on Windows),
+  0700/0600, and they SURVIVE between invocations. Any smoke case asserting
+  "no cached result" must therefore purge first, or a real search from an
+  earlier session makes it flaky — that is why `purge-first` sits ahead of
+  `play-nocache` in the table.
+- **On Windows the "ephemeral" store is a real disk write.** The design leans on
+  `$XDG_RUNTIME_DIR` being tmpfs, i.e. gone at logout. `%TEMP%` is not tmpfs and
+  survives a reboot, so on this dev target `purge` (or `--private`) is the only
+  thing that actually removes the permalinks — worth knowing before calling the
+  default "ephemeral" in front of a user.
+- **`--private` is isolated, not just write-blocked (T4.3).** It reads nothing
+  either, so `search` (normal) then `--private play 1` correctly reports no
+  cached result. It writes zero bytes to either store directory — asserted in
+  `pkg/store/store_test.go`, not just intended.
 - **Unknown verbs exit 3, not 1** (urfave/cli's `CommandNotFound` path). Every
   other failure is exit 1 — there is no MISUSE/NOT_FOUND differentiation yet.
 - **The banner prints on stdout for every verb**, before argument parsing. It
@@ -157,6 +182,16 @@ go test ./...   # → "?  chainsmoke  [no test files]" — no tests exist yet
   a live `get_property` round-trip. Same protocol, different dial. `core.SocketPath()`
   already returns the right endpoint per platform; the Phase-5 client must
   abstract the dial (T10.7) rather than assume `net.Dial("unix", ...)`.
+
+## TASKS
+- this is a check-up prompt:
+// alright, drop the status: 
+// are we finished with phase <current_phase>?
+// is there anything we can fix?
+// is there anything we have to add?
+// should run-chainsmoke be redacted for the next phases?
+// should INSTRUCTIONS.md be redacted for the next phases?
+- review these questions carefully each time dev mentions TASKS.md. if dev accepts your review, you may proceed with redacting each file that's mentioned during this check-up.
 
 ## Troubleshooting
 

@@ -362,3 +362,68 @@ func TestWaitUsableStopsOnTerminalError(t *testing.T) {
 		t.Errorf("took %s — a terminal SOCKS code must abort, not consume the retry budget", elapsed)
 	}
 }
+
+// TestReisolate is the T3.5 retry's foundation: a new credential is what buys a
+// new circuit, so a re-roll that produced the same pair would silently retry on
+// the very exit we are trying to escape.
+func TestReisolate(t *testing.T) {
+	d := &socks5Dialer{user: "chainsmoke", pass: isolationPass()}
+	u1, p1 := d.creds()
+
+	if !d.reisolate() {
+		t.Fatal("reisolate() = false on an isolating dialer, want true")
+	}
+	u2, p2 := d.creds()
+	if u2 != u1 {
+		t.Errorf("username changed (%q -> %q); only the password keys a new circuit", u1, u2)
+	}
+	if p2 == p1 {
+		t.Error("password unchanged — Tor would hand back the SAME circuit")
+	}
+
+	// 200 rolls, no collisions: a time-derived key could repeat inside one
+	// coarse Windows clock tick, which is exactly the bug this guards.
+	seen := map[string]bool{p1: true, p2: true}
+	for i := 0; i < 200; i++ {
+		d.reisolate()
+		_, p := d.creds()
+		if seen[p] {
+			t.Fatalf("duplicate isolation key after %d rolls: %q", i, p)
+		}
+		seen[p] = true
+	}
+}
+
+// TestReisolateWithoutIsolation: a bridge built without isolation has nothing
+// to roll, and must say so rather than let a caller claim a fresh circuit.
+func TestReisolateWithoutIsolation(t *testing.T) {
+	d := &socks5Dialer{} // no-auth dialer
+	if d.reisolate() {
+		t.Error("reisolate() = true with isolation off, want false")
+	}
+	if u, p := d.creds(); u != "" || p != "" {
+		t.Errorf("creds() = %q/%q, want empty — a no-auth dialer must stay no-auth", u, p)
+	}
+}
+
+// TestReisolateConcurrent: Reisolate runs while the bridge is serving, so the
+// credentials are read by in-flight dials as they are rewritten. Meaningful
+// under -race; harmless without it.
+func TestReisolateConcurrent(t *testing.T) {
+	d := &socks5Dialer{user: "chainsmoke", pass: isolationPass()}
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			d.reisolate()
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		if u, _ := d.creds(); u != "chainsmoke" {
+			t.Errorf("creds() saw a torn username %q", u)
+			break
+		}
+	}
+	<-done
+}

@@ -12,7 +12,9 @@ package net
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +53,7 @@ const (
 type Bridge struct {
 	override    string         // --proxy value, if the user supplied one
 	allowDirect bool           // --allow-direct: opt in to unanonymized egress
+	torSocks    string         // where Tor's SOCKS listener is expected
 	proxy       string         // egress proxy URL once Up() succeeds ("" until then)
 	direct      bool           // true when nothing was reachable and we fell back
 	up          bool           // true once Up() has run to completion (success or not)
@@ -71,10 +74,20 @@ var _ core.Net = (*Bridge)(nil)
 // through the bridge, in this process".
 var ErrEgressNotVerified = errors.New("egress not verified — no network call may run (T0.2 fail-closed)")
 
-// New builds a bridge. override is the --proxy value ("" for the built-in path);
-// allowDirect opts in to running unanonymized when no proxy can be brought up.
-func New(override string, allowDirect bool) *Bridge {
-	return &Bridge{override: override, allowDirect: allowDirect}
+// New builds a bridge.
+//
+//	override    the --proxy value ("" for the built-in path)
+//	allowDirect opt in to running unanonymized when no proxy can be brought up
+//	torSocks    where to look for Tor's SOCKS listener ("" = the 9050 default).
+//	            Configurable because the Tor Browser bundle uses 9150, and
+//	            because a test needs to be able to point at a port that is
+//	            definitively dead — otherwise the fail-closed cases only pass on
+//	            machines that happen to have no Tor.
+func New(override string, allowDirect bool, torSocks string) *Bridge {
+	if torSocks == "" {
+		torSocks = torSocksAddr
+	}
+	return &Bridge{override: override, allowDirect: allowDirect, torSocks: torSocks}
 }
 
 // Assert is the gate every egressing call must pass. It answers a POLICY
@@ -179,7 +192,7 @@ func (b *Bridge) Up() error {
 		return b.fallback(fmt.Sprintf("tor could not be started: %v", err))
 	}
 	if socksAddr == "" {
-		return b.fallback(fmt.Sprintf("no Tor SOCKS listener on %s", torSocksAddr))
+		return b.fallback(fmt.Sprintf("no Tor SOCKS listener on %s", b.torSocks))
 	}
 	b.socksAddr = socksAddr
 
@@ -218,7 +231,7 @@ func (b *Bridge) fallback(reason string) error {
 	if !b.allowDirect {
 		return fmt.Errorf("%s — refusing to run unanonymized.\n"+
 			"  start tor (SocksPort %s), pass --proxy, or accept the risk with --allow-direct",
-			reason, torSocksAddr)
+			reason, b.torSocks)
 	}
 	b.direct = true
 	fmt.Fprintf(os.Stderr, "chainsmoke: WARNING %s\n", reason)
@@ -262,9 +275,13 @@ func (b *Bridge) Down() error {
 // circuit, so a successful return does NOT prove the exit changed.
 const newnymCooldown = 10 * time.Second
 
-// Rotate requests a fresh Tor circuit over the control port (NEWNYM).
+// Rotate asks for a different exit two ways, strongest-guarantee first:
+// re-rolled SOCKS isolation credentials (always available, effective on our own
+// next stream) and a NEWNYM over the control port (process-wide, but only when
+// a ControlPort exists and lets us in).
 //
-// Two honesty requirements, both of which the first implementation failed:
+// Three honesty requirements, the first two of which the first implementation
+// failed:
 //
 //   - Auth is negotiated (PROTOCOLINFO -> cookie / NULL), not assumed absent.
 //     `AUTHENTICATE ""` fails on every distro tor, which ships
@@ -272,9 +289,30 @@ const newnymCooldown = 10 * time.Second
 //   - A 250 OK is NOT proof of rotation. Tor coalesces NEWNYM signals sent
 //     within newnymCooldown and reports success either way. Rather than let the
 //     user believe they have a new exit, we track when we last asked and say so.
-//     For a real per-request guarantee, the answer is per-stream SOCKS
-//     credentials (IsolateSOCKSAuth), which the bridge already uses.
+//   - Success here means "the next stream keys a new circuit", not "you have a
+//     different exit". Tor picks exits at random; it may well pick the same one.
 func (b *Bridge) Rotate() error {
+	// Re-isolate FIRST, and unconditionally. It is the half that always works:
+	// no ControlPort, no auth, no cooperation from a tor we do not own. A
+	// system tor with ControlPort disabled — the common case, and what this dev
+	// box runs — used to make `chainsmoke rotate` fail outright while a fresh
+	// circuit was one credential away.
+	fresh := b.cb != nil && b.cb.Reisolate()
+
+	if err := b.newnym(); err != nil {
+		if !fresh {
+			return err
+		}
+		fmt.Fprintf(os.Stderr,
+			"chainsmoke: NEWNYM unavailable (%v)\n"+
+				"chainsmoke:         re-isolated instead — the next stream opens a fresh circuit.\n", err)
+	}
+	return nil
+}
+
+// newnym is the ControlPort half of Rotate, split out so a failure here can be
+// weighed against whether re-isolation already delivered a new circuit.
+func (b *Bridge) newnym() error {
 	addr := b.ctrlAddr()
 	c, err := dialControl(addr, dialTimeout)
 	if err != nil {
@@ -382,8 +420,8 @@ func (b *Bridge) ProxyURL() string {
 // waitUsable's job, and doing it there means the same code path covers a system
 // tor that is still warming up.
 func (b *Bridge) ensureTor() (string, error) {
-	if dialCheck(torSocksAddr) == nil {
-		return torSocksAddr, nil // system tor
+	if dialCheck(b.torSocks) == nil {
+		return b.torSocks, nil // system tor
 	}
 	if _, err := exec.LookPath("tor"); err != nil {
 		return "", nil // nothing listening and nothing to spawn
@@ -502,7 +540,7 @@ func StartConnectBridge(torSocksAddr string, isolate bool) (*ConnectBridge, erro
 	}
 	if isolate {
 		b.dialer.user = "chainsmoke"
-		b.dialer.pass = strconv.FormatInt(time.Now().UnixNano(), 36)
+		b.dialer.pass = isolationPass()
 	}
 	b.wg.Add(1)
 	go b.serve()
@@ -511,6 +549,16 @@ func StartConnectBridge(torSocksAddr string, isolate bool) (*ConnectBridge, erro
 
 // ProxyURL is what goes into http_proxy and yt-dlp --proxy.
 func (b *ConnectBridge) ProxyURL() string { return "http://" + b.ln.Addr().String() }
+
+// Reisolate re-rolls this bridge's SOCKS credentials so the NEXT stream lands
+// on a fresh circuit — usually, though not provably, a different exit.
+//
+// This is the rotation that works when NEWNYM cannot: it needs no ControlPort,
+// no authentication, and no cooperation from a system tor we do not own. It is
+// also finer-grained than NEWNYM, which resets the whole process's circuits.
+// Reports false when the bridge was built without isolation, so no caller
+// claims a fresh circuit it did not get.
+func (b *ConnectBridge) Reisolate() bool { return b.dialer.reisolate() }
 
 // Verify pushes one real CONNECT through the bridge to target and tears it down.
 // Success means Tor is bootstrapped and the whole chain carries bytes.
@@ -618,8 +666,48 @@ func (b *ConnectBridge) Close() error {
 type socks5Dialer struct {
 	addr    string // Tor SOCKS5 listener
 	timeout time.Duration
-	user    string // stream-isolation credentials; "" = no-auth
-	pass    string
+
+	// mu guards the isolation credentials. They are not write-once: Reisolate
+	// re-rolls them while the bridge is serving, and every dial reads them, so
+	// a plain field assignment here would be a data race (T3.5 retry).
+	mu   sync.RWMutex
+	user string // stream-isolation credentials; "" = no-auth
+	pass string
+}
+
+// creds reads the pair as a unit. Splitting the read would let a handshake pair
+// the old username with a re-rolled password and key an unintended circuit.
+func (d *socks5Dialer) creds() (user, pass string) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.user, d.pass
+}
+
+// reisolate re-rolls the password so the NEXT stream through this dialer keys a
+// different circuit. It reports false when isolation is off: there is nothing
+// to roll, and no caller may claim a fresh circuit it did not get.
+func (d *socks5Dialer) reisolate() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.user == "" {
+		return false
+	}
+	d.pass = isolationPass()
+	return true
+}
+
+// isolationPass is random, not time-derived. Two re-rolls inside one clock tick
+// would otherwise produce the SAME key and silently reuse the very circuit we
+// are trying to escape — and Windows' wall clock is coarse enough (often ~1ms,
+// sometimes ~15ms) for a retry loop to land inside one tick.
+func isolationPass() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Falling back to the clock is worse but still distinct-ish; returning
+		// a constant would disable isolation for the rest of the process.
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func (d *socks5Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -648,11 +736,15 @@ func (d *socks5Dialer) DialContext(ctx context.Context, network, address string)
 }
 
 func (d *socks5Dialer) handshake(c net.Conn, dest string) error {
+	// One read of the credentials per handshake: a mid-handshake re-roll must
+	// not split this dial across two isolation keys.
+	user, pass := d.creds()
+
 	// When isolating we offer ONLY username/password. If 0x00 is on the table
 	// Tor will take it, and no-auth streams share a circuit — precisely what
 	// isolation exists to prevent.
 	greeting := []byte{0x05, 0x01, 0x00}
-	if d.user != "" {
+	if user != "" {
 		greeting = []byte{0x05, 0x01, 0x02}
 	}
 	if _, err := c.Write(greeting); err != nil {
@@ -668,7 +760,7 @@ func (d *socks5Dialer) handshake(c net.Conn, dest string) error {
 	switch sel[1] {
 	case 0x00:
 	case 0x02:
-		if err := d.authUserPass(c); err != nil {
+		if err := d.authUserPass(c, user, pass); err != nil {
 			return err
 		}
 	default:
@@ -687,15 +779,15 @@ func (d *socks5Dialer) handshake(c net.Conn, dest string) error {
 
 // authUserPass is RFC 1929. Tor does not validate the credentials; it uses the
 // pair as a circuit-isolation key, so any distinct value buys a distinct path.
-func (d *socks5Dialer) authUserPass(c net.Conn) error {
-	if len(d.user) > 255 || len(d.pass) > 255 {
+func (d *socks5Dialer) authUserPass(c net.Conn, user, pass string) error {
+	if len(user) > 255 || len(pass) > 255 {
 		return errors.New("socks5: isolation credentials too long")
 	}
-	buf := make([]byte, 0, 3+len(d.user)+len(d.pass))
-	buf = append(buf, 0x01, byte(len(d.user)))
-	buf = append(buf, d.user...)
-	buf = append(buf, byte(len(d.pass)))
-	buf = append(buf, d.pass...)
+	buf := make([]byte, 0, 3+len(user)+len(pass))
+	buf = append(buf, 0x01, byte(len(user)))
+	buf = append(buf, user...)
+	buf = append(buf, byte(len(pass)))
+	buf = append(buf, pass...)
 	if _, err := c.Write(buf); err != nil {
 		return fmt.Errorf("socks5: write auth: %w", err)
 	}

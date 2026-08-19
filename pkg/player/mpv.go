@@ -38,7 +38,9 @@ func (p *MPV) Ensure() error {
 	if _, err := exec.LookPath("mpv"); err != nil {
 		return ErrToolMissing
 	}
-	return nil
+	cmd := exec.Command("mpv", "--idle", "--no-video", "--input-ipc-server")
+	// PHASE 5 T5.1 -- stopped here
+	return cmd.Run()
 }
 
 // Enqueue plays an already-resolved stream URL directly. mpv inherits the proxy

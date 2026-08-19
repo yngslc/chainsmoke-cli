@@ -145,7 +145,7 @@ a new bug, which is what made the freeze safe.
 > `exec.Command` takes a `[]string`, so argv boundaries are explicit and no
 > value of `CS_IMPERSONATE` (spaces, globs, empty) can change the argument count.
 
-## Phase 2 — pkg/net (spec ordering: network before playback)
+## Phase 2 - COMPLETED — pkg/net (spec ordering: network before playback)
 
 - **T2.1** Tor lifecycle: detect a listening system tor on 9050; else spawn a
   private one; readiness = SOCKS handshake, not sleep.
@@ -177,30 +177,40 @@ a new bug, which is what made the freeze safe.
   netns swap seam.
   **done**
 
-  `Phase 2 is complete. Meet me you know where...`
+  `phase 2 is complete. Meet me you know where...`
 
-## Phase 3 — pkg/resolver (yt-dlp wrapper)
+## Phase 3 - COMPLETED — pkg/resolver (yt-dlp wrapper)
 
 - **T3.1** `Meta`: `--flat-playlist -J`, parse entries; use
   `webpage_url // url` (bash lesson T1.11); playlists and single tracks.
+  **waits for claude's review**
+  **dev's override/done**
 - **T3.2** `Stream`: `-f bestaudio -g` with
   `--extractor-args soundcloud:formats=hls_aac`.
+  **done**
 - **T3.3** `Search`: `scsearchN:<term>`, respect `--limit`.
+  **done**
 - **T3.4** Proxy + impersonate injection on *every* invocation, taken from
   the live Net handle (chokepoint enforcement), never from ambient env.
+  **done**
 - **T3.5** Error taxonomy: stale-extractor (→ the yt-dlp -U hint), 403/expired
   (→ rotate+retry), proxy-down (→ net error). Timeouts on every exec.
+  **done**
 
-## Phase 4 — pkg/store (per T0.1)
+## Phase 4 - COMPLETED (claude) — pkg/store (per T0.1)
 
 - **T4.1** Runtime store (default): results in `$XDG_RUNTIME_DIR/chainsmoke`, 0700,
   survives across invocations, wiped by purge/cleanup. This is what makes
   `chainsmoke search` → `chainsmoke play N` work at all in the Go port.
+  **done**
 - **T4.2** Disk store (`--remember`): `$XDG_STATE_HOME/chainsmoke`, real persistence.
+  **done**
 - **T4.3** `--private`: memory/no-write semantics enforced *inside* the store
   (single write path), not at call sites — the bash bug T1.8 is the cautionary tale.
+  **done**
 - **T4.4** `Purge()`: wipe both stores; coordinate with player teardown
   (bash lesson T1.13).
+  **done**
 
 ## Phase 5 — pkg/player (mpv JSON-IPC)
 
