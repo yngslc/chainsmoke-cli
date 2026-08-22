@@ -95,7 +95,8 @@ Verified behavior baseline (what the carcass does today):
 | `.\chainsmoke.exe --help` | 0 | full command/flag table |
 | `.\chainsmoke.exe --version` | 0 | `chainsmoke version development` |
 | `.\chainsmoke.exe search kendrick` | 0/1 | real scsearch through the chokepoint (T3.3) — needs egress; fails closed without it |
-| `.\chainsmoke.exe np`, `toggle` | 1 | `chainsmoke: not implemented` (no IPC daemon in the raw player) |
+| `.\chainsmoke.exe np` | 0 | real IPC round-trip (T5.2); `nothing playing` when the daemon is idle. Needs a daemon — without one it exits 1 with `mpv IPC ... unreachable` |
+| `.\chainsmoke.exe toggle`, `vol N`, `next`, `prev` | 0 | real IPC commands against the daemon |
 | `.\chainsmoke.exe play 1` | 1 | `net.Up` warns DIRECT (no proxy), then `no cached result #1 — run \`chainsmoke search <term>\` first`. No egress. |
 | `.\chainsmoke.exe --proxy http://127.0.0.1:9 play 1` | 1 | `--proxy ... not reachable` — proves the flag reaches the bridge (T1.2) |
 | `.\chainsmoke.exe daemon start` | 0 | `Ensure()` finds mpv on PATH and returns nil (raw player has no real daemon yet) |
@@ -153,6 +154,15 @@ go test ./...   # → "?  chainsmoke  [no test files]" — no tests exist yet
 - **`rotate` now brings egress up first.** Without a live bridge there is
   nothing to re-isolate, and on a system tor with no ControlPort (this box) the
   verb used to fail outright. It now exits 0 and says which half it managed.
+- **The IPC client is real, and it is synchronous (T5.2).** One connection,
+  `request_id` correlation, async events discarded — see `pkg/player/mpv.go`.
+  It is NOT safe for concurrent use and does not need to be under T0.1(a). The
+  TUI's event-while-idle client (T10.7) is a second implementation behind the
+  same `Command` seam, not a change to this one.
+- **`daemon start` leaves mpv running, and `stop` does not kill it.** `Down()`
+  closes only our end of the pipe; killing the daemon is still T5.5. After a
+  smoke run there will be an idle mpv on the named pipe — that is also why the
+  `np-idle` case sits after `daemon-start`.
 - **`search` → `play N` works now (T4.1), and that has a cost.** Results live in
   `$XDG_RUNTIME_DIR/chainsmoke/results.json` (`%TEMP%\chainsmoke` on Windows),
   0700/0600, and they SURVIVE between invocations. Any smoke case asserting

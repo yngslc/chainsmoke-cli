@@ -84,8 +84,11 @@ $cases = @(
     # Match the invariant itself, not an incidental word in the remediation
     # text — the previous 'stdin' match broke when the message was reworded.
     @{ Name = 'url-in-argv';  Args = @('--allow-direct', 'play', 'https://soundcloud.com/a/b'); Exit = 1; Match = 'not accepted in argv' },
-    @{ Name = 'np-stub';      Args = @('np');                Exit = 1; Match = 'not implemented' },
     @{ Name = 'daemon-start'; Args = @('daemon', 'start');   Exit = 0; Match = '' },
+    # T5.2/T5.5: `np` is a real IPC round-trip now, so it runs AFTER daemon-start
+    # — otherwise the result depends on whether a daemon happened to be left
+    # over from an earlier run. An idle daemon is a state, not an error.
+    @{ Name = 'np-idle';      Args = @('np');                Exit = 0; Match = 'nothing playing' },
     # stdin contract: URLs never ride in argv; `get` reads one line from stdin,
     # then dies in the scrubber stub. Proves the stdin path is wired.
     @{ Name = 'get-stdin';    Args = @('--allow-direct', 'get'); Exit = 1; Match = 'not implemented'; Stdin = 'https://soundcloud.com/artist/track' },

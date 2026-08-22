@@ -77,7 +77,7 @@ corresponding expectation in
   `/chainsmoke/mpv.sock`; port the bash default (`/run/user/$UID`), create dir 0700.
 - **T1.5 — Replace homemade `atoi`/`isInt` with `strconv.Atoi`** (overflow).
 - **T1.6 — `get`: remove hardcoded `/tmp/in.m4a`**; plumb a real temp path
-  (full impl comes in Phase 6).
+  (full impl is deferred with download+scrub — see "Deferred: download + scrub").
 - **T1.7 — Honest stub errors.** Only append the "run: yt-dlp -U" hint for
   real resolver failures, never for `ErrNotImplemented`.
 
@@ -225,7 +225,26 @@ a new bug, which is what made the freeze safe.
 - **T5.5** Transport verbs: np/toggle/seek/vol/next/prev/stop on the real
   client; `daemon status`.
 
-## Phase 6 — pkg/scrub + get
+## Deferred: download + scrub (was Phase 6)
+
+Streaming-only means nothing persists, so metadata scrubbing has no target.
+Revisit when `get` ships. Open question at that time: Go M4A/AAC tag writing
+(bogem/id3v2 is MP3-only, dhowden/tag is read-only) — may force an
+ffmpeg-only scrub or a Python sidecar.
+
+Parked as written rather than deleted: the research below is the expensive
+part and it does not rot. Three things to carry to the revisit:
+
+- **T1.10's lesson parks with it.** "Don't pre-create the output file" is owned
+  by T6.1/T6.2 and by nothing else, so it is unowned until `get` ships.
+- **`get` remains a verb that cannot succeed.** It is wired to the scrubber
+  stub and fails with `not implemented` (the `get-stdin` smoke case). That is
+  honest but it is still a promise in `--help`; decide then whether to hide the
+  verb until it works.
+- **T6.3's "no python dependency" is no longer free.** The open question above
+  supersedes it: if nothing in Go can write M4A tags, the real choice is an
+  ffmpeg-only scrub or the sidecar, and that is a dependency decision, not a
+  library-picking one.
 
 - **T6.1** Download path: yt-dlp to a temp *dir* (never a pre-created file —
   T1.10 lesson), through the chokepoint.

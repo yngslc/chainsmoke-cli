@@ -66,7 +66,7 @@ func wire(app *core.App, remember, private bool, proxy, impersonate string, allo
 	n := csnet.New(proxy, allowDirect, torSocks)
 	app.Net = n
 	app.Res = resolver.New(n, impersonate)
-	app.Play = player.New(core.SocketPath())
+	app.Play = player.New(core.SocketPath(), n)
 	app.Scrub = scrub.New()
 	app.Store = store.New(remember, private)
 	app.Version = BuildVersion

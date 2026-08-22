@@ -25,10 +25,21 @@ import (
 // is not installed (TASKS.md T1.7).
 var ErrToolMissing = errors.New("yt-dlp not found on PATH — install yt-dlp to resolve streams")
 
-// resolveTimeout caps EVERY invocation (T3.5: "timeouts on every exec"). One
-// constant for all three verbs on purpose: they share a transport, and that
-// transport is Tor, which is what makes the ceiling this generous.
-const resolveTimeout = 60 * time.Second
+// Timeouts and attempt count are MEASURED against live Tor (2026-08-19), not
+// picked round: over 6 fresh circuits, the one that worked completed in 22.9s
+// while every failure stalled and was cut off at ~17s. So:
+//
+//   - socketTimeout 15s: no single socket operation in the successful run came
+//     near it, and it turns a dead circuit into a 17s loss instead of a 30s one.
+//   - maxAttempts 3: the failure is the exit you drew, so more dice beat more
+//     patience. Worst case ~51s, better odds than the old 2 x 30s.
+//   - resolveTimeout 45s: a backstop above yt-dlp's own timeout, with room for
+//     a 23s success. If it fires, yt-dlp is wedged rather than slow.
+const (
+	resolveTimeout = 45 * time.Second
+	socketTimeout  = "15" // seconds, passed to yt-dlp
+	maxAttempts    = 3
+)
 
 // YTDLP shells out to yt-dlp, always passing the proxy from the live Net handle
 // explicitly (research: socks5h env handling has had bugs — prefer --proxy)
@@ -36,6 +47,11 @@ const resolveTimeout = 60 * time.Second
 type YTDLP struct {
 	net         core.Net
 	impersonate string // yt-dlp curl_cffi target; "" disables
+
+	// invoke runs yt-dlp ONCE and classifies the result. It is a field, not a
+	// method call, purely so the retry policy above it can be tested without a
+	// yt-dlp, a network, or a Tor circuit — production always wires execOnce.
+	invoke func(ctx context.Context, args []string) ([]byte, error)
 }
 
 // ytEntry is the slice of yt-dlp's JSON we consume. Everything not listed here
@@ -68,7 +84,9 @@ var _ core.Resolver = (*YTDLP)(nil)
 // reading ambient env is what makes the chokepoint structural: a resolver
 // cannot be constructed without something that knows how to bring egress up.
 func New(n core.Net, impersonate string) *YTDLP {
-	return &YTDLP{net: n, impersonate: impersonate}
+	r := &YTDLP{net: n, impersonate: impersonate}
+	r.invoke = r.execOnce
+	return r
 }
 
 // Meta resolves a page URL to its entries with `--flat-playlist -J` (T3.1).
@@ -83,10 +101,7 @@ func (r *YTDLP) Meta(pageURL string) ([]core.Track, error) {
 		return nil, errors.New("empty URL")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
-	defer cancel()
-
-	out, err := r.run(ctx, "--flat-playlist", "-J", "--", pageURL)
+	out, err := r.run("--flat-playlist", "-J", "--", pageURL)
 	if err != nil {
 		return nil, err
 	}
@@ -112,10 +127,7 @@ func (r *YTDLP) Stream(permalink string) (string, error) {
 		return "", errors.New("empty permalink")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
-	defer cancel()
-
-	out, err := r.run(ctx,
+	out, err := r.run(
 		"-f", "bestaudio", "-g", "--no-playlist",
 		"--extractor-args", "soundcloud:formats=hls_aac",
 		"--", permalink)
@@ -146,12 +158,9 @@ func (r *YTDLP) Search(term string, limit int) ([]core.Track, error) {
 		limit = 50
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
-	defer cancel()
-
 	// scsearchN:<term> is a pseudo-URL, so it goes after `--` like any other:
 	// a term starting with "-" must never be read as a flag.
-	out, err := r.run(ctx, "--flat-playlist", "-J", "--", "scsearch"+strconv.Itoa(limit)+":"+term)
+	out, err := r.run("--flat-playlist", "-J", "--", "scsearch"+strconv.Itoa(limit)+":"+term)
 	if err != nil {
 		return nil, err
 	}
@@ -172,15 +181,92 @@ func (r *YTDLP) Search(term string, limit int) ([]core.Track, error) {
 // The single exec path (T3.4)
 // -----------------------------------------------------------------------------
 
-// run is where every yt-dlp invocation in this program goes. Having exactly ONE
-// of these is the whole of T3.4: proxy and impersonation are injected here, from
-// the live Net handle, on every call — so a new verb cannot reach SoundCloud
-// unproxied by forgetting a flag, and no ambient environment variable gets a
-// vote in where the traffic goes.
-func (r *YTDLP) run(ctx context.Context, args ...string) ([]byte, error) {
+// run is the retry policy, and the gate every yt-dlp invocation passes.
+//
+// Over Tor the dominant failure is the circuit, not the request, and it comes
+// in two flavours that want OPPOSITE treatment. Measured live, 2026-08-19,
+// paired across identical isolation credentials:
+//
+//   - Slow failure (~17s, yt-dlp's socket timeout, or a 403): the exit is
+//     unusable or blocked. Raising the timeout to 30s did not save a single one
+//     of these — it just cost twice as long. Rotate, then retry.
+//   - Fast failure (~5s): Tor is still building the circuit. One such request
+//     failed in 5.5s and the very next attempt on the SAME credentials
+//     succeeded in 8.0s. Rotating here would throw away a circuit that was
+//     about to work, and hand us a cold one with the same warm-up ahead of it.
+//     Retry, do NOT rotate.
+//
+// Deliberately not retried at all: a stale extractor, a rejected --impersonate,
+// a missing binary, a shut gate. No circuit fixes any of them, and retrying
+// only delays the message that would.
+func (r *YTDLP) run(args ...string) ([]byte, error) {
 	if err := r.net.Assert(); err != nil { // T0.2: fail closed before any egress
 		return nil, err
 	}
+
+	var err error
+	for attempt := 1; ; attempt++ {
+		// A budget per ATTEMPT, not per call: a retry that inherits the
+		// remainder of a spent deadline is not a retry.
+		ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+		var out []byte
+		started := time.Now()
+		out, err = r.invoke(ctx, args)
+		cancel()
+
+		if err == nil {
+			return out, nil
+		}
+		retry, rotate := retryPlan(err, time.Since(started))
+		if !retry || attempt >= maxAttempts {
+			return nil, err
+		}
+
+		// Say it out loud. A silent retry makes a stalled circuit look like a
+		// slow program rather than a bad relay.
+		what := "retrying"
+		if rotate {
+			what = "rotating circuit, retrying"
+		}
+		fmt.Fprintf(os.Stderr, "chainsmoke: %v\nchainsmoke:         %s (%d/%d)\n",
+			err, what, attempt+1, maxAttempts)
+
+		if rotate {
+			if rerr := r.net.Rotate(); rerr != nil {
+				fmt.Fprintf(os.Stderr, "chainsmoke: rotate failed (%v) — not retrying\n", rerr)
+				return nil, err
+			}
+		}
+	}
+}
+
+// circuitWarmup is the line between "Tor was still building" and "this exit is
+// no good" — see run's measurements. A failure faster than this is worth one
+// more try on the same circuit; a slower one has already proven the circuit.
+const circuitWarmup = 10 * time.Second
+
+// retryPlan decides what to do after a failed attempt: whether another one is
+// worth making, and whether it needs a different circuit first. Pure so the
+// policy can be tested without a network, a clock, or a Tor daemon.
+func retryPlan(err error, elapsed time.Duration) (retry, rotate bool) {
+	switch {
+	case errors.Is(err, core.ErrRateLimited):
+		// SoundCloud answered — fast — and said no. Only a new exit changes it.
+		return true, true
+	case errors.Is(err, core.ErrEgress):
+		return true, elapsed >= circuitWarmup
+	default:
+		return false, false
+	}
+}
+
+// execOnce is the single exec path (T3.4): proxy and impersonation are injected
+// here, from the live Net handle, on every call — so a new verb cannot reach
+// SoundCloud unproxied by forgetting a flag, and no ambient environment
+// variable gets a vote in where the traffic goes.
+func (r *YTDLP) execOnce(ctx context.Context, args []string) ([]byte, error) {
+	// Checked here rather than in run() so the retry policy stays pure: no
+	// binary, no network, no circuit needed to test it.
 	if _, err := exec.LookPath("yt-dlp"); err != nil {
 		return nil, ErrToolMissing
 	}
@@ -189,7 +275,7 @@ func (r *YTDLP) run(ctx context.Context, args ...string) ([]byte, error) {
 		"--ignore-config", // a user's yt-dlp config could override --proxy
 		"--no-cache-dir",  // no resolved-URL crumbs under ~/.cache
 		"--no-progress",
-		"--socket-timeout", "30",
+		"--socket-timeout", socketTimeout,
 	}
 	base = append(base, r.proxyArgs()...)
 	if r.impersonate != "" {
@@ -272,9 +358,11 @@ func classify(ctx context.Context, err error, stderr string) error {
 		return nil
 	}
 	// A process killed by the context deadline reports a generic exit status,
-	// so ask the context rather than the error.
+	// so ask the context rather than the error. It is ErrEgress because that is
+	// what it means over Tor: bytes were not moving. Classifying it that way is
+	// also what lets run() rotate and retry instead of surrendering.
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("yt-dlp timed out after %s", resolveTimeout)
+		return fmt.Errorf("%w: yt-dlp timed out after %s", core.ErrEgress, resolveTimeout)
 	}
 
 	// Lowercase once: yt-dlp capitalizes ("ERROR: Unable to extract ...").
@@ -292,7 +380,13 @@ func classify(ctx context.Context, err error, stderr string) error {
 	case contains(low,
 		"proxy", "socks", "connection refused", "tunnel connection failed",
 		"failed to connect", "failed to establish a new connection",
-		"curl: (7)", "winerror 10061"):
+		"curl: (7)", "winerror 10061",
+		// A circuit that never completes is a transport failure too, and over
+		// Tor it is the COMMON one — verified live: a bad exit hangs until
+		// yt-dlp's own --socket-timeout fires ("curl: (28) Connection timed
+		// out"). Without this the user is told to update yt-dlp because a
+		// relay was slow.
+		"timed out", "curl: (28)"):
 		return fmt.Errorf("%w: %s", core.ErrEgress, firstLine(stderr))
 
 	// A rejected --impersonate is OUR argument, not SoundCloud's fault: yt-dlp

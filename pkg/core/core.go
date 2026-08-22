@@ -436,3 +436,5 @@ var ErrRateLimited = errors.New("SoundCloud refused the request (403/429) — th
 // carry the connection. This is a pkg/net fault surfaced through the resolver,
 // and must NOT be reported as a SoundCloud or yt-dlp problem.
 var ErrEgress = errors.New("yt-dlp could not reach the network through the proxy")
+
+var ErrDeadStream = errors.New("Revoked stream")
