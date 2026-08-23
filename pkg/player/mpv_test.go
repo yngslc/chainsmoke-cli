@@ -200,7 +200,7 @@ func (n fakeNet) Verified() bool   { return n.gate == nil }
 func TestEnqueueFailsClosed(t *testing.T) {
 	p := New("unused.sock", fakeNet{gate: errors.New("egress not verified")})
 
-	err := p.Enqueue("http://127.0.0.1:1/never-reached")
+	err := p.Enqueue("http://127.0.0.1:1/never-reached", "x")
 	if err == nil {
 		t.Fatal("Enqueue() = nil with the gate shut, want a refusal")
 	}
@@ -219,7 +219,7 @@ func TestPreflightSkipsDeadStreams(t *testing.T) {
 	defer dead.Close()
 
 	p := New("unused.sock", fakeNet{proxy: "DIRECT (no proxy)"})
-	err := p.Enqueue(dead.URL + "/expired?Signature=secret")
+	err := p.Enqueue(dead.URL+"/expired?Signature=secret", "x")
 
 	if !errors.Is(err, core.ErrDeadStream) {
 		t.Fatalf("Enqueue() = %v, want core.ErrDeadStream", err)
@@ -235,7 +235,7 @@ func TestPreflightErrorsDoNotLeakTheURL(t *testing.T) {
 	const signed = "http://127.0.0.1:1/x?Policy=abc&Signature=secret"
 	p := New("unused.sock", fakeNet{proxy: "DIRECT (no proxy)"})
 
-	err := p.Enqueue(signed)
+	err := p.Enqueue(signed, "x")
 	if err == nil {
 		t.Fatal("Enqueue() = nil against a dead port, want an error")
 	}
@@ -275,5 +275,136 @@ func TestHTTPClientUsesTheLiveProxy(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("ProxyURL %q -> proxy %q, want %q", tc.proxy, got, tc.want)
 		}
+	}
+}
+
+// TestEnqueueSendsLoadfile pins the T5.3 wire format and, just as importantly,
+// that Enqueue RETURNS — a blocking Enqueue is what made preload-ahead
+// impossible before.
+func TestEnqueueSendsLoadfile(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer origin.Close()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	var sent []string
+	go func() {
+		sc := bufio.NewScanner(server)
+		for sc.Scan() {
+			sent = append(sent, sc.Text())
+			fmt.Fprintf(server, `{"request_id":%d,"error":"success"}`+"\n", requestID(t, sc.Text()))
+		}
+	}()
+
+	p := New("unused.sock", fakeNet{proxy: "DIRECT (no proxy)"})
+	p.ipc = newIPC(client) // stand in for a dialled daemon
+
+	done := make(chan error, 1)
+	go func() { done <- p.Enqueue(origin.URL+"/track.m4a?Signature=secret", "Lemon Black") }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Enqueue() = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Enqueue() blocked — it must hand the track to the daemon and return")
+	}
+
+	if len(sent) != 2 {
+		t.Fatalf("sent %d commands, want loadfile + unpause: %v", len(sent), sent)
+	}
+	if !strings.Contains(sent[0], `"loadfile"`) || !strings.Contains(sent[0], `"append-play"`) {
+		t.Errorf("first command = %s, want loadfile ... append-play", sent[0])
+	}
+	// Sticky pause from an earlier session would swallow this track silently.
+	if !strings.Contains(sent[1], `"pause"`) {
+		t.Errorf("second command = %s, want the unpause", sent[1])
+	}
+}
+
+// TestEnqueueDoesNotQueueADeadStream: the preflight is the only synchronous
+// signal (loadfile answers "success" for a dead URL), so a failed preflight
+// must stop the track from ever reaching mpv's playlist.
+func TestEnqueueDoesNotQueueADeadStream(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer dead.Close()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	var sent int
+	go func() {
+		sc := bufio.NewScanner(server)
+		for sc.Scan() {
+			sent++
+		}
+	}()
+
+	p := New("unused.sock", fakeNet{proxy: "DIRECT (no proxy)"})
+	p.ipc = newIPC(client)
+
+	if err := p.Enqueue(dead.URL+"/expired", "x"); !errors.Is(err, core.ErrDeadStream) {
+		t.Fatalf("Enqueue() = %v, want core.ErrDeadStream", err)
+	}
+	if sent != 0 {
+		t.Errorf("%d commands reached mpv; a dead stream must never enter the playlist", sent)
+	}
+}
+
+// TestEnqueueForcesTheTitle: without force-media-title mpv falls back to the
+// filename, and an HLS "filename" is the whole signed URL — so `np` would print
+// a credential. Measured against mpv 0.41 before this was added.
+func TestEnqueueForcesTheTitle(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer origin.Close()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	var first string
+	go func() {
+		sc := bufio.NewScanner(server)
+		for sc.Scan() {
+			if first == "" {
+				first = sc.Text()
+			}
+			fmt.Fprintf(server, `{"request_id":%d,"error":"success"}`+"\n", requestID(t, sc.Text()))
+		}
+	}()
+
+	p := New("unused.sock", fakeNet{proxy: "DIRECT (no proxy)"})
+	p.ipc = newIPC(client)
+	if err := p.Enqueue(origin.URL+"/playlist.m3u8?Signature=secret", "Lemon Black"); err != nil {
+		t.Fatalf("Enqueue() = %v", err)
+	}
+	if !strings.Contains(first, `"force-media-title":"Lemon Black"`) {
+		t.Errorf("loadfile = %s\nwant force-media-title so `np` shows a title, not a URL", first)
+	}
+}
+
+// TestNowPlayingNeverPrintsAURL is the backstop: whatever ends up in mpv's
+// playlist, `np` must not be the thing that puts a signed URL on a terminal.
+func TestNowPlayingNeverPrintsAURL(t *testing.T) {
+	const leaked = "playlist.m3u8?Policy=abc&Signature=secret"
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		sc := bufio.NewScanner(server)
+		for sc.Scan() {
+			fmt.Fprintf(server, `{"data":"https://cdn.example/%s","request_id":%d,"error":"success"}`+"\n",
+				leaked, requestID(t, sc.Text()))
+		}
+	}()
+
+	p := New("unused.sock", fakeNet{})
+	p.ipc = newIPC(client)
+
+	got, err := p.NowPlaying()
+	if err != nil {
+		t.Fatalf("NowPlaying() = %v", err)
+	}
+	if strings.Contains(got, "Signature") || strings.Contains(got, "://") {
+		t.Errorf("NowPlaying() = %q — it printed the signed URL", got)
 	}
 }

@@ -69,7 +69,24 @@ func (p *MPV) Ensure() error {
 		}
 	}
 
-	cmd := exec.Command("mpv", "--idle", "--no-video", "--gapless-audio", "--cache-on-disk=no", "--input-ipc-server="+p.sock)
+	// Every flag here is load-bearing; all were checked against mpv 0.41 rather
+	// than assumed:
+	//   --idle              stay alive with an empty playlist (this is the daemon)
+	//   --no-video          audio-only; never opens a window
+	//   --no-config         the user's mpv.conf must not override any of the
+	//                       above, the same reason the resolver passes
+	//                       --ignore-config to yt-dlp
+	//   --no-ytdl           mpv must NEVER resolve a URL itself. Its ytdl hook
+	//                       does not fire for direct media URLs (measured), but
+	//                       a page URL reaching it would spawn a yt-dlp outside
+	//                       the chokepoint — no proxy flags, no impersonation.
+	//   --gapless-audio     this is a music queue, not a video player
+	//   --cache-on-disk=no  already the default; stated because "stream bytes
+	//                       never touch the disk" is a promise, not a preference
+	cmd := exec.Command("mpv",
+		"--idle", "--no-video", "--no-config", "--no-ytdl",
+		"--gapless-audio", "--cache-on-disk=no",
+		"--input-ipc-server="+p.sock)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start mpv: %w", err)
 	}
@@ -234,30 +251,44 @@ func setReadDeadline(rw io.ReadWriteCloser, d time.Duration) {
 // is gone; waiting longer only delays a skip the caller has to make anyway.
 const preflightTimeout = 10 * time.Second
 
-// Enqueue plays an already-resolved stream URL. The HEAD preflight in front of
-// it is the first half of T5.3: SoundCloud's signed URLs expire, and handing
-// mpv a dead one makes it sit on a connection that will never produce audio.
-// Failing here with core.ErrDeadStream lets the caller skip the track instead
-// of aborting the queue (T1.14, skip-not-abort).
+// Enqueue hands an already-resolved stream URL to the daemon (T5.3): preflight,
+// then `loadfile <url> append-play` over the IPC socket, then return. It does
+// NOT block — the track outlives this process, which is the whole of T0.1(a).
 //
-// KNOWN GAP (T5.3): the name is still aspirational. A real Enqueue sends
-// `loadfile <url> append-play` over the IPC socket and returns immediately;
-// this one plays in the FOREGROUND and blocks until the track ends, so callers
-// must not run two of them — they fight over the same terminal.
+// The preflight is load-bearing, not belt-and-braces. Measured against mpv 0.41:
+// `loadfile` answers `{"error":"success"}` for a URL pointing at a dead port and
+// only fails LATER, as an async event with no request_id. So the HEAD is the one
+// synchronous signal a short-lived process can act on, and without it
+// skip-not-abort (T1.14) would have nothing to decide from — every track would
+// "succeed" and the queue would silently fill with dead entries.
 //
-// KNOWN GAP (invariant #3): the signed URL rides mpv's argv and is therefore
-// visible in the OS process list. The IPC path fixes this by sending it over
-// the socket instead. Do not treat this as acceptable past Phase 5.
-func (p *MPV) Enqueue(streamURL string) error {
+// Invariant #3 is improved, not solved: the signed URL no longer rides mpv's
+// argv (the OS process list), but it does live in mpv's playlist, readable by
+// anything that can reach the IPC socket. That is what the 0700 runtime dir is
+// protecting.
+func (p *MPV) Enqueue(streamURL, title string) error {
 	if err := p.net.Assert(); err != nil { // T0.2: fail closed before any egress
 		return err
 	}
 	if err := p.preflight(streamURL); err != nil {
 		return fmt.Errorf("%w: %v", core.ErrDeadStream, err)
 	}
-	cmd := exec.Command("mpv", "--no-video", "--quiet", streamURL)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+	// mpv falls back to the FILENAME for media-title, and an HLS stream's
+	// "filename" is the whole signed URL — so without force-media-title, `np`
+	// prints Policy and Signature straight to the terminal (measured 2026-08-22,
+	// invariant #3). The title is the fix, not a nicety.
+	args := []any{"loadfile", streamURL, "append-play"}
+	if title != "" {
+		args = append(args, -1, map[string]any{"force-media-title": title})
+	}
+	if _, err := p.Command(args...); err != nil {
+		return err
+	}
+	// The daemon keeps pause state between invocations, so a session someone
+	// paused yesterday would swallow today's `play` silently. Unpausing is the
+	// difference between "queued" and "audible".
+	_, err := p.Command("set_property", "pause", false)
+	return err
 }
 
 // preflight asks the CDN whether the stream is still there, through the SAME
@@ -274,18 +305,28 @@ func (p *MPV) preflight(streamURL string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), preflightTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, streamURL, nil)
+	// A one-byte ranged GET, NOT a HEAD. TASKS.md T5.3 says "HEAD via bridge",
+	// and that was measured wrong on 2026-08-22: SoundCloud's playback CDN
+	// answers HEAD with `405 Method Not Allowed`, so a HEAD preflight rejects
+	// every healthy stream — it skipped a track that played fine seconds later.
+	// `Range: bytes=0-0` is the portable equivalent, and it proves more: the CDN
+	// will actually serve bytes, not merely acknowledge the URL.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Range", "bytes=0-0")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		// The URL is a credential, and err embeds it. Report the shape of the
 		// failure, never the target (invariant #3).
-		return fmt.Errorf("HEAD failed: %s", redactURL(err.Error(), streamURL))
+		return fmt.Errorf("preflight failed: %s", redactURL(err.Error(), streamURL))
 	}
 	defer resp.Body.Close()
 
+	// 403 is the one that matters: an expired or revoked signature. Anything
+	// else at or above 400 is equally unplayable from here.
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("CDN answered %s", resp.Status)
 	}
@@ -343,6 +384,12 @@ func (p *MPV) Command(args ...any) (any, error) {
 // NowPlaying reports the current track's title. An idle daemon is a state, not
 // a failure: mpv answers "property unavailable" when the playlist is empty, and
 // `np` should say so plainly rather than surface an IPC error.
+//
+// The redaction is a backstop for invariant #3. Enqueue sets force-media-title
+// so this returns a real title, but anything that reaches mpv's playlist by
+// another route (a user's own `loadfile`, a future code path) would fall back
+// to the filename — which for an HLS stream is a signed URL. `np` must never be
+// the thing that prints a credential.
 func (p *MPV) NowPlaying() (string, error) {
 	title, err := p.Command("get_property", "media-title")
 	if err != nil {
@@ -355,17 +402,31 @@ func (p *MPV) NowPlaying() (string, error) {
 	if !ok {
 		return "", fmt.Errorf("mpv: media-title was %T, want a string", title)
 	}
+	if strings.Contains(s, "://") || strings.Contains(s, "Signature=") {
+		return "<playing: title unavailable, URL withheld>", nil
+	}
 	return s, nil
 }
 
-// Down closes OUR end of the IPC connection. It does not stop mpv: killing the
-// daemon is the `stop` verb's job (T5.5), and core.App.Purge relies on that
-// distinction — on POSIX the socket file lives in the directory purge removes,
-// so a still-running mpv there is the T1.13 hazard, still open.
+// Down stops the daemon and then closes our end of the pipe (T5.5). It is the
+// teardown half of the pair: `stop` the VERB clears the queue and keeps the
+// session alive, while this ends the session outright.
+//
+// core.App.Purge depends on it doing exactly that: on POSIX the IPC socket
+// lives inside the directory purge is about to delete, and removing it out from
+// under a live mpv leaves a daemon nobody can talk to (T1.13). On Windows an
+// open handle cannot be removed at all.
+//
+// A daemon that is already gone is not an error — Purge must not stop halfway
+// because there was nothing to tear down.
 func (p *MPV) Down() error {
 	if p.ipc == nil {
 		return nil
 	}
+	// Best effort: mpv closes the connection as it exits, so the reply to
+	// `quit` frequently never arrives. That is a successful quit, not a fault.
+	_, _ = p.Command("quit")
+
 	err := p.ipc.Close()
 	p.ipc = nil
 	return err

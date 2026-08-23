@@ -87,9 +87,9 @@ type Resolver interface {
 // Player owns the mpv daemon and speaks JSON-IPC over the unix socket
 // (named pipe on Windows — TASKS.md T10.7).
 type Player interface {
-	Ensure() error                    // start mpv --idle if not already up
-	Enqueue(streamURL string) error   // loadfile ... append-play (preflighted upstream)
-	Command(args ...any) (any, error) // raw IPC: get/set/cycle/seek/playlist-*
+	Ensure() error                         // start mpv --idle if not already up
+	Enqueue(streamURL, title string) error // loadfile ... append-play; title keeps the signed URL out of `np`
+	Command(args ...any) (any, error)      // raw IPC: get/set/cycle/seek/playlist-*
 	NowPlaying() (string, error)
 	Down() error
 }
@@ -210,36 +210,55 @@ func stdinIsTerminal() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-// EnqueueAhead plays entry 0, then resolves and enqueues entry 1 so exactly one
-// item stays preloaded — without pre-resolving the whole queue, whose signed
-// URLs would expire before playback reached them.
+// preloadAhead is how many tracks are resolved and queued before this process
+// exits: the one that plays, plus one waiting behind it. Not the whole
+// playlist, because SoundCloud's signed URLs expire — resolving track 40 now
+// would hand mpv a URL that is dead long before playback reaches it, and it
+// would cost 40 Tor round-trips to do so (TASKS.md T5.4).
+const preloadAhead = 2
+
+// EnqueueAhead resolves and queues up to preloadAhead tracks, synchronously.
 //
-// The enqueue of N+1 is SYNCHRONOUS by decision T0.1(a): under the "mpv is the
-// only daemon" model the chainsmoke process is short-lived, so a goroutine
-// would be killed the moment main() returns. (The bash prototype's `&` at
-// script.sh:237 forks a surviving process; a goroutine does not. The idiom was
-// ported, its semantics were not.) See TASKS.md T5.4.
+// Synchronous by decision T0.1(a): under the "mpv is the only daemon" model the
+// chainsmoke process is short-lived, so a goroutine would be killed the moment
+// main() returns. (The bash prototype's `&` at script.sh:237 forks a surviving
+// process; a goroutine does not. The idiom was ported, its semantics were not.)
+//
+// Skip-not-abort (T1.14): one dead track must cost only itself. A stream that
+// will not resolve, or a URL the CDN has already expired, is reported and
+// stepped over — the queue is abandoned only when NOTHING could be queued.
 func (a *App) EnqueueAhead(entries []Track) error {
 	if len(entries) == 0 {
 		return errors.New("nothing resolved")
 	}
-	first, err := a.Res.Stream(entries[0].Permalink)
-	if err != nil {
-		return YtdlpHint(err)
-	}
-	if err := a.Play.Enqueue(first); err != nil { // Enqueue preflights internally
-		return err
-	}
-	if len(entries) > 1 {
-		// Best-effort: a dead entry must skip, not abort the whole play
-		// (bash lesson T1.14). The error is surfaced, not swallowed silently.
-		if s, err := a.Res.Stream(entries[1].Permalink); err == nil {
-			if err := a.Play.Enqueue(s); err != nil {
-				fmt.Fprintf(os.Stderr, "chainsmoke: preload of next track failed (skipped): %v\n", err)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "chainsmoke: could not resolve next track (skipped): %v\n", err)
+
+	queued := 0
+	for _, t := range entries {
+		if queued == preloadAhead {
+			break
 		}
+		url, err := a.Res.Stream(t.Permalink)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "chainsmoke: skipping %q: %v\n", t.Title, YtdlpHint(err))
+			continue
+		}
+		if err := a.Play.Enqueue(url, t.Title); err != nil {
+			fmt.Fprintf(os.Stderr, "chainsmoke: skipping %q: %v\n", t.Title, err)
+			continue
+		}
+		queued++
+		// Playback starts in the daemon and outlives this process, so without
+		// a line here `play` would exit instantly and silently — which reads as
+		// "nothing happened" rather than "it is playing".
+		fmt.Fprintf(a.out(), "▶ %s\n", t.Title)
+	}
+
+	if queued == 0 {
+		return fmt.Errorf("none of the %d resolved tracks could be queued", len(entries))
+	}
+	if len(entries) > queued {
+		fmt.Fprintf(a.out(), "  (%d more in this set — run `chainsmoke next` when this pair ends)\n",
+			len(entries)-queued)
 	}
 	return nil
 }

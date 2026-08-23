@@ -29,14 +29,16 @@ tar.exe -xf "$env:TEMP\go.zip" -C "$env:LOCALAPPDATA\go-portable"
 The smoke driver auto-detects this location when `go` is not on PATH.
 
 The runtime deps from `script.sh` (mpv, yt-dlp, ffmpeg, jq, socat, tor,
-privoxy) are **not** needed to build or drive the carcass's still-stubbed verbs.
-But two are now installed (used by the implemented raw `play` path):
+privoxy) are not all needed: `privoxy` was dropped in T2.2 and `jq`/`socat`
+were bash-only. Three matter now, and all three are installed:
 
 - **mpv** `0.41.0` — `winget install --id shinchiro.mpv` → `C:\Program Files\MPV Player\` (added to the User PATH).
 - **yt-dlp** `2026.07.04` — portable exe at `%LOCALAPPDATA%\chainsmoke-tools\bin\yt-dlp.exe` (on the User PATH).
+- **tor** — runs inside WSL (Ubuntu-26.04), reachable from native Windows on `127.0.0.1:9050` through WSL2 localhost forwarding, so `chainsmoke.exe` needs no changes to use it.
 
-`ffmpeg` ships inside the mpv build; `tor`/`privoxy`/`jq`/`socat` are still not
-installed (the egress path falls back to a DIRECT connection with a warning).
+`ffmpeg` ships inside the mpv build. Tor's ControlPort (9051) is NOT enabled on
+this box, so `rotate` cannot send NEWNYM and falls back to re-isolating its
+SOCKS credentials — which is why that verb still exits 0.
 Because a fresh install persisted these to the *User* PATH, a shell started
 earlier may not see them — `smoke.ps1` re-reads Machine+User PATH from the
 registry to compensate.
@@ -99,19 +101,19 @@ Verified behavior baseline (what the carcass does today):
 | `.\chainsmoke.exe toggle`, `vol N`, `next`, `prev` | 0 | real IPC commands against the daemon |
 | `.\chainsmoke.exe play 1` | 1 | `net.Up` warns DIRECT (no proxy), then `no cached result #1 — run \`chainsmoke search <term>\` first`. No egress. |
 | `.\chainsmoke.exe --proxy http://127.0.0.1:9 play 1` | 1 | `--proxy ... not reachable` — proves the flag reaches the bridge (T1.2) |
-| `.\chainsmoke.exe daemon start` | 0 | `Ensure()` finds mpv on PATH and returns nil (raw player has no real daemon yet) |
+| `.\chainsmoke.exe daemon start` | 0 | spawns `mpv --idle` and liveness-probes it over IPC (T5.1); returns nil if one is already up |
 | `"https://soundcloud.com/artist/track" \| .\chainsmoke.exe get` | 1 | stdin URL is read (no-URLs-in-argv contract), then dies in the scrubber stub |
 | `.\chainsmoke.exe purge` | 0 | really wipes both stores now (T4.4): runtime + state dirs, with the player taken down first |
-| `.\chainsmoke.exe stop` | 0 | silent success (player.Down is still a no-op) |
+| `.\chainsmoke.exe stop` | 0 | closes our end of the pipe. Does NOT kill mpv — `Down()` is not `quit` yet (T5.5), so daemons accumulate |
 | `.\chainsmoke.exe audit` | 1 | `Up()` runs first (T7.1 posture is probed, not printed from config), so it warns DIRECT, prints `egress: DIRECT (no proxy)` + runtime dir + version, then SelfTest fails with "egress is DIRECT" |
 | `.\chainsmoke.exe seek` / `vol 900` | 1 | arity/range rejected before mpv ever sees the argument |
 | `.\chainsmoke.exe bogus` | 3 | `No help topic for 'bogus'` |
 
-Raw `play` is implemented: `net.Up` (detect Privoxy `:8118` / `--proxy`, else
-DIRECT + warning) → `mpv`/`yt-dlp` presence check → resolve one stream via
-`yt-dlp -g` → play with a foreground `mpv --no-video`. A real end-to-end play
-needs a live SoundCloud URL and makes a network request (DIRECT unless
-tor+privoxy are up), so it is not part of the offline smoke baseline.
+`play` today: `net.Up` (system tor on :9050, else a private one, else refuse —
+`--proxy` or `--allow-direct` override) → `Ensure()` spawns the mpv daemon →
+`Meta`/`Stream` resolve through the chokepoint → `EnqueueAhead` plays with a
+foreground `mpv --no-video`. A real end-to-end play needs a live SoundCloud URL
+and makes a network request, so it is not part of the offline smoke baseline.
 
 ## Direct invocation (dev loop)
 
@@ -122,15 +124,21 @@ findstr /s /n "ErrNotImplemented" cmd\*.go pkg\*.go
 ```
 
 Then `go vet ./...` + the smoke driver are the inner loop. Real egress needs
-tor+privoxy on :9050/:8118; without them every verb falls back to DIRECT with a
-warning.
-
+tor on :9050 (privoxy is gone since T2.2 — the CONNECT→SOCKS5 bridge is
+in-process and picks its own ephemeral port). Without tor every egress verb
+fails closed unless `--allow-direct` is passed.
 ## Test
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # → "?  chainsmoke  [no test files]" — no tests exist yet
+go test ./...   # 58 passing: core 3, net 19, player 10, resolver 16, store 10
 ```
+
+Test coverage lives where the invariants are, not spread evenly: `pkg/store`
+asserts `--private` writes zero bytes, `pkg/player` asserts a signed URL cannot
+reach an error string, `pkg/resolver` pins the retry policy and the error
+taxonomy against stderr captured from real yt-dlp. `cmd/` and `pkg/scrub` have
+none — the CLI surface is covered by smoke.ps1 instead.
 
 ## Gotchas
 - **Build `.\cmd\chainsmoke`, never `.`** — see Build. This is the single most
@@ -183,15 +191,18 @@ go test ./...   # → "?  chainsmoke  [no test files]" — no tests exist yet
 - **The banner prints on stdout for every verb**, before argument parsing. It
   pollutes pipes and corrupts `--generate-bash-completion`. Known, deliberate,
   and owned by T10.1/T10.2 — do not "fix" it in an unrelated change.
-- **The raw `play` path works on native Windows** (foreground
-  `mpv --no-video <resolved-url>`, no IPC socket) with mpv+yt-dlp on PATH. It is
-  not gated on Tor: it falls back to a DIRECT, non-anonymized connection with a
-  warning (TASKS.md T0.2 wants that flipped to fail-closed before shipping).
+- **`play` still uses a FOREGROUND mpv, and starts a daemon it then ignores.**
+  `Ensure()` spawns `mpv --idle`, then `Enqueue` execs a *second* mpv that
+  blocks until the track ends. Two processes, and the signed URL rides the
+  second one's argv (invariant #3). Fixing it is T5.3's `loadfile append-play`.
+  It IS gated on Tor now — fail-closed since T2.3, unlike the older note here.
 - **mpv JSON-IPC works on BOTH targets** — unix socket under WSL, named pipe
   (`\\.\pipe\chainsmoke-mpv`) on native Windows; verified against mpv 0.41 with
   a live `get_property` round-trip. Same protocol, different dial. `core.SocketPath()`
-  already returns the right endpoint per platform; the Phase-5 client must
-  abstract the dial (T10.7) rather than assume `net.Dial("unix", ...)`.
+  already returns the right endpoint per platform, and `pkg/player` abstracts
+  the dial as T10.7 asked: `net.Dial("unix", ...)` on POSIX, `os.OpenFile` on
+  the named pipe. Stdlib only — no go-winio — but a blocked read there cannot
+  be interrupted by `Close()`, which is the TUI's problem, not the CLI's.
 
 ## TASKS
 - this is a check-up prompt:

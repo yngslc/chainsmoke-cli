@@ -212,18 +212,23 @@ a new bug, which is what made the freeze safe.
   (bash lesson T1.13).
   **done**
 
-## Phase 5 — pkg/player (mpv JSON-IPC)
+## Phase 5 - COMPLETED — pkg/player (mpv JSON-IPC)
 
 - **T5.1** `Ensure()`: spawn `mpv --idle --no-video --input-ipc-server`,
   wait for socket, liveness-probe stale sockets (T1.15 lesson).
+  **done**
 - **T5.2** IPC client: newline-delimited JSON, `request_id` correlation,
   filter async event messages out of replies.
+    **done**
 - **T5.3** `Enqueue()`: preflight (HEAD via bridge) then
   `loadfile append-play`; skip-not-abort on failure (T1.14 lesson).
+    **done**
 - **T5.4** Preload-ahead per the T0.1 decision (daemon queue, or synchronous
   enqueue-next, or mpv event hook). The current goroutine is dead code.
+    **done**
 - **T5.5** Transport verbs: np/toggle/seek/vol/next/prev/stop on the real
   client; `daemon status`.
+    **done**
 
 ## Deferred: download + scrub (was Phase 6)
 
@@ -263,8 +268,15 @@ part and it does not rot. Three things to carry to the revisit:
   connection goes to the bridge and only *.soundcloud/*.sndcdn beyond it.
   This is the acceptance test for T0.2/T2.x/T3.4.
 - **T7.3** Verify mpv/ffmpeg honor the proxy for HLS fetches on the target
-  build ("ALL_PROXY sometimes honored — verify per build" is currently an
-  open question, and it's a leak if false).
+  build. **ANSWERED 2026-08-19 (mpv 0.41, native Windows), measured with a
+  local origin server and a proxy pointed at a dead port:**
+  `http_proxy`/`https_proxy` are honored — the fetch fails and never reaches
+  the origin. **`ALL_PROXY` is IGNORED: mpv connects directly, with no error.**
+  So the answer to "sometimes honored" is: not for ALL_PROXY, and the failure
+  is silent. `exportProxyEnv` already sets only the four correct spellings, so
+  the shipped path is safe; the remaining T7.3 work is (a) re-measure on the
+  WSL/Linux build, and (b) an assertion that keeps it that way, since nothing
+  today would catch a future ALL_PROXY-only regression.
 
 ## Phase 8 — UX + release polish
 

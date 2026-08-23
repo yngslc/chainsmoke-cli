@@ -226,8 +226,11 @@ func commands(app *core.App) []*cli.Command {
 			Action: func(*cli.Context) error { _, err := app.Play.Command("set_property", "pause", true); return err },
 		},
 		{
-			Name: "stop", Usage: "Kill the player daemon",
-			Action: func(*cli.Context) error { return app.Play.Down() },
+			Name: "stop", Usage: "Stop playback and clear the queue (daemon stays up)",
+			// mpv's own `stop` command does both halves — measured: playlist-count
+			// 2 -> 0 with the daemon still answering. Killing the daemon is
+			// `daemon stop`, which is a different thing to want (T5.5).
+			Action: func(*cli.Context) error { _, err := app.Play.Command("stop"); return err },
 		},
 
 		// --- privacy / lifecycle -----------------------------------------------
@@ -267,7 +270,7 @@ func commands(app *core.App) []*cli.Command {
 			Subcommands: []*cli.Command{
 				{Name: "start", Usage: "Start the mpv daemon if it is not running",
 					Action: func(*cli.Context) error { return app.Play.Ensure() }},
-				{Name: "stop", Usage: "Stop the mpv daemon",
+				{Name: "stop", Usage: "Stop the mpv daemon (ends the session)",
 					Action: func(*cli.Context) error { return app.Play.Down() }},
 				{Name: "status", Usage: "Report whether the mpv daemon is reachable",
 					Action: func(*cli.Context) error {
