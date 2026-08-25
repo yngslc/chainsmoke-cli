@@ -67,11 +67,20 @@ go build -o chainsmoke.exe .\cmd\chainsmoke
 # → chainsmoke version development
 ```
 
-Release-style version stamp (works, verified):
+**Release builds go through `build.ps1`, not a bare `go build`** (T8.3):
 
 ```powershell
-go build -ldflags "-X main.BuildVersion=0.0.1" -o chainsmoke.exe .\cmd\chainsmoke
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Version 0.1.0        # this host
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Version 0.1.0 -All   # 6 targets -> .\dist
 ```
+
+It vets first, then builds with `-trimpath -ldflags "-s -w -X main.BuildVersion=..."`
+and `CGO_ENABLED=0`. **`-trimpath` is not cosmetic:** measured 2026-08-24, a
+build without it embeds 15 absolute source paths (`D:/sccli/pkg/core/browse.go`
+and friends), disclosing the builder's drive letter and directory layout to
+anyone holding the binary. `-s -w` takes 13 MB to 8.9 MB. The Linux artifact is
+confirmed `statically linked` by `file(1)`; darwin cross-compiles but has no
+dev target here, so it is untested.
 
 `chainsmoke.exe` lands in the repo root. Note `go build .\cmd\chainsmoke`
 compiles only that package's dependency graph — run `go vet ./...` (as smoke.ps1
@@ -84,7 +93,7 @@ and output against the current baseline:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .claude\skills\run-chainsmoke\smoke.ps1
-# → PASS x20, "smoke: all 20 cases pass", exit 0
+# → PASS x35, "smoke: all 35 cases pass", exit 0
 ```
 
 **When you implement a subsystem, flip the corresponding expectations in the
@@ -96,7 +105,10 @@ Verified behavior baseline (what the carcass does today):
 |---|---|---|
 | `.\chainsmoke.exe --help` | 0 | full command/flag table |
 | `.\chainsmoke.exe --version` | 0 | `chainsmoke version development` |
-| `.\chainsmoke.exe search kendrick` | 0/1 | real scsearch through the chokepoint (T3.3) — needs egress; fails closed without it |
+| `.\chainsmoke.exe search kendrick` | 0/1 | real scsearch through the chokepoint (T3.3) — needs egress; fails closed without it. Prints the T8.1 table on a TTY, TSV down a pipe |
+| `.\chainsmoke.exe likes <user>` | 0/1 | `/likes` page through Meta (T8.2); handle validated BEFORE `Net.Up()`, so a typo costs no circuit |
+| `.\chainsmoke.exe playlist <user>/<set>` | 0/1 | same, for `/<user>/sets/<slug>`. Also accepts the `<user>/sets/<slug>` spelling |
+| `.\chainsmoke.exe completion bash\|zsh\|fish` | 0 | prints a completion script, with NO banner (T8.3) |
 | `.\chainsmoke.exe np` | 0 | real IPC round-trip (T5.2); `nothing playing` when the daemon is idle. Needs a daemon — without one it exits 1 with `mpv IPC ... unreachable` |
 | `.\chainsmoke.exe toggle`, `vol N`, `next`, `prev` | 0 | real IPC commands against the daemon |
 | `.\chainsmoke.exe play 1` | 1 | `net.Up` warns DIRECT (no proxy), then `no cached result #1 — run \`chainsmoke search <term>\` first`. No egress. |
@@ -104,8 +116,9 @@ Verified behavior baseline (what the carcass does today):
 | `.\chainsmoke.exe daemon start` | 0 | spawns `mpv --idle` and liveness-probes it over IPC (T5.1); returns nil if one is already up |
 | `"https://soundcloud.com/artist/track" \| .\chainsmoke.exe get` | 1 | stdin URL is read (no-URLs-in-argv contract), then dies in the scrubber stub |
 | `.\chainsmoke.exe purge` | 0 | really wipes both stores now (T4.4): runtime + state dirs, with the player taken down first |
-| `.\chainsmoke.exe stop` | 0 | closes our end of the pipe. Does NOT kill mpv — `Down()` is not `quit` yet (T5.5), so daemons accumulate |
-| `.\chainsmoke.exe audit` | 1 | `Up()` runs first (T7.1 posture is probed, not printed from config), so it warns DIRECT, prints `egress: DIRECT (no proxy)` + runtime dir + version, then SelfTest fails with "egress is DIRECT" |
+| `.\chainsmoke.exe stop` | 0 | mpv `stop`: clears the queue and ends playback, daemon stays up (T5.5). Killing the daemon is `daemon stop`, which sends `quit` |
+| `.\chainsmoke.exe audit` | 1 | probes, never prints config (T7.1). Reports posture (TOR / DIRECT / DOWN), proxy, impersonate, store mode + cached count, drift against the saved config, the egress ledger (T7.2), and local DNS. Exit 1 whenever the setup is not healthy |
+| `.\chainsmoke.exe audit --save` | 0/1 | records this run's egress settings with the posture the probe PROVED. Exit still tracks the audit, not the save — with Tor up it is 0, on a DIRECT run it saves, warns, and exits 1 |
 | `.\chainsmoke.exe seek` / `vol 900` | 1 | arity/range rejected before mpv ever sees the argument |
 | `.\chainsmoke.exe bogus` | 3 | `No help topic for 'bogus'` |
 
@@ -131,14 +144,24 @@ fails closed unless `--allow-direct` is passed.
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # 58 passing: core 3, net 19, player 10, resolver 16, store 10
+go test ./...   # 119 passing: core 44, net 29, player 14, resolver 19, store 13
 ```
 
 Test coverage lives where the invariants are, not spread evenly: `pkg/store`
-asserts `--private` writes zero bytes, `pkg/player` asserts a signed URL cannot
-reach an error string, `pkg/resolver` pins the retry policy and the error
-taxonomy against stderr captured from real yt-dlp. `cmd/` and `pkg/scrub` have
-none — the CLI surface is covered by smoke.ps1 instead.
+asserts `--private` writes zero bytes; `pkg/player` asserts a signed URL cannot
+reach an error string; `pkg/resolver` pins the retry policy and the error
+taxonomy against stderr captured from real yt-dlp, including which recovery
+hint each failure earns; `pkg/net` pins the fail-closed proxy spelling and the
+egress ledger; `pkg/core` pins what `audit` may claim, that a page URL built
+from user input cannot leave soundcloud.com, and that the results table never
+prints a permalink. `cmd/` and `pkg/scrub` have none — the CLI surface is
+covered by smoke.ps1 instead.
+
+`pkg/core/table_test.go` is the one place tests exist for a non-security
+reason: column alignment is arithmetic (display cells, not bytes or runes), and
+arithmetic is worth asserting rather than eyeballing. `TestTableColumnsAlign`
+renders CJK, emoji and combining marks at five widths and checks every row ends
+at the same cell.
 
 ## Gotchas
 - **Build `.\cmd\chainsmoke`, never `.`** — see Build. This is the single most
@@ -167,10 +190,44 @@ none — the CLI surface is covered by smoke.ps1 instead.
   It is NOT safe for concurrent use and does not need to be under T0.1(a). The
   TUI's event-while-idle client (T10.7) is a second implementation behind the
   same `Command` seam, not a change to this one.
-- **`daemon start` leaves mpv running, and `stop` does not kill it.** `Down()`
-  closes only our end of the pipe; killing the daemon is still T5.5. After a
-  smoke run there will be an idle mpv on the named pipe — that is also why the
-  `np-idle` case sits after `daemon-start`.
+- **`daemon start` leaves mpv running, and `stop` deliberately does not kill
+  it.** `stop` is mpv's own `stop` (queue cleared, session kept); `daemon stop`
+  is what sends `quit` (T5.5). After a smoke run there will be an idle mpv on
+  the named pipe — that is also why the `np-idle` case sits after
+  `daemon-start`.
+- **`audit` is the ONE verb that still runs when egress is down (T7.1).** Every
+  other verb aborts on `Up()`'s refusal because it is about to send traffic;
+  audit sends nothing of its own, and a diagnostic that refuses to run exactly
+  when the thing it diagnoses is broken is useless. It prints the report and
+  then returns the failure, so the exit code is unchanged — do not "fix" the
+  non-zero exit by making the report a success.
+- **Posture has THREE states, not two.** `TOR` (verified), `DIRECT` (permitted
+  by `--allow-direct`, unanonymized), and `DOWN` (nothing permitted to leave —
+  `Assert()` fails). Collapsing the last two tells a user their traffic is
+  leaking when it is in fact being refused.
+- **`audit --save` writes to the real config dir, so tests must sandbox it.**
+  `%APPDATA%\chainsmoke\config.json` (or `$XDG_CONFIG_HOME`). smoke.ps1 points
+  `XDG_CONFIG_HOME` at a temp sandbox it wipes at startup — without that, the
+  six audit cases would both depend on and destroy the developer's real saved
+  config. Any new audit case belongs after that block, and the ordered group
+  (`audit-down` → `audit-nosave` → `audit-noconfig` → `audit-save` →
+  `audit-match` → `audit-drift`) must stay in order: the first three assert the
+  "nothing saved yet" branch.
+- **The egress ledger is process-scoped, and `audit` is its own process
+  (T7.2).** So a bare `audit` shows only the tunnel its own self-test opened —
+  never what an earlier `play` did. That is the honest scope, not a bug:
+  persisting it would mean writing destination hostnames to disk, which is the
+  trail the whole tool exists to avoid. `Observed: false` (a `--proxy` or
+  DIRECT run) means "we could not look" and must never be rendered as "nothing
+  left the machine".
+- **The proxy env vars are a security invariant, not a formatting choice
+  (T7.3).** Measured 2026-08-23 on mpv 0.41, both targets: with a LIVE proxy
+  all six spellings work, but with a DEAD one, `ALL_PROXY`, `https_proxy` and
+  `HTTPS_PROXY` all make mpv **silently open a direct connection** — and on
+  Linux so does `HTTP_PROXY`. Lowercase `http_proxy` is the only spelling that
+  fails closed everywhere, and its presence is what makes the shipped four fail
+  closed. Do not "simplify" `exportProxyEnv` to the upper-case convention or to
+  `ALL_PROXY`; `pkg/net/proxyenv_test.go` will fail, and it is right to.
 - **`search` → `play N` works now (T4.1), and that has a cost.** Results live in
   `$XDG_RUNTIME_DIR/chainsmoke/results.json` (`%TEMP%\chainsmoke` on Windows),
   0700/0600, and they SURVIVE between invocations. Any smoke case asserting
@@ -188,14 +245,48 @@ none — the CLI surface is covered by smoke.ps1 instead.
   `pkg/store/store_test.go`, not just intended.
 - **Unknown verbs exit 3, not 1** (urfave/cli's `CommandNotFound` path). Every
   other failure is exit 1 — there is no MISUSE/NOT_FOUND differentiation yet.
-- **The banner prints on stdout for every verb**, before argument parsing. It
-  pollutes pipes and corrupts `--generate-bash-completion`. Known, deliberate,
-  and owned by T10.1/T10.2 — do not "fix" it in an unrelated change.
-- **`play` still uses a FOREGROUND mpv, and starts a daemon it then ignores.**
-  `Ensure()` spawns `mpv --idle`, then `Enqueue` execs a *second* mpv that
-  blocks until the track ends. Two processes, and the signed URL rides the
-  second one's argv (invariant #3). Fixing it is T5.3's `loadfile append-play`.
-  It IS gated on Tor now — fail-closed since T2.3, unlike the older note here.
+- **The banner prints on stdout for every verb**, before argument parsing, and
+  pollutes pipes. Known, deliberate, owned by T10.1/T10.2 — do not "fix" it in
+  an unrelated change. **Two exceptions exist** and they are not the general
+  fix: `bannerCorruptsOutput` suppresses it for `--generate-bash-completion`
+  (every wordmark line would become a completion candidate) and for
+  `completion <shell>` (the script gets redirected into `~/.bashrc`). If you add
+  a global flag that takes a VALUE, add it to `valueFlags` in
+  `cmd/chainsmoke/completion.go` too, or `--newflag completion` will be misread
+  as the completion verb.
+- **The results table decides its columns from the DATA (T8.1).** Measured
+  2026-08-24 through Tor, `--flat-playlist` returns three shapes: `scsearch`
+  carries title+uploader+duration, user pages (`/likes`, `/tracks`) carry title
+  only, and SETS carry *neither* — no `title` field at all. So `likes` prints a
+  one-column table by design, and `playlist` titles come from
+  `titleFromSlug` in `pkg/resolver`, not from SoundCloud. Do not "fix" a
+  missing UPLOADER column; there is no uploader in that response.
+- **A terminal gets the table, a pipe gets TSV.** Four fields, no header, no
+  truncation, duration in SECONDS and empty (not 0) when unknown. smoke.ps1
+  captures through a pipe, so it always sees the TSV path — assert on TSV there.
+- **Track titles are third-party text and are scrubbed before display.** A
+  newline would forge a numbered row (pointing `play N` at something the user
+  never saw), a tab would wreck the TSV, an ESC would repaint the terminal.
+  `clean()` in `pkg/core/table.go` handles it; `TestCleanRejectsHostileTitles`
+  is the guard.
+- **`likes`/`playlist` take a HANDLE, never a URL**, and that is the deliberate
+  line: a handle is the same exposure as `search <term>`, a track URL is not
+  (invariant #3). `cleanHandle`'s allowlist is also the reason the URL handed to
+  the chokepoint can only ever point at soundcloud.com — a 17-case injection
+  sweep asserts it. Do not relax it to "accept a pasted URL and parse out the
+  handle"; by then argv already has the URL.
+- **`play` drives the daemon over IPC — the old "foreground mpv" note was
+  stale and has been corrected (2026-08-24).** T5.3 landed: `Ensure()` spawns
+  `mpv --idle`, and `Enqueue` sends `loadfile <url> append-play` over the socket
+  with `force-media-title`. One process, and the signed URL never touches argv
+  (invariant #3). The only `exec.Command("mpv", ...)` left is the daemon spawn.
+- **A daemon outlives the run that spawned it, and its proxy env does not
+  follow.** The bridge picks a NEW ephemeral port every run, `Ensure()` reuses a
+  live daemon, and mpv's environment is fixed at spawn — so run 2 talks to a
+  daemon whose `http_proxy` still names run 1's dead port. Measured 2026-08-24:
+  this **fails closed** (the track silently does not start; no leak), which is
+  the right direction but still broken playback. The fix is per-load options on
+  `loadfile` rather than inherited env; not yet done.
 - **mpv JSON-IPC works on BOTH targets** — unix socket under WSL, named pipe
   (`\\.\pipe\chainsmoke-mpv`) on native Windows; verified against mpv 0.41 with
   a live `get_property` round-trip. Same protocol, different dial. `core.SocketPath()`

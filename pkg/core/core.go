@@ -15,9 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -31,22 +33,21 @@ var ErrNotImplemented = errors.New("not implemented")
 // Data model
 // -----------------------------------------------------------------------------
 
+// Track is the only shape SoundCloud metadata takes inside chainsmoke.
+//
+// Every field here is one something actually fills. Streams/Likes/Reposts used
+// to sit alongside these and were removed 2026-08-24: nothing ever wrote them,
+// so they serialized as `"Streams":0,"Likes":0,"Reposts":0` into every cache
+// file and read as data the tool had collected. `--flat-playlist` does not
+// return counts at all — getting them means one non-flat resolve per track,
+// which is a Tor round-trip each and exactly what T3.1 made Meta flat to avoid.
+// Re-add them when something populates them, not before.
 type Track struct {
 	ID        string
 	Title     string
 	Uploader  string
-	Duration  int // seconds
-	Streams   int
-	Likes     int
-	Reposts   int
+	Duration  int    // seconds; 0 means "SoundCloud did not say", never "zero-length"
 	Permalink string // soundcloud.com/... — kept internal, never printed into argv examples
-}
-
-type Playlist struct {
-	ID     string
-	Title  string
-	Tracks []Track
-	Plays  int
 }
 
 // -----------------------------------------------------------------------------
@@ -121,6 +122,11 @@ type App struct {
 	Store   Store
 	Version string
 
+	// Egress is the effective egress configuration for THIS run, resolved at
+	// the CLI edge and handed down (T1.2). Audit compares it against the saved
+	// config; nothing else reads it.
+	Egress Config
+
 	// Stdin is where URLs arrive (invariant #3). Overridable for tests.
 	Stdin io.Reader
 	// Out is normal program output. Diagnostics go to stderr at the CLI edge,
@@ -178,18 +184,7 @@ func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
 				"  chainsmoke search <term> && chainsmoke play 1   # no URL anywhere",
 			arg)
 	}
-	// On an interactive terminal, prompt instead of blocking silently — a bare
-	// ReadString here looks like a hung CLI. The prompt is also the most
-	// private way in: typing a URL at it puts the URL in neither argv (visible
-	// via /proc) nor the shell's history file. Piping achieves the first but
-	// not the second.
-	//
-	// The prompt goes to stderr so `chainsmoke play | ...` keeps a clean stdout.
-	if a.Stdin == nil && stdinIsTerminal() {
-		fmt.Fprint(os.Stderr, "URL (stays out of argv and shell history): ")
-	}
-	line, err := bufio.NewReader(a.stdin()).ReadString('\n')
-	line = strings.TrimSpace(line)
+	line, err := a.readLine("URL (stays out of argv and shell history): ")
 	if line == "" {
 		if err != nil {
 			return Track{}, errors.New("no result index given and no URL on stdin")
@@ -197,6 +192,23 @@ func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
 		return Track{}, errors.New("empty URL on stdin")
 	}
 	return Track{Permalink: line}, nil
+}
+
+// readLine takes exactly one line from stdin, prompting first when there is a
+// human to prompt.
+//
+// On an interactive terminal a bare ReadString looks like a hung CLI, so it
+// asks. The prompt is also the most private route in: what is typed at it lands
+// in neither argv (visible via /proc) nor the shell's history file, where a
+// pipe achieves only the first.
+//
+// The prompt goes to stderr so `chainsmoke play | ...` keeps a clean stdout.
+func (a *App) readLine(prompt string) (string, error) {
+	if a.Stdin == nil && stdinIsTerminal() {
+		fmt.Fprint(os.Stderr, prompt)
+	}
+	line, err := bufio.NewReader(a.stdin()).ReadString('\n')
+	return strings.TrimSpace(line), err
 }
 
 // stdinIsTerminal reports whether stdin is an interactive console rather than a
@@ -271,27 +283,151 @@ type DNSAuditor interface {
 	AuditLocalDNS() (visible bool, lines []string)
 }
 
-// Audit prints the runtime privacy posture. Everything it reports is PROBED at
-// runtime, never read back from config (TASKS.md T7.1) — that distinction is
-// the whole point of the verb.
+// EgressAuditor is optionally implemented by a Net that can account for what
+// crossed it (T7.2). Optional for the same reason: a Net that is someone else's
+// proxy cannot see its own traffic, and must say so rather than report zero.
+type EgressAuditor interface {
+	EgressLedger() EgressLedger
+}
+
+// StoreDescriber is optionally implemented by a Store that can say where it
+// keeps things and how much is there (T7.1).
+type StoreDescriber interface {
+	Describe() (mode string, results int)
+}
+
+// Audit reports the runtime privacy posture. Everything about the live path is
+// PROBED, never read back from config (T7.1) — that distinction is the whole
+// point of the verb, and the saved config below does not weaken it: the config
+// is an EXPECTATION the probe is compared against, never a substitute for it.
+//
+// Three questions, in the order a user actually asks them:
+//
+//  1. Am I anonymized right now?          (probed posture, DNS, ledger)
+//  2. Am I anonymized the way I chose?    (drift against the saved config)
+//  3. What does this machine still hold?  (store mode, cached results)
 func (a *App) Audit() error {
-	posture := "DIRECT ⚠  (not anonymized)"
-	if a.Net.Verified() {
+	live := a.Egress
+
+	// Three states, not two. Collapsing the last two into "DIRECT" was wrong in
+	// the direction that matters: with egress DOWN nothing is permitted to
+	// leave at all (Assert fails), and telling a user their traffic is going
+	// out unanonymized when it is in fact being refused sends them chasing a
+	// leak that does not exist.
+	posture := "DOWN ✋ (no egress permitted — fail-closed)"
+	switch {
+	case a.Net.Verified():
 		posture = "TOR ✓  (verified by a live CONNECT)"
+	case a.Net.Assert() == nil:
+		posture = "DIRECT ⚠  (permitted by --allow-direct; NOT anonymized)"
 	}
+
 	fmt.Fprintf(a.out(), "egress:      %s\n", posture)
 	fmt.Fprintf(a.out(), "proxy:       %s\n", a.Net.ProxyURL())
+	fmt.Fprintf(a.out(), "impersonate: %s\n", describeImpersonate(live.Impersonate))
+
+	if d, ok := a.Store.(StoreDescriber); ok {
+		mode, results := d.Describe()
+		fmt.Fprintf(a.out(), "store:       %s\n", mode)
+		fmt.Fprintf(a.out(), "results:     %d cached\n", results)
+	}
 	fmt.Fprintf(a.out(), "runtime dir: %s\n", RuntimeDir())
 	fmt.Fprintf(a.out(), "version:     %s\n", a.Version)
 
+	a.auditConfig(live)
+	a.auditEgressLedger()
+
 	if d, ok := a.Net.(DNSAuditor); ok {
 		_, lines := d.AuditLocalDNS()
-		fmt.Fprintln(a.out(), "local DNS:")
+		fmt.Fprintln(a.out(), "\nlocal DNS:")
 		for _, ln := range lines {
 			fmt.Fprintf(a.out(), "  %s\n", ln)
 		}
 	}
 	return a.Net.SelfTest()
+}
+
+// auditConfig answers "am I anonymized the way I chose to be?" — the question a
+// probe alone cannot answer, because a run that quietly fell back to
+// --allow-direct probes as a perfectly healthy DIRECT connection.
+func (a *App) auditConfig(live Config) {
+	saved, exists, err := LoadConfig()
+	switch {
+	case err != nil:
+		fmt.Fprintf(a.out(), "\nsaved config: %v\n", err)
+		return
+	case !exists:
+		fmt.Fprintf(a.out(), "\nsaved config: none — run `chainsmoke audit --save` to record this one\n")
+		return
+	}
+
+	fmt.Fprintf(a.out(), "\nsaved config: %s, verified %s\n",
+		saved.SavedAt.Local().Format("2006-01-02 15:04"), saved.SavedPosture)
+
+	drift := saved.Diff(live)
+	if len(drift) == 0 {
+		fmt.Fprintln(a.out(), "  ✓ this run matches it")
+	} else {
+		for _, d := range drift {
+			fmt.Fprintf(a.out(), "  ⚠ %-12s saved %s, running %s\n", d.Field, d.Saved, d.Live)
+		}
+	}
+
+	// The sharpest case: the settings can match while the OUTCOME does not,
+	// because a saved TOR config still runs DIRECT when Tor is down and
+	// --allow-direct is in play. Comparing fields alone would call that a match.
+	if saved.SavedPosture == "TOR" && !a.Net.Verified() {
+		fmt.Fprintln(a.out(), "  ⚠ you saved this as an ANONYMIZED setup and this run is not anonymized")
+	}
+}
+
+// auditEgressLedger prints what actually crossed the bridge (T7.2).
+func (a *App) auditEgressLedger() {
+	auditor, ok := a.Net.(EgressAuditor)
+	if !ok {
+		return
+	}
+	l := auditor.EgressLedger()
+
+	fmt.Fprintln(a.out(), "\negress ledger (this process):")
+	if !l.Observed {
+		// Saying "0 connections" here would be a lie of omission: an external
+		// proxy carries traffic we cannot see.
+		fmt.Fprintln(a.out(), "  not observable — this run does not own the bridge (--proxy or DIRECT)")
+		return
+	}
+	if len(l.Targets) == 0 {
+		fmt.Fprintln(a.out(), "  no tunnels opened yet in this process")
+	}
+	for _, target := range sortedTargets(l.Targets) {
+		mark := "✓ expected"
+		host := target
+		if h, _, err := net.SplitHostPort(target); err == nil {
+			host = h
+		}
+		if !ExpectedHost(host) {
+			mark = "⚠ UNEXPECTED"
+		}
+		fmt.Fprintf(a.out(), "  %-46s %d  %s\n", target, l.Targets[target], mark)
+	}
+	if l.Refused > 0 {
+		fmt.Fprintf(a.out(), "  %d plaintext attempt(s) refused by the bridge\n", l.Refused)
+	}
+	if l.Failed > 0 {
+		fmt.Fprintf(a.out(), "  %d tunnel(s) failed to open (dead exit, or a blocked one)\n", l.Failed)
+	}
+	// Scope, stated every time rather than buried in a doc: this accounts for
+	// what went THROUGH the bridge, not for what may have gone around it.
+	fmt.Fprintln(a.out(), "  (accounts for traffic through the bridge; it cannot see traffic that bypassed it)")
+}
+
+func sortedTargets(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Purge wipes stored state, and does it in the ONE order that works: the player
@@ -316,16 +452,6 @@ func (a *App) Purge() error {
 	return a.Store.Purge()
 }
 
-// PrintResults writes the numbered result set: index and title only. Permalinks
-// stay in the store so they never reach a terminal, a scrollback buffer, or a
-// shell history (invariant #3).
-func (a *App) PrintResults(ts []Track) {
-	// TODO(impl): tablewriter, matching the reference's PrintTable output (T8.1).
-	for i, t := range ts {
-		fmt.Fprintf(a.out(), "%3d  %s\n", i+1, t.Title)
-	}
-}
-
 // YtdlpHint appends the ONE recovery action that fits the failure — and nothing
 // at all for a stub, where "run: yt-dlp -U" would send the user chasing a
 // dependency that is not the problem (TASKS.md T1.7).
@@ -343,6 +469,20 @@ func YtdlpHint(err error) error {
 		return err // pkg/net's problem; the error already says so
 	case errors.Is(err, ErrRateLimited):
 		return fmt.Errorf("%w\n  the exit is likely blocked — run: chainsmoke rotate", err)
+	case errors.Is(err, ErrImpersonate):
+		// Nothing left the machine, so neither SoundCloud nor the extractor is
+		// involved. Both fixes are offered because the cause is one of two
+		// things and the message from yt-dlp does not always distinguish them.
+		return fmt.Errorf("%w\n"+
+			"  install the dependency:  pip install \"yt-dlp[default,curl-cffi]\"\n"+
+			"  or turn it off:          chainsmoke --impersonate '' ...", err)
+	case errors.Is(err, ErrNotFound):
+		// SoundCloud answered, and the answer was "that does not exist". The
+		// extractor parsed the reply perfectly well; updating it changes
+		// nothing. Nearly always a mistyped handle.
+		return fmt.Errorf("%w\n"+
+			"  check the spelling — handles are the tail of the profile URL\n"+
+			"  chainsmoke search <artist>   # to find one you are unsure of", err)
 	}
 	return fmt.Errorf("%w\n  SoundCloud extractor may be stale — run: yt-dlp -U", err)
 }
@@ -457,3 +597,96 @@ var ErrRateLimited = errors.New("SoundCloud refused the request (403/429) — th
 var ErrEgress = errors.New("yt-dlp could not reach the network through the proxy")
 
 var ErrDeadStream = errors.New("Revoked stream")
+
+// -----------------------------------------------------------------------------
+// Egress accounting (TASKS.md T7.2)
+// -----------------------------------------------------------------------------
+
+// EgressLedger is what actually crossed the bridge in this process: every
+// CONNECT target, plus the two kinds of thing that did not become a tunnel.
+//
+// Read the scope honestly. This accounts for traffic that WENT THROUGH the
+// bridge; it cannot see traffic that went around it. A ledger showing only
+// SoundCloud hosts is evidence, not proof, and the difference is the open half
+// of T7.2 — closing it needs the OS to answer, not us (a netns on Linux, a
+// packet capture in CI).
+type EgressLedger struct {
+	// Observed is false when this process does not own a bridge — a user
+	// --proxy, or DIRECT mode. An empty ledger then means "we could not look",
+	// which must never be displayed as "nothing left the machine".
+	Observed bool
+
+	// Targets counts CONNECTs per "host:port".
+	Targets map[string]int
+
+	// Refused counts non-CONNECT requests the bridge rejected. Each one is a
+	// child process that tried to push PLAINTEXT through us — the loud failure
+	// the bridge prefers over quietly proxying it.
+	Refused int
+
+	// Failed counts CONNECTs that never became a tunnel (a dead exit, a
+	// refused SOCKS request). Not a leak; useful for telling "SoundCloud is
+	// blocking this circuit" apart from "nothing was attempted".
+	Failed int
+}
+
+// UnexpectedTargets returns the ledger entries that are not hosts chainsmoke
+// has a reason to reach, sorted for stable output.
+func (l EgressLedger) UnexpectedTargets() []string {
+	var out []string
+	for target := range l.Targets {
+		host := target
+		if h, _, err := net.SplitHostPort(target); err == nil {
+			host = h
+		}
+		if !ExpectedHost(host) {
+			out = append(out, target)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// expectedSuffixes is the set of hosts a correct chainsmoke run reaches.
+//
+// soundcloud.cloud is not decoration and not a typo: the December 2025 HLS/AAC
+// migration moved audio to playback.media-streaming.soundcloud.cloud, and a
+// live resolve on 2026-08-19 returned exactly that host. TASKS.md T7.2 was
+// written as "only *.soundcloud/*.sndcdn", which would flag the tool's own
+// working audio stream as foreign traffic.
+var expectedSuffixes = []string{
+	"soundcloud.com",
+	"sndcdn.com",
+	"soundcloud.cloud",
+}
+
+// ExpectedHost reports whether host is one chainsmoke legitimately talks to.
+// Suffix matching is deliberately anchored on a leading dot so that a host like
+// "evilsoundcloud.com" cannot pass by ending in the same letters.
+func ExpectedHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, suffix := range expectedSuffixes {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrImpersonate means yt-dlp refused the --impersonate target we gave it, so
+// nothing ever left the machine. Found live 2026-08-24: without this branch the
+// failure fell through to the default hint and told the user to run `yt-dlp -U`
+// — an update that cannot fix a flag, for a request that never happened. The
+// real fixes are the two below, and which one applies depends on whether
+// curl_cffi is installed at all.
+var ErrImpersonate = errors.New("yt-dlp rejected --impersonate")
+
+// ErrNotFound is SoundCloud answering 404: the user, track or playlist does not
+// exist. Found live 2026-08-24 running `chainsmoke likes` against a mistyped
+// handle — it fell through to the default hint and advised `yt-dlp -U`, which
+// is the one thing that cannot possibly help. The extractor parsed the reply
+// correctly; the reply just said "no such page".
+//
+// Deliberately NOT retryable: unlike a blocked exit, a 404 is the same on every
+// circuit, so retryPlan leaves it in the no-retry default.
+var ErrNotFound = errors.New("SoundCloud has no such user, track, or playlist (404)")

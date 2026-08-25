@@ -518,6 +518,7 @@ func freePort() (int, error) {
 // support at all. This is the job Privoxy did in script.sh, done in-process so
 // chainsmoke keeps its single-static-binary promise and drops a dependency.
 type ConnectBridge struct {
+	ledger *ledger // T7.2 accounting: every CONNECT that crossed this bridge
 	ln     net.Listener
 	dialer *socks5Dialer
 	wg     sync.WaitGroup
@@ -537,6 +538,7 @@ func StartConnectBridge(torSocksAddr string, isolate bool) (*ConnectBridge, erro
 	b := &ConnectBridge{
 		ln:     ln,
 		dialer: &socks5Dialer{addr: torSocksAddr, timeout: tunnelTimeout},
+		ledger: newLedger(),
 	}
 	if isolate {
 		b.dialer.user = "chainsmoke"
@@ -562,11 +564,20 @@ func (b *ConnectBridge) Reisolate() bool { return b.dialer.reisolate() }
 
 // Verify pushes one real CONNECT through the bridge to target and tears it down.
 // Success means Tor is bootstrapped and the whole chain carries bytes.
+//
+// It dials b.dialer directly rather than looping through our own listener, so
+// the ledger has to be told here too (T7.2). Skipping it would under-report our
+// OWN egress — the one direction an honesty feature must never err in — and it
+// is also the only tunnel a bare `chainsmoke audit` opens, since that verb runs
+// no yt-dlp and no mpv.
 func (b *ConnectBridge) Verify(target string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), tunnelTimeout)
 	defer cancel()
+
+	b.ledger.connect(target)
 	c, err := b.dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
+		b.ledger.fail()
 		return fmt.Errorf("egress self-test failed (%s): %w", target, err)
 	}
 	return c.Close()
@@ -600,6 +611,7 @@ func (b *ConnectBridge) handle(client net.Conn) {
 	// PLAINTEXT through us — refuse loudly rather than proxy it, so a leak
 	// shows up as a visible failure instead of as quiet traffic.
 	if req.Method != http.MethodConnect {
+		b.ledger.refuse() // T7.2: a child tried to push plaintext through us
 		_, _ = io.WriteString(client,
 			"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 		return
@@ -610,11 +622,13 @@ func (b *ConnectBridge) handle(client net.Conn) {
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		target = net.JoinHostPort(target, "443")
 	}
+	b.ledger.connect(target) // T7.2: every tunnel this process opened
 
 	ctx, cancel := context.WithTimeout(context.Background(), tunnelTimeout)
 	upstream, err := b.dialer.DialContext(ctx, "tcp", target)
 	cancel()
 	if err != nil {
+		b.ledger.fail() // T7.2: attempted, never became a tunnel
 		_, _ = io.WriteString(client,
 			"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 		return

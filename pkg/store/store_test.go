@@ -261,3 +261,97 @@ func assertPrivateMode(t *testing.T, dir string) {
 		t.Errorf("%s mode = %#o, want 0600", resultsFile, perm)
 	}
 }
+
+// --- T7.1: describing the store for `audit` -----------------------------------
+
+// TestDescribeNamesTheBackendAndCount: `audit` answers "what does this machine
+// still hold?", and the answer differs for each of the three modes. Getting the
+// mode wrong here would tell a --private user their permalinks are on disk, or
+// worse, tell a --remember user they are not.
+func TestDescribeNamesTheBackendAndCount(t *testing.T) {
+	runtimeDir, stateDir := isolate(t)
+
+	cases := []struct {
+		name             string
+		remember, priv   bool
+		wantMode, wantIn string
+		wantResults      int
+	}{
+		{"runtime", false, false, "runtime (ephemeral)", runtimeDir, len(sample)},
+		{"disk", true, false, "disk (--remember)", stateDir, len(sample)},
+		// --private reads nothing, so it must report 0 even though the other two
+		// stores on this machine are full — that is T4.3's isolation, restated.
+		{"private", false, true, "memory (--private", "", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.remember, tc.priv)
+			if !tc.priv {
+				if err := s.SaveResults(sample); err != nil {
+					t.Fatalf("SaveResults: %v", err)
+				}
+			}
+			mode, results := describer(t, s).Describe()
+			if !strings.Contains(mode, tc.wantMode) {
+				t.Errorf("mode = %q, want it to contain %q", mode, tc.wantMode)
+			}
+			if tc.wantIn != "" && !strings.Contains(mode, tc.wantIn) {
+				t.Errorf("mode = %q, want it to name the directory %q", mode, tc.wantIn)
+			}
+			if results != tc.wantResults {
+				t.Errorf("results = %d, want %d", results, tc.wantResults)
+			}
+		})
+	}
+}
+
+// TestDescribeOnAnEmptyMachine: never having searched is not an error, and
+// `audit` must not fail on a fresh install.
+func TestDescribeOnAnEmptyMachine(t *testing.T) {
+	isolate(t)
+
+	mode, results := describer(t, New(false, false)).Describe()
+	if mode == "" {
+		t.Error("mode is empty on a fresh machine")
+	}
+	if results != 0 {
+		t.Errorf("results = %d, want 0", results)
+	}
+}
+
+// TestDescribeSurvivesACorruptCache: a half-written results.json already
+// degrades to "no results" for `play` (TestCorruptCacheIsRecoverable). Audit
+// must degrade the same way instead of reporting a count it could not read.
+func TestDescribeSurvivesACorruptCache(t *testing.T) {
+	runtimeDir, _ := isolate(t)
+
+	s := New(false, false)
+	if err := s.SaveResults(sample); err != nil {
+		t.Fatalf("SaveResults: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "results.json"), []byte("{tru"), 0o600); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+
+	mode, results := describer(t, New(false, false)).Describe()
+	if results != 0 {
+		t.Errorf("results = %d on a corrupt cache, want 0", results)
+	}
+	if !strings.Contains(mode, "runtime") {
+		t.Errorf("mode = %q, want the backend still named", mode)
+	}
+}
+
+// describer asserts through core.StoreDescriber rather than calling the method
+// on *Store directly. Audit reaches the store as an interface value and skips
+// the whole section when the assertion fails, so a New() that stopped returning
+// a describing store would silently shorten the report — this is where that
+// gets caught.
+func describer(t *testing.T, s core.Store) core.StoreDescriber {
+	t.Helper()
+	d, ok := s.(core.StoreDescriber)
+	if !ok {
+		t.Fatalf("%T does not implement core.StoreDescriber; `audit` would omit the store section", s)
+	}
+	return d
+}

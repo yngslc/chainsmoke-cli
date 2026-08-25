@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"chainsmoke/pkg/core"
 )
@@ -371,6 +372,15 @@ func classify(ctx context.Context, err error, stderr string) error {
 	case contains(low, "http error 403", "http error 429", "too many requests"):
 		return fmt.Errorf("%w: %s", core.ErrRateLimited, firstLine(stderr))
 
+	// The other definitive answer from SoundCloud, and the opposite advice: 403
+	// means "not from this exit, try another circuit", 404 means "this page does
+	// not exist, no circuit will help". Found live 2026-08-24 on a mistyped
+	// handle, where it fell through to the default and recommended `yt-dlp -U`.
+	// Matched on the full status rather than a bare "not found", which is common
+	// enough in other messages to over-match.
+	case contains(low, "http error 404", "404: not found"):
+		return fmt.Errorf("%w: %s", core.ErrNotFound, firstLine(stderr))
+
 	// Both HTTP stacks yt-dlp can use are covered here, and they word it
 	// differently: curl_cffi (the --impersonate path) says "curl: (7) Failed to
 	// connect", urllib says "Unable to connect to proxy" / "Failed to establish
@@ -394,14 +404,26 @@ func classify(ctx context.Context, err error, stderr string) error {
 	// target, at startup for one it cannot load. Reporting that as a
 	// resolve failure would blame the site for a flag the user set.
 	case contains(low, "impersonate target"):
-		return fmt.Errorf("yt-dlp rejected --impersonate: %s", firstLine(stderr))
+		return fmt.Errorf("%w: %s", core.ErrImpersonate, firstLine(stderr))
 
 	case contains(low, "unable to extract", "client_id", "unsupported url",
 		"no video formats found"):
 		return fmt.Errorf("%w: %s", core.ErrStaleExtractor, firstLine(stderr))
 	}
 
-	if text := redactURLs(stderr); text != "" {
+	// firstLine here too, not the whole of stderr. Every classified branch above
+	// already reduces to yt-dlp's ERROR line; this one used to dump everything
+	// joined by "; ", so an unrecognised failure led with whatever noise yt-dlp
+	// happened to print first. Observed live 2026-08-24:
+	//
+	//	yt-dlp: exit status 1: Deprecated Feature: Support for Python version
+	//	3.10 has been deprecated. Please update to Python 3.11 or above;
+	//	ERROR: [soundcloud:user] ktotyt: ... HTTP Error 404: Not Found
+	//
+	// The Python deprecation warning is not the failure and reads as though it
+	// were. firstLine prefers the ERROR line and falls back to the first
+	// non-empty one, so nothing useful is lost when there is no ERROR line.
+	if text := firstLine(stderr); text != "" {
 		return fmt.Errorf("yt-dlp: %w: %s", err, text)
 	}
 	return fmt.Errorf("yt-dlp: %w", err)
@@ -509,9 +531,9 @@ func toTracks(entries []ytEntry) []core.Track {
 		}
 		title := strings.TrimSpace(e.Title)
 		if title == "" {
-			// PrintResults shows index + title only, and a blank row is
-			// unusable. The permalink is NOT a fallback here — invariant #3
-			// keeps it out of the terminal.
+			title = titleFromSlug(p)
+		}
+		if title == "" {
 			title = "(untitled)"
 		}
 		tracks = append(tracks, core.Track{
@@ -523,4 +545,58 @@ func toTracks(entries []ytEntry) []core.Track {
 		})
 	}
 	return tracks
+}
+
+// titleFromSlug recovers a display name from a permalink's last path segment
+// when yt-dlp supplies no title.
+//
+// MEASURED 2026-08-24 through Tor, and the reason this exists: `--flat-playlist`
+// returns three different shapes, and only two of them carry a title.
+//
+//	scsearch          title, uploader, duration
+//	user pages        title only        (/likes, /tracks)
+//	SETS              NEITHER           (_type "url_transparent": album, id, url)
+//
+// So without this, every row of `chainsmoke playlist <user>/<set>` read
+// "(untitled)" — a numbered list nobody can choose from. The alternative,
+// resolving each entry non-flat for its real title, costs one Tor round-trip
+// per track and is exactly what T3.1 made Meta flat to avoid.
+//
+// This does NOT breach invariant #3. The slug is the track's own human-written
+// title, lowercased and hyphenated by SoundCloud — it discloses precisely what
+// the title column already discloses, and nothing about URL structure: no
+// scheme, no host, no user segment, and nothing that can be pasted into a
+// browser. The full permalink stays in the store, and a test asserts it.
+func titleFromSlug(permalink string) string {
+	rest := permalink
+	if _, after, ok := strings.Cut(rest, "://"); ok {
+		rest = after
+	}
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
+	}
+
+	// host / user / slug. Fewer segments than that means there is no track slug
+	// to take, and grabbing whatever is last would print the UPLOADER's handle
+	// as every row's title — confidently wrong, which is worse than "(untitled)".
+	var segs []string
+	for _, s := range strings.Split(rest, "/") {
+		if s != "" {
+			segs = append(segs, s)
+		}
+	}
+	if len(segs) < 3 {
+		return ""
+	}
+
+	slug := strings.TrimSpace(strings.NewReplacer("-", " ", "_", " ").Replace(segs[len(segs)-1]))
+	if slug == "" {
+		return ""
+	}
+	// Capitalize the first letter only. Title-casing every word would invent
+	// capitalization SoundCloud never told us about; leaving it entirely
+	// lowercase reads as a fragment rather than a name.
+	r := []rune(slug)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
 }

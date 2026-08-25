@@ -158,3 +158,24 @@ func (s *Store) Purge() error {
 	}
 	return failed
 }
+
+// Describe reports which backend is in use and how many results are cached,
+// for `audit` (TASKS.md T7.1). It is a separate optional interface rather than
+// part of core.Store because it answers a reporting question, not a
+// persistence one — a Store that could not describe itself would still be a
+// perfectly good Store.
+func (s *Store) Describe() (mode string, results int) {
+	switch {
+	case s.dir == "":
+		mode = "memory (--private: nothing is written)"
+	case s.dir == core.StateDir():
+		mode = "disk (--remember): " + s.dir
+	default:
+		mode = "runtime (ephemeral): " + s.dir
+	}
+	ts, err := s.load()
+	if err != nil {
+		return mode, 0
+	}
+	return mode, len(ts)
+}

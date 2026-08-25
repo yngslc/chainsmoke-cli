@@ -260,31 +260,169 @@ part and it does not rot. Three things to carry to the revisit:
 - **T6.4** xattr cleanup + mtime normalize; `--nuclear` = mat2 pass when
   available; post-scrub audit print.
 
-## Phase 7 — Privacy verification (make `audit` real)
+## Phase 7 - COMPLETED — Privacy verification (make `audit` real)
 
 - **T7.1** `audit`: live bridge status (actually probe, don't print config),
   store mode, results-file presence, impersonation setting.
+  Built as three questions in the order a user asks them: *am I anonymized
+  right now* (probed posture + DNS + ledger), *am I anonymized the way I chose*
+  (drift against a saved config), *what does this machine still hold* (store
+  mode + cached count). The saved config added here (`audit --save`,
+  `pkg/core/config.go`) is an EXPECTATION compared against the probe, never a
+  substitute for it — the posture line can only be set by `Verified()`.
+  Two things the implementation found that the task text did not anticipate:
+  (a) posture has THREE states, not two — DOWN (nothing permitted to leave)
+  is not DIRECT (permitted, unanonymized), and reporting the first as the
+  second sends a user hunting a leak that is not happening;
+  (b) `audit` must keep running when `Up()` refuses. Every other verb aborts
+  there because it is about to send traffic; a diagnostic that refuses to run
+  exactly when the thing it diagnoses is broken is useless. The exit code still
+  carries the failure, and `--save` still refuses to record a setup that never
+  carried traffic.
+  **done**
 - **T7.2** Egress accounting test: capture one `play`; assert every outbound
   connection goes to the bridge and only *.soundcloud/*.sndcdn beyond it.
   This is the acceptance test for T0.2/T2.x/T3.4.
+  Built as `pkg/net/ledger.go` + `core.EgressLedger`: the bridge counts every
+  CONNECT target, every refused plaintext request, and every tunnel that failed
+  to open, and `audit` prints them classified against `core.ExpectedHost`.
+  Three corrections to the task text, all of them load-bearing:
+  (a) the allowlist as written would flag the tool's own audio. The December
+  2025 HLS/AAC migration serves streams from
+  `playback.media-streaming.soundcloud.cloud`, so `soundcloud.cloud` is in
+  `expectedSuffixes` and the match is anchored on a leading dot, or
+  `evilsoundcloud.com` would pass;
+  (b) record-only, never blocking. A CDN redirect to a host we have not seen
+  before would become silence instead of music, and the tool's first duty is to
+  work — classification lives in core, where audit reports drift without the
+  bridge enforcing it;
+  (c) the honest scope is stated in the output itself: this accounts for what
+  went THROUGH the bridge, not for what went around it. `Observed: false` when
+  the run does not own a bridge (`--proxy`, DIRECT), because "we could not
+  look" must never render as "nothing left the machine". Closing that half
+  needs the OS, not us — see the open questions below.
+  **done**
 - **T7.3** Verify mpv/ffmpeg honor the proxy for HLS fetches on the target
-  build. **ANSWERED 2026-08-19 (mpv 0.41, native Windows), measured with a
-  local origin server and a proxy pointed at a dead port:**
-  `http_proxy`/`https_proxy` are honored — the fetch fails and never reaches
-  the origin. **`ALL_PROXY` is IGNORED: mpv connects directly, with no error.**
-  So the answer to "sometimes honored" is: not for ALL_PROXY, and the failure
-  is silent. `exportProxyEnv` already sets only the four correct spellings, so
-  the shipped path is safe; the remaining T7.3 work is (a) re-measure on the
-  WSL/Linux build, and (b) an assertion that keeps it that way, since nothing
-  today would catch a future ALL_PROXY-only regression.
+  build. **RE-ANSWERED 2026-08-23 — the 2026-08-19 answer below was wrong on
+  mechanism, and the correction matters.**
+  Old answer: "`http_proxy`/`https_proxy` are honored; **`ALL_PROXY` is
+  IGNORED**: mpv connects directly, with no error."
+  Measured again with a listener that logs what it receives, on mpv 0.41 on
+  BOTH targets (native Windows 10 and WSL Ubuntu 26.04): with a LIVE proxy,
+  **all six spellings are honored, ALL_PROXY included**. ALL_PROXY is not
+  ignored. The real question is what happens when the proxy DIES, and there the
+  answers split — pointing each variable at a dead port and watching a local
+  origin for a hit:
 
-## Phase 8 — UX + release polish
+  | var | https:// URL | http:// URL |
+  |---|---|---|
+  | `http_proxy` | fail closed (win + linux) | fail closed (win + linux) |
+  | `HTTP_PROXY` | fail closed win, **OPEN linux** | fail closed win, **OPEN linux** |
+  | `https_proxy` | **OPEN** (win + linux) | n/a |
+  | `HTTPS_PROXY` | **OPEN** (win + linux) | n/a |
+  | `ALL_PROXY` | **OPEN** (win + linux) | **OPEN** (win + linux) |
+  | the shipped four | fail closed (win + linux) | fail closed (win + linux) |
+
+  **OPEN** = mpv silently opened a DIRECT connection to the origin when it
+  could not reach the proxy. No error, no warning, audio keeps playing. For a
+  tool whose premise is that nothing leaves except through Tor that is the
+  worst failure mode there is, and a bridge dying mid-track is exactly how a
+  user would meet it.
+  Lowercase `http_proxy` is the single load-bearing variable: the only spelling
+  that fails closed on both platforms and both schemes, and its presence makes
+  the whole set fail closed (verified for the shipped four, and for those four
+  plus ALL_PROXY). `exportProxyEnv` already sets it, so **the shipped path is
+  safe** — but it is safe for a reason nobody had written down, which is how it
+  gets "simplified" to the conventional upper-case spelling later.
+  Both halves of the remaining work are now done: (a) re-measured on the
+  WSL/Linux build, and (b) `TestExportProxyEnvSetsTheFailClosedSpelling` in
+  `pkg/net/proxyenv_test.go` pins it, with the measurement in the comment.
+  ffmpeg is deliberately NOT covered: scrubbing is deferred (see below), and a
+  runtime proxy-enforcement layer was considered and rejected — a user running
+  a VPN or proxychains on top of chainsmoke is a supported setup, and fighting
+  their environment would break working configurations to defend against a case
+  the shipped env already handles.
+  **done**
+
+## Phase 8 - COMPLETED — UX + release polish
 
 - **T8.1** `search` output via tablewriter (index/title/uploader/duration),
   matching the reference repo's table.
+  Built on the **standard library instead of tablewriter**, deliberately.
+  `go get github.com/olekukonko/tablewriter@latest` resolves to EIGHT modules —
+  tablewriter plus `olekukonko/{cat,errors,ll}`, `mattn/{go-isatty,go-runewidth}`,
+  `olekukonko/ts` and `golang.org/x/sys`; one of them is a logging library. This
+  project ships a single static binary to people who chose it for its threat
+  model, and its dependency set is one module. T10.12 also already says the TUI
+  gets its own table widget and the two share DATA, not formatting — so the
+  dependency would serve exactly one function and be superseded two phases on.
+  And it does not solve the actual problem: the hard part is display-width
+  arithmetic for truncation, which is needed either way. `runeWidth` in
+  `pkg/core/table.go` is the seam if exact East Asian width ever matters more
+  than the dependency count.
+  Three things the task text did not anticipate, all found by measuring:
+  (a) **columns are chosen by the DATA.** `--flat-playlist` returns three
+  shapes: `scsearch` carries title+uploader+duration, user pages (`/likes`,
+  `/tracks`) carry title only, and SETS carry *neither* — `_type
+  "url_transparent"` with album, id and url. Two columns of blanks on every row
+  of a `likes` listing would be noise paid for out of the title's width, so
+  empty columns are dropped;
+  (b) **sets had no titles at all**, so every row of `playlist` read
+  "(untitled)" — a numbered list nobody can choose from. `titleFromSlug` in
+  `pkg/resolver` recovers the name from the permalink's last segment. It costs
+  nothing (the alternative is one Tor round-trip per track, which is what T3.1
+  made Meta flat to avoid) and breaches nothing: the slug is the track's own
+  title lowercased and hyphenated, disclosing exactly what the title column
+  already discloses, with no scheme, host or user segment;
+  (c) **a pipe gets TSV, a terminal gets the table.** `chainsmoke search x |
+  head -3` and `| cut -f2` are real uses that a box-drawn table serves badly,
+  and width is meaningless down a pipe. Four stable fields, duration in
+  seconds, empty rather than 0 for unknown.
+  Titles are third-party text and are scrubbed accordingly: a newline in a title
+  would forge a numbered row pointing `play N` at a track the user never saw, a
+  tab would wreck the TSV, and an ESC would let a track repaint the terminal.
+  **done**
 - **T8.2** `likes` / `playlist` verbs (thin over Meta).
+  `App.Collect` is the shared middle — resolve, cache, print — that `search`
+  already ran inline, so a fourth listing verb now costs a URL builder rather
+  than a copy of the flow. `chainsmoke likes <user>` and
+  `chainsmoke playlist <user>/<set>`; both take `--limit`, both fall back to
+  stdin, and both accept the `<user>/sets/<slug>` spelling people actually copy.
+  The handle rides in **argv**, which is a bounded exception rather than an
+  oversight: `search <term>` already does the same and a handle is the same
+  class of disclosure as a search term, while a track URL identifies one exact
+  thing you are about to play. Anyone wanting neither in argv pipes it on stdin.
+  `cleanHandle`'s allowlist ([A-Za-z0-9_-] per segment) is what makes building a
+  URL from user input safe: no input can introduce a second path component, a
+  query, a scheme or a host, so the URL handed to the single egress chokepoint
+  always points at literally soundcloud.com. A 17-case injection sweep asserts
+  it. Validation also runs BEFORE `Net.Up()`, so a typo never costs a circuit.
+  **done**
 - **T8.3** Shell completion, `-ldflags -X main.BuildVersion` release build,
   `CGO_ENABLED=0` static Linux build.
+  `chainsmoke completion <bash|zsh|fish>`. urfave/cli already answered the
+  completion *protocol*; what it ships is two files in its own repo, so the glue
+  is emitted here (fish uses the library's real generator, which is declarative
+  and carries usage text). Verified by driving the emitted bash function
+  directly: verbs, prefix filtering, per-command flags and custom values all
+  complete.
+  **The banner was the actual blocker**, not the protocol. Every wordmark line
+  becomes a completion candidate on the protocol path, and lands in `~/.bashrc`
+  on the script path. `bannerCorruptsOutput` suppresses it for exactly those two
+  cases — this is NOT the general banner fix, which stays T10.1/T10.2's; it is
+  the narrow suppression without which T8.3 cannot work at all. Two smoke cases
+  assert the absence, which is why the harness grew a `NotMatch` field.
+  `build.ps1` cross-builds all six targets. **MEASURED 2026-08-24: without
+  `-trimpath` the binary embeds absolute source paths** — `D:/sccli/pkg/core/
+  browse.go` and 14 more — disclosing the builder's drive letter and directory
+  layout to anyone holding it. With it: zero. `-s -w` takes 13 MB to 8.9 MB.
+  `CGO_ENABLED=0` is set for every target, not just Linux, and the Linux
+  artifact is confirmed `statically linked` by `file(1)`.
+  Also fixed here, found live: a rejected `--impersonate` was classified
+  correctly but then handed the DEFAULT hint, telling users to run `yt-dlp -U`
+  for a flag we passed ourselves on a request that never left the machine.
+  `core.ErrImpersonate` now carries the two fixes that can actually help.
+  **done**
 
 ## Phase 9 — Tests & CI (grows alongside, not after)
 

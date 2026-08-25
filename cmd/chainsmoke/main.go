@@ -70,6 +70,15 @@ func wire(app *core.App, remember, private bool, proxy, impersonate string, allo
 	app.Scrub = scrub.New()
 	app.Store = store.New(remember, private)
 	app.Version = BuildVersion
+
+	// The effective egress settings, handed down rather than re-read from argv
+	// deeper in (T1.2). Audit compares this against the saved config (T7.1).
+	app.Egress = core.Config{
+		TorSocks:    torSocks,
+		Proxy:       proxy,
+		AllowDirect: allowDirect,
+		Impersonate: impersonate,
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -106,6 +115,59 @@ func commands(app *core.App) []*cli.Command {
 				}
 				app.PrintResults(tracks) // index + title only; permalinks stay cached
 				return nil
+			},
+		},
+		{
+			Name:      "likes",
+			Usage:     "List a user's public likes; prints numbered, cached results",
+			ArgsUsage: "<user>",
+			Description: "The handle rides in argv, the same exposure as `search <term>`.\n" +
+				"   Give no argument to type or pipe it instead:\n" +
+				"      chainsmoke likes < handle.txt",
+			Flags: []cli.Flag{
+				&cli.IntFlag{Name: "limit", Usage: "keep only the first N (default: the whole page)"},
+			},
+			Action: func(c *cli.Context) error {
+				ref, err := app.HandleOrStdin(c.Args().First(), "user handle: ",
+					"usage: chainsmoke likes <user>   (or pipe the handle on stdin)")
+				if err != nil {
+					return err
+				}
+				url, err := core.LikesURL(ref)
+				if err != nil {
+					return err
+				}
+				if err := app.Net.Up(); err != nil { // chokepoint before the resolver
+					return err
+				}
+				return app.Collect(url, c.Int("limit"))
+			},
+		},
+		{
+			Name:      "playlist",
+			Aliases:   []string{"set"},
+			Usage:     "List a playlist's tracks; prints numbered, cached results",
+			ArgsUsage: "<user>/<set>",
+			Description: "A set slug is only unique within a user, so both halves are needed:\n" +
+				"      chainsmoke playlist ghostinnafurcoat/late-night\n" +
+				"   which is the tail of https://soundcloud.com/<user>/sets/<set>.",
+			Flags: []cli.Flag{
+				&cli.IntFlag{Name: "limit", Usage: "keep only the first N (default: the whole set)"},
+			},
+			Action: func(c *cli.Context) error {
+				ref, err := app.HandleOrStdin(c.Args().First(), "<user>/<set>: ",
+					"usage: chainsmoke playlist <user>/<set>   (or pipe it on stdin)")
+				if err != nil {
+					return err
+				}
+				url, err := core.SetURL(ref)
+				if err != nil {
+					return err
+				}
+				if err := app.Net.Up(); err != nil {
+					return err
+				}
+				return app.Collect(url, c.Int("limit"))
 			},
 		},
 		{
@@ -248,15 +310,66 @@ func commands(app *core.App) []*cli.Command {
 			},
 		},
 		{
-			Name: "audit", Usage: "Show runtime privacy posture",
-			Action: func(*cli.Context) error {
+			Name:  "audit",
+			Usage: "Show runtime privacy posture; --save records this setup as the one you want",
+			Flags: []cli.Flag{
+				&cli.BoolFlag{Name: "save", Usage: "save this run's egress config as your expected setup (T7.1)"},
+			},
+			Action: func(c *cli.Context) error {
 				// audit must PROBE, not print config (T7.1). Bringing egress up
 				// first is what makes the reported posture real; without it the
 				// proxy field reads "<down>" even when Tor is running.
-				if err := app.Net.Up(); err != nil {
+				//
+				// Up()'s refusal is REPORTED here rather than obeyed, which is
+				// the one place in the tool that is true. Every other verb must
+				// abort on it because it is about to send traffic; audit is a
+				// diagnostic that sends nothing of its own, and a diagnostic
+				// that refuses to run precisely when the thing it diagnoses is
+				// broken is useless. The exit code below still carries the
+				// failure, so nothing is laundered into a pass.
+				upErr := app.Net.Up()
+				if upErr != nil {
+					// Just a heads-up here; the error itself is returned below
+					// and printed once by main, rather than twice.
+					fmt.Fprintln(os.Stderr,
+						"chainsmoke: egress could not be brought up — reporting the state anyway:")
+				}
+
+				auditErr := app.Audit()
+				if !c.Bool("save") {
+					if upErr != nil {
+						return upErr // the sharper of the two; already printed above
+					}
+					return auditErr
+				}
+
+				// Refuse to record a setup that could not carry traffic at all.
+				// The point of saving is to have an expectation worth comparing
+				// against; a config saved out of a total egress failure would
+				// teach every future audit to call that failure "expected".
+				if upErr != nil {
+					fmt.Fprintln(os.Stderr,
+						"chainsmoke: NOT saving — this setup could not bring egress up, so there is nothing working to record")
+					return upErr
+				}
+
+				// Saved AFTER the probe, with the posture the probe proved, so
+				// what lands on disk is a setup that has carried traffic —
+				// never a wish. Saving an unanonymized one is allowed (someone
+				// running --proxy through their own VPN wants exactly that),
+				// but it is recorded and warned about, not silently blessed.
+				if err := core.SaveConfig(app.Egress, app.Net.Verified()); err != nil {
 					return err
 				}
-				return app.Audit()
+				fmt.Printf("\nsaved: %s\n", core.ConfigPath())
+				if !app.Net.Verified() {
+					fmt.Fprintln(os.Stderr,
+						"chainsmoke: WARNING saved an UNANONYMIZED setup — future audits will call this one \"expected\"")
+				}
+				// The save succeeded; the audit may still have failed. Returning
+				// it keeps the exit code a statement about the SETUP, so adding
+				// --save can never turn a failing audit into a passing one.
+				return auditErr
 			},
 		},
 		{
@@ -283,6 +396,7 @@ func commands(app *core.App) []*cli.Command {
 					}},
 			},
 		},
+		completionCommand(),
 	}
 }
 
@@ -293,7 +407,14 @@ func commands(app *core.App) []*cli.Command {
 func main() {
 	app := &core.App{Version: BuildVersion}
 
-	printBanner()
+	// The banner still prints for every other verb — that is T10.1/T10.2's to
+	// change, not this one's. It is suppressed only where it would corrupt the
+	// output rather than merely clutter it: the completion protocol, whose every
+	// line becomes a candidate, and `completion <shell>`, whose output is a
+	// script the user redirects into a file (T8.3).
+	if !bannerCorruptsOutput(os.Args) {
+		printBanner()
+	}
 
 	cliApp := &cli.App{
 		Name:                 "chainsmoke",

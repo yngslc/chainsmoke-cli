@@ -107,6 +107,24 @@ func TestClassify(t *testing.T) {
 			stderr: "ERROR: [soundcloud] Unable to extract client_id; please report this issue on https://github.com/yt-dlp/yt-dlp/issues",
 			want:   core.ErrStaleExtractor,
 		},
+		{
+			// Found live 2026-08-24 on a yt-dlp without curl_cffi. Nothing left
+			// the machine, so the retry policy must not spend circuits on it and
+			// the hint must not blame SoundCloud.
+			name:   "rejected impersonate target",
+			stderr: "yt_dlp.utils.YoutubeDLError: Impersonate target \"smoke-invalid\" is not available. Use --list-impersonate-targets to see available targets. You may be missing dependencies required to support this target.",
+			want:   core.ErrImpersonate,
+		},
+		{
+			// Verbatim stderr from `chainsmoke likes` against a mistyped handle,
+			// 2026-08-24. The Python deprecation warning is deliberately kept in
+			// the fixture: it is what yt-dlp actually printed first, and it used
+			// to lead the message the user saw.
+			name: "no such user (404)",
+			stderr: "Deprecated Feature: Support for Python version 3.10 has been deprecated. Please update to Python 3.11 or above\n" +
+				"ERROR: [soundcloud:user] ktotyt: Unable to download JSON metadata: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)",
+			want: core.ErrNotFound,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := classify(context.Background(), errors.New("exit status 1"), tc.stderr)
@@ -196,13 +214,57 @@ func TestToTracksSkips(t *testing.T) {
 	got := toTracks([]ytEntry{
 		{ID: "1", Title: "kept", URL: "https://soundcloud.com/a/1"},
 		{ID: "2", Title: "no url"},
-		{ID: "3", URL: "https://soundcloud.com/a/3"},
+		{ID: "3", URL: "https://soundcloud.com/a/late-night-drive"},
 	})
 	if len(got) != 2 {
 		t.Fatalf("got %d tracks, want 2", len(got))
 	}
-	if got[1].Title != "(untitled)" {
-		t.Errorf("title = %q, want %q", got[1].Title, "(untitled)")
+	if got[1].Title != "Late night drive" {
+		t.Errorf("title = %q, want the slug-derived name", got[1].Title)
+	}
+}
+
+// TestTitleFromSlug covers the shape that made `playlist` unusable. MEASURED
+// 2026-08-24: a SET's flat entries are `_type: "url_transparent"` and carry
+// album, id and url — and NO title — so every row printed "(untitled)" until
+// the slug became the fallback.
+func TestTitleFromSlug(t *testing.T) {
+	cases := map[string]string{
+		"https://soundcloud.com/changing-currents/like-a-star-x-bicycle-changing-currents-mashup": "Like a star x bicycle changing currents mashup",
+		"https://soundcloud.com/a/late-night-drive":                                               "Late night drive",
+		"https://soundcloud.com/a/track_two":                                                      "Track two",
+		"https://soundcloud.com/a/plain":                                                          "Plain",
+		"https://soundcloud.com/a/trailing/":                                                      "Trailing",
+		"https://soundcloud.com/a/x?utm_source=copy":                                              "X",
+		"https://soundcloud.com/a/y#t=30":                                                         "Y",
+		"":                                                                                        "",
+		"https://soundcloud.com/a/":                                                               "",
+	}
+	for in, want := range cases {
+		if got := titleFromSlug(in); got != want {
+			t.Errorf("titleFromSlug(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestSlugTitleIsNotAURL is the invariant-#3 half of the decision above. The
+// slug discloses exactly what a title column already discloses; what must never
+// escape is anything that reconstructs the address — the scheme, the host, the
+// user segment, or a pasteable link.
+func TestSlugTitleIsNotAURL(t *testing.T) {
+	const permalink = "https://soundcloud.com/ghostinnafurcoat/lemon-black"
+	got := toTracks([]ytEntry{{ID: "1", URL: permalink}})
+	if len(got) != 1 {
+		t.Fatalf("got %d tracks", len(got))
+	}
+	title := got[0].Title
+	for _, forbidden := range []string{"http", "://", "soundcloud.com", "/", "ghostinnafurcoat"} {
+		if strings.Contains(title, forbidden) {
+			t.Errorf("derived title %q contains %q — that is URL structure, not a name", title, forbidden)
+		}
+	}
+	if got[0].Permalink != permalink {
+		t.Errorf("permalink was altered: %q", got[0].Permalink)
 	}
 }
 
@@ -416,5 +478,52 @@ func TestNoRetryWhenRotateFails(t *testing.T) {
 	}
 	if *calls != 1 || n.rotates != 1 {
 		t.Errorf("%d attempts / %d rotations, want 1 / 1", *calls, n.rotates)
+	}
+}
+
+// TestRetryPlanSkipsOurOwnMistakes: a rejected --impersonate is a flag WE
+// passed, so no number of fresh circuits can fix it. Retrying would spend three
+// Tor round-trips and ~50s to fail the same way.
+func TestRetryPlanSkipsOurOwnMistakes(t *testing.T) {
+	for _, err := range []error{
+		fmt.Errorf("%w: bad target", core.ErrImpersonate),
+		fmt.Errorf("%w: client_id", core.ErrStaleExtractor),
+	} {
+		if retry, rotate := retryPlan(err, 20*time.Second); retry || rotate {
+			t.Errorf("retryPlan(%v) = retry:%v rotate:%v, want both false", err, retry, rotate)
+		}
+	}
+}
+
+// TestUnclassifiedErrorLeadsWithTheErrorLine: the fallback branch used to join
+// ALL of stderr with "; ", so an unrecognised failure led with whatever noise
+// yt-dlp printed first — in the live 2026-08-24 case, a Python 3.10 deprecation
+// warning that had nothing to do with the failure.
+func TestUnclassifiedErrorLeadsWithTheErrorLine(t *testing.T) {
+	const stderr = "Deprecated Feature: Support for Python version 3.10 has been deprecated. Please update to Python 3.11 or above\n" +
+		"ERROR: [soundcloud] something we have never seen before"
+
+	got := classify(context.Background(), errors.New("exit status 1"), stderr).Error()
+
+	if strings.Contains(got, "Deprecated Feature") {
+		t.Errorf("message leads with unrelated noise:\n  %s", got)
+	}
+	if !strings.Contains(got, "something we have never seen before") {
+		t.Errorf("message dropped the actual error:\n  %s", got)
+	}
+}
+
+// TestNotFoundIsNotRetried: a 404 is the same answer on every circuit, so
+// spending two more Tor round-trips (~30s) to be told again is pure loss. This
+// is the counterpart to the 403 case, which SHOULD rotate.
+func TestNotFoundIsNotRetried(t *testing.T) {
+	notFound := fmt.Errorf("%w: no such user", core.ErrNotFound)
+	if retry, rotate := retryPlan(notFound, 20*time.Second); retry || rotate {
+		t.Errorf("retryPlan(404) = retry:%v rotate:%v, want both false", retry, rotate)
+	}
+	// The contrast that makes the distinction meaningful.
+	blocked := fmt.Errorf("%w: 403", core.ErrRateLimited)
+	if retry, rotate := retryPlan(blocked, 20*time.Second); !retry || !rotate {
+		t.Errorf("retryPlan(403) = retry:%v rotate:%v, want both true", retry, rotate)
 	}
 }

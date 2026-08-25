@@ -56,6 +56,14 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go build failed (output above).'; 
 # regression. Port 1 (tcpmux) is never bound in practice.
 $noTor = @('--tor-socks', '127.0.0.1:1')
 
+# Every audit case below reads and writes a saved config (T7.1). Point
+# XDG_CONFIG_HOME at a sandbox for the whole run: a regression harness must
+# never touch — or overwrite — the developer's real %APPDATA%\chainsmoke
+# config, and the first audit cases assert the "no config yet" branch, which a
+# real config on this machine would silently break.
+$env:XDG_CONFIG_HOME = Join-Path ([System.IO.Path]::GetTempPath()) 'chainsmoke-smoke-cfg'
+if (Test-Path $env:XDG_CONFIG_HOME) { Remove-Item -Recurse -Force $env:XDG_CONFIG_HOME }
+
 # -- case table: args / stdin / expected exit / expected output substring ----
 $cases = @(
     @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version' },
@@ -120,7 +128,53 @@ $cases = @(
     # REFUSE, not warn-and-continue. If this ever goes green-by-warning again,
     # the fail-closed invariant has silently regressed.
     @{ Name = 'failclosed';    Args = @($noTor + @('play', '1')); Exit = 1; Match = 'refusing to run unanonymized' },
-    @{ Name = 'failclosed-search'; Args = @($noTor + @('search', 'x')); Exit = 1; Match = 'refusing to run unanonymized' }
+    @{ Name = 'failclosed-search'; Args = @($noTor + @('search', 'x')); Exit = 1; Match = 'refusing to run unanonymized' },
+
+    # -- Phase 7 T7.1/T7.2: audit + saved config ------------------------------
+    # These six run in order and share the sandboxed config dir set above:
+    # 1-3 assert the "nothing saved yet" branch, 4 writes it, 5-6 read it back.
+    #
+    # audit is the ONE verb that still runs when egress is down. Every other
+    # verb aborts on Up()'s refusal because it is about to send traffic; a
+    # diagnostic that refuses to run exactly when the thing it diagnoses is
+    # broken would be useless. Exit stays 1 — the report is extra, not a pass.
+    @{ Name = 'audit-down';    Args = @($noTor + @('audit')); Exit = 1; Match = 'DOWN' },
+    # ...but --save refuses on a setup that never carried traffic. Recording it
+    # would teach every future audit to call this failure "expected".
+    @{ Name = 'audit-nosave';  Args = @($noTor + @('audit', '--save')); Exit = 1; Match = 'NOT saving' },
+    # DIRECT is a different state from DOWN and must not be reported as the
+    # same thing: here traffic IS permitted to leave, just not anonymized.
+    @{ Name = 'audit-noconfig'; Args = @($noTor + @('--allow-direct', 'audit')); Exit = 1; Match = 'audit --save' },
+    # --save records the posture the probe PROVED, so this lands as DIRECT even
+    # though nothing on the command line says so. Exit stays 1: adding a flag
+    # must never turn a failing audit into a passing one.
+    @{ Name = 'audit-save';    Args = @($noTor + @('--allow-direct', 'audit', '--save')); Exit = 1; Match = 'saved:' },
+    @{ Name = 'audit-match';   Args = @($noTor + @('--allow-direct', 'audit')); Exit = 1; Match = 'this run matches it' },
+    # The case the whole feature exists for: a flag left in a shell alias. The
+    # probe is unchanged; only the comparison notices the drift.
+    @{ Name = 'audit-drift';   Args = @($noTor + @('--allow-direct', '--impersonate', 'smoke-drift', 'audit')); Exit = 1; Match = 'impersonate' },
+
+    # -- Phase 8 T8.2: likes / playlist ---------------------------------------
+    # All of these fail in argument validation, BEFORE Net.Up() — so they prove
+    # the wiring while staying offline. That ordering is itself the assertion:
+    # a typo must not cost a Tor circuit.
+    @{ Name = 'likes-url';     Args = @('likes', 'https://soundcloud.com/x/likes'); Exit = 1; Match = 'not accepted in argv' },
+    @{ Name = 'likes-badhandle'; Args = @('likes', 'evil.com');   Exit = 1; Match = 'letters, digits' },
+    @{ Name = 'playlist-arity'; Args = @('playlist', 'someuser'); Exit = 1; Match = '<user>/<set>' },
+    # ...and a VALID handle must then hit the fail-closed gate rather than the
+    # network, proving Up() still runs ahead of the resolver (T1.1/T0.2).
+    @{ Name = 'likes-failclosed'; Args = @($noTor + @('likes', 'someuser')); Exit = 1; Match = 'refusing to run unanonymized' },
+    @{ Name = 'playlist-failclosed'; Args = @($noTor + @('playlist', 'someuser/someset')); Exit = 1; Match = 'refusing to run unanonymized' },
+
+    # -- Phase 8 T8.3: shell completion ---------------------------------------
+    # The banner assertions are the point of these three. Every line of the
+    # wordmark becomes a completion candidate on the protocol path, and lands in
+    # ~/.bashrc on the script path — so "no banner" is the feature, and NotMatch
+    # is how it gets tested.
+    @{ Name = 'comp-protocol'; Args = @('--generate-bash-completion'); Exit = 0; Match = 'likes'; NotMatch = '=====' },
+    @{ Name = 'comp-bash';     Args = @('completion', 'bash'); Exit = 0; Match = '_chainsmoke_complete'; NotMatch = '=====' },
+    @{ Name = 'comp-fish';     Args = @('completion', 'fish'); Exit = 0; Match = 'complete -c chainsmoke'; NotMatch = '=====' },
+    @{ Name = 'comp-badshell'; Args = @('completion', 'tcsh'); Exit = 1; Match = 'unknown shell' }
 )
 
 # -- run ---------------------------------------------------------------------
@@ -132,7 +186,13 @@ foreach ($case in $cases) {
         $out = (& .\chainsmoke.exe $case.Args 2>&1 | ForEach-Object { "$_" }) -join "`n"
     }
     $code = $LASTEXITCODE
-    $ok = ($code -eq $case.Exit) -and ($case.Match -eq '' -or $out -like "*$($case.Match)*")
+    # NotMatch is as load-bearing as Match here: several of the properties this
+    # harness guards are ABSENCES — no banner in a completion script, no URL in
+    # output — and "the string is missing" is not something a positive match can
+    # express.
+    $ok = ($code -eq $case.Exit) -and
+          ($case.Match -eq '' -or $out -like "*$($case.Match)*") -and
+          ($null -eq $case.NotMatch -or $case.NotMatch -eq '' -or $out -notlike "*$($case.NotMatch)*")
     if ($ok) {
         Write-Host ('PASS  {0,-13} exit={1}' -f $case.Name, $code)
     } else {

@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -169,5 +170,55 @@ func TestEnqueueAheadFailsWhenNothingQueues(t *testing.T) {
 
 	if err := app.EnqueueAhead(tracks("x")); err == nil {
 		t.Fatal("EnqueueAhead() = nil with every track dead, want an error")
+	}
+}
+
+// --- T1.7 / T3.5: one recovery action, and the RIGHT one ----------------------
+
+// TestYtdlpHintGivesTheFittingAdvice is the whole point of the taxonomy. Every
+// one of these failures used to end in "run: yt-dlp -U", and for three of the
+// four that is advice which cannot possibly help — the update fixes an
+// extractor, not a blocked exit, a dead bridge, or a flag we passed ourselves.
+func TestYtdlpHintGivesTheFittingAdvice(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		want    string
+		mustNot string
+	}{
+		{"stale extractor", fmt.Errorf("%w: x", ErrStaleExtractor), "yt-dlp -U", "rotate"},
+		{"blocked exit", fmt.Errorf("%w: x", ErrRateLimited), "chainsmoke rotate", "yt-dlp -U"},
+		// Found live 2026-08-24 on a yt-dlp without curl_cffi: nothing left the
+		// machine, so neither SoundCloud nor the extractor is implicated.
+		{"rejected impersonate", fmt.Errorf("%w: x", ErrImpersonate), "curl-cffi", "yt-dlp -U"},
+		// Found live 2026-08-24 running `likes` against a mistyped handle.
+		// SoundCloud answered and the extractor parsed the answer correctly;
+		// the answer was "no such page". Updating yt-dlp cannot change that.
+		{"mistyped handle", fmt.Errorf("%w: x", ErrNotFound), "check the spelling", "yt-dlp -U"},
+		// A dead bridge is pkg/net's problem and the error already says so;
+		// appending anything would point the user away from the real fault.
+		{"dead bridge", fmt.Errorf("%w: x", ErrEgress), "", "yt-dlp -U"},
+		// A stub must never send anyone chasing a dependency (T1.7).
+		{"stub", ErrNotImplemented, "", "yt-dlp -U"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := YtdlpHint(tc.err).Error()
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Errorf("YtdlpHint = %q, want it to mention %q", got, tc.want)
+			}
+			if strings.Contains(got, tc.mustNot) {
+				t.Errorf("YtdlpHint = %q, must NOT suggest %q for this failure", got, tc.mustNot)
+			}
+		})
+	}
+
+	if YtdlpHint(nil) != nil {
+		t.Error("YtdlpHint(nil) invented an error")
+	}
+	// Anything unclassified still gets the extractor hint: a resolve that failed
+	// for a reason we do not recognise is most often the extractor.
+	if got := YtdlpHint(errors.New("something new")).Error(); !strings.Contains(got, "yt-dlp -U") {
+		t.Errorf("unclassified hint = %q, want the extractor fallback", got)
 	}
 }
