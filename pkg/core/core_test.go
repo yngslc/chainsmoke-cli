@@ -222,3 +222,128 @@ func TestYtdlpHintGivesTheFittingAdvice(t *testing.T) {
 		t.Errorf("unclassified hint = %q, want the extractor fallback", got)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Index-vs-stdin resolution (TASKS.md T9.1)
+// -----------------------------------------------------------------------------
+
+// indexStore records which index was asked for, so the argv path can be
+// distinguished from the stdin path rather than inferred from the result.
+type indexStore struct {
+	asked int
+	err   error
+}
+
+func (s *indexStore) SaveResults([]Track) error { return nil }
+func (s *indexStore) Purge() error              { return nil }
+func (s *indexStore) Result(n int) (Track, error) {
+	s.asked = n
+	if s.err != nil {
+		return Track{}, s.err
+	}
+	return Track{Title: "cached", Permalink: "https://soundcloud.com/a/cached"}, nil
+}
+
+// TestResolveIndexOrStdinRoutes covers the three-way branch that implements
+// invariant #3. Each row is a different CLASS of input, and getting the class
+// wrong is what makes the failure dangerous rather than merely annoying: a URL
+// that falls through to the stdin path would be silently accepted from argv.
+func TestResolveIndexOrStdinRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		arg       string
+		stdin     string
+		wantIndex int    // 0 = the store must not be consulted
+		wantPerma string // "" = expect an error
+		wantErr   string
+	}{
+		{name: "index reaches the store", arg: "3", wantIndex: 3,
+			wantPerma: "https://soundcloud.com/a/cached"},
+		{name: "index 1 is not confused with empty", arg: "1", wantIndex: 1,
+			wantPerma: "https://soundcloud.com/a/cached"},
+		{name: "url in argv is refused", arg: "https://soundcloud.com/a/b",
+			wantErr: "not accepted in argv"},
+		{name: "bare word in argv is refused the same way", arg: "notanumber",
+			wantErr: "not accepted in argv"},
+		{name: "overflow is an index error, not a URL error", arg: "99999999999999999999",
+			wantErr: "out of range"},
+		{name: "no arg reads one line from stdin", stdin: "https://soundcloud.com/a/piped\n",
+			wantPerma: "https://soundcloud.com/a/piped"},
+		{name: "stdin is trimmed", stdin: "  https://soundcloud.com/a/pad  \n",
+			wantPerma: "https://soundcloud.com/a/pad"},
+		{name: "empty stdin is a clear error", stdin: "", wantErr: "no result index"},
+		{name: "blank line on stdin is a clear error", stdin: "   \n", wantErr: "empty URL on stdin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &indexStore{}
+			app := &App{Store: st, Stdin: strings.NewReader(tc.stdin)}
+
+			got, err := app.ResolveIndexOrStdin(tc.arg)
+
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("got %+v, want an error containing %q", got, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error = %q, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Permalink != tc.wantPerma {
+				t.Errorf("permalink = %q, want %q", got.Permalink, tc.wantPerma)
+			}
+			if st.asked != tc.wantIndex {
+				t.Errorf("store was asked for index %d, want %d", st.asked, tc.wantIndex)
+			}
+		})
+	}
+}
+
+// TestResolveIndexOrStdinRefusalNamesTheExposure: by the time we see a URL in
+// argv, the OS process list already has it. The message has to say so and give
+// the routes that leak nothing — telling the user "invalid argument" would let
+// them retype it and leak it twice.
+func TestResolveIndexOrStdinRefusalNamesTheExposure(t *testing.T) {
+	app := &App{Store: &indexStore{}, Stdin: strings.NewReader("")}
+
+	_, err := app.ResolveIndexOrStdin("https://soundcloud.com/artist/secret-track")
+	if err == nil {
+		t.Fatal("a URL in argv was accepted")
+	}
+	msg := err.Error()
+	for _, want := range []string{"world-readable", "already reached it", "chainsmoke play"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+// TestResolveIndexOrStdinDoesNotConsultTheStoreForAURL: the store lookup is
+// skipped entirely on the argv-URL path. If it were consulted first, a cache
+// miss would mask the invariant-#3 message behind "no cached result".
+func TestResolveIndexOrStdinDoesNotConsultTheStoreForAURL(t *testing.T) {
+	st := &indexStore{err: errors.New("no cached result #0")}
+	app := &App{Store: st, Stdin: strings.NewReader("")}
+
+	_, err := app.ResolveIndexOrStdin("https://soundcloud.com/a/b")
+	if err == nil || !strings.Contains(err.Error(), "not accepted in argv") {
+		t.Fatalf("error = %v, want the argv refusal", err)
+	}
+	if st.asked != 0 {
+		t.Errorf("store was consulted (index %d) for a URL argument", st.asked)
+	}
+}
+
+// TestResolveIndexOrStdinPropagatesStoreErrors: a real cache miss must surface
+// as itself, with the remediation the store wrote.
+func TestResolveIndexOrStdinPropagatesStoreErrors(t *testing.T) {
+	miss := errors.New("no cached result #7 — run `chainsmoke search <term>` first")
+	app := &App{Store: &indexStore{err: miss}, Stdin: strings.NewReader("")}
+
+	if _, err := app.ResolveIndexOrStdin("7"); !errors.Is(err, miss) {
+		t.Errorf("ResolveIndexOrStdin = %v, want the store's error", err)
+	}
+}

@@ -1,0 +1,106 @@
+# CI for chainsmoke (TASKS.md T9.2).
+#
+# Linux, because that is where the checks this project cares about can actually
+# run. `-race` needs cgo and a C toolchain, which the Windows dev box does not
+# have — measured 2026-08-24: `go: -race requires cgo`. So the race detector has
+# no home except here, and pkg/net is genuinely concurrent (bridge accept and
+# splice goroutines, a mutex-guarded ledger, an RWMutex in the SOCKS dialer).
+#
+# What this deliberately does NOT do: run the integration suite. Those tests are
+# behind `-tags integration`, they need a live Tor, and they leave the machine.
+# CI must never open a circuit — see pkg/net/integration_test.go.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt is checked rather than applied: CI reporting a diff is useful,
+      # CI silently rewriting the tree is not.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./pkg)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d ./cmd ./pkg
+            exit 1
+          fi
+
+      # vet the WHOLE module. `go build ./cmd/chainsmoke` compiles only that
+      # package's import graph, so a broken pkg/* that nothing imports yet would
+      # otherwise sail through.
+      - name: vet
+        run: go vet ./...
+
+      - name: test (race)
+        run: go test ./... -race -count=1
+
+      # The tagged suite must keep COMPILING even though it never runs here.
+      # Without this, an integration test can rot for months behind its tag and
+      # only break when someone finally opts in.
+      - name: integration suite compiles
+        run: go test -tags integration -run XXX_compile_only ./...
+
+  build:
+    name: cross-build
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Same flags build.ps1 uses, for the same reasons: CGO_ENABLED=0 makes the
+      # Linux artifact a single static ELF, and -trimpath keeps the builder's
+      # absolute source paths out of the binary (measured: 15 of them without it).
+      - name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.BuildVersion=ci-${GITHUB_SHA::7}" \
+            -o "chainsmoke_${GOOS}_${GOARCH}" ./cmd/chainsmoke
+
+      - name: assert no build paths leaked
+        run: |
+          if grep -aq "/home/runner/work" "chainsmoke_${{ matrix.goos }}_${{ matrix.goarch }}"; then
+            echo "binary embeds absolute build paths — is -trimpath still set?"
+            exit 1
+          fi

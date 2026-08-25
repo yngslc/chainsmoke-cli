@@ -81,6 +81,21 @@ func wire(app *core.App, remember, private bool, proxy, impersonate string, allo
 	}
 }
 
+// globalFlags is the app-level flag set, extracted from main() so it can be
+// tested (T9.1) and so `valueFlags` in completion.go can be checked against it
+// rather than kept in sync by hand — a flag added here but missed there makes
+// `--newflag completion` parse as the completion verb.
+func globalFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.BoolFlag{Name: "remember", Usage: "persist history/results to disk (default: ephemeral)"},
+		&cli.BoolFlag{Name: "private", Usage: "force memory-only for this run (overrides --remember)"},
+		&cli.StringFlag{Name: "proxy", Usage: "override egress proxy (else the built-in Tor bridge)"},
+		&cli.StringFlag{Name: "impersonate", Value: "chrome", Usage: "yt-dlp curl_cffi target ('' to disable)"},
+		&cli.BoolFlag{Name: "allow-direct", Usage: "permit UNANONYMIZED egress when Tor cannot be brought up (T0.2 escape hatch)"},
+		&cli.StringFlag{Name: "tor-socks", Value: "127.0.0.1:9050", Usage: "Tor SOCKS address (use 127.0.0.1:9150 for the Tor Browser bundle)"},
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Commands
 // -----------------------------------------------------------------------------
@@ -421,14 +436,7 @@ func main() {
 		Usage:                "A privacy-focused SoundCloud CLI (play, search, get) over Tor",
 		Version:              BuildVersion,
 		EnableBashCompletion: true,
-		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "remember", Usage: "persist history/results to disk (default: ephemeral)"},
-			&cli.BoolFlag{Name: "private", Usage: "force memory-only for this run (overrides --remember)"},
-			&cli.StringFlag{Name: "proxy", Usage: "override egress proxy (else the built-in Tor bridge)"},
-			&cli.StringFlag{Name: "impersonate", Value: "chrome", Usage: "yt-dlp curl_cffi target ('' to disable)"},
-			&cli.BoolFlag{Name: "allow-direct", Usage: "permit UNANONYMIZED egress when Tor cannot be brought up (T0.2 escape hatch)"},
-			&cli.StringFlag{Name: "tor-socks", Value: "127.0.0.1:9050", Usage: "Tor SOCKS address (use 127.0.0.1:9150 for the Tor Browser bundle)"},
-		},
+		Flags:                globalFlags(),
 		// Before is the single place global flags are read. Constructing the
 		// runtime here (rather than in main, from raw argv) is what lets
 		// --proxy/--impersonate actually reach the subsystems — previously they

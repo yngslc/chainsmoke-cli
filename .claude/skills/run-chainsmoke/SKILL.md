@@ -144,8 +144,33 @@ fails closed unless `--allow-direct` is passed.
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # 119 passing: core 44, net 29, player 14, resolver 19, store 13
+go test ./...   # 131 passing: core 48, net 29, resolver 21, player 14, store 13, cmd 6
 ```
+
+**The integration suite is separate and opt-in** (T9.2). Five tests behind
+`//go:build integration` that need a live Tor or a real mpv:
+
+```powershell
+go test -tags integration ./pkg/net/ ./pkg/player/     # 5 tests; SKIP if the dep is absent
+wsl -e bash -c "cd /mnt/d/sccli && go test -tags integration ./... -run Integration"
+```
+
+A build tag rather than `testing.Short()` on purpose: the default
+`go test ./...` — what CI runs and what a contributor runs by reflex — **must
+never open a circuit**. Each test skips rather than fails when its dependency is
+missing, because a red suite meaning "you have no tor" teaches people to ignore
+red suites. `CHAINSMOKE_TOR_SOCKS` overrides the SOCKS address (9150 for the
+Tor Browser bundle).
+
+**CI is Linux, and not by preference** (`.github/workflows/ci.yml`). `-race`
+needs cgo and a C toolchain, and this Windows box has neither — measured
+2026-08-24: `go: -race requires cgo`. So the race detector has no home except
+CI, which matters because `pkg/net` is the genuinely concurrent part (accept and
+splice goroutines, a mutex-guarded ledger, an RWMutex in the SOCKS dialer). CI
+runs gofmt, vet, `test -race`, a compile-only pass over the tagged suite so it
+cannot rot behind its tag, and the six-target cross-build with an assertion that
+no absolute build paths were embedded. It does **not** run the integration
+tests.
 
 Test coverage lives where the invariants are, not spread evenly: `pkg/store`
 asserts `--private` writes zero bytes; `pkg/player` asserts a signed URL cannot
@@ -163,7 +188,22 @@ arithmetic is worth asserting rather than eyeballing. `TestTableColumnsAlign`
 renders CJK, emoji and combining marks at five widths and checks every row ends
 at the same cell.
 
+`cmd/chainsmoke/main_test.go` (T9.1) tests **wiring, never the entry point** —
+that distinction is load-bearing, because T10.1/T10.2 rewrite bare-invocation
+routing and banner placement, and anything asserting those would be written
+twice. What it does pin survives Phase 10: `TestEgressVerbsGateOnUp` drives all
+five egress verbs with `Up()` refusing and asserts the resolver is never
+touched; `TestCommandTableIsWellFormed` catches a duplicate verb or alias, where
+urfave resolves the FIRST match and silently shadows the second; and
+`TestValueFlagsMatchesGlobalFlags` closes the `valueFlags` sync footgun that was
+previously a hand-maintained list. Add a global flag and that last test tells
+you if you forgot `completion.go`.
+
 ## Gotchas
+- **`valueFlags` in `completion.go` must list every value-taking global flag.**
+  `TestValueFlagsMatchesGlobalFlags` enforces it now, so adding a flag to
+  `globalFlags()` and forgetting `completion.go` fails a test instead of shipping
+  — the bug it prevents is `--newflag completion` parsing as the completion verb.
 - **Build `.\cmd\chainsmoke`, never `.`** — see Build. This is the single most
   common way to think the tree is broken when it isn't.
 - **`go build` alone does not prove the module is sound.** It only compiles the

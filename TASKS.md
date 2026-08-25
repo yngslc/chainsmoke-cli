@@ -61,26 +61,32 @@ corresponding expectation in
   Options: repair/reinstall WSL, a Linux box, or Linux CI. Needed by
   Phase 2+ integration testing; the pure-Go unit tests don't need it. **dev's conclusion: fixed**
 
-## Phase 1 — Correctness fixes in the existing carcass (cheap, do before subsystems)
+## Phase 1 - COMPLETED — Correctness fixes in the existing carcass (cheap, do before subsystems)
 
 ### 1A — Go
 - **T1.1 — `search` must establish the chokepoint** — call `a.net.Up()`
   before `res.Search` (parity with `play`/`get`).
+  **done**
 - **T1.2 — Fix flag handling.** Delete `hasFlag`/raw-argv scanning; read
   `--remember/--private/--proxy/--impersonate` via urfave/cli (Before hook
   or `c.Bool` from context) and actually wire `--proxy`/`--impersonate`
   into `newApp`. Today they are parsed-but-ignored.
+   **done**
 - **T1.3 — `resolveIndexOrStdin`: reject non-integer argv** with a clear
   "URLs are read from stdin, not argv" error instead of silently falling
   through to a blocking stdin read.
+   **done**
 - **T1.4 — Runtime-dir fallback.** `XDG_RUNTIME_DIR` unset must not yield
   `/chainsmoke/mpv.sock`; port the bash default (`/run/user/$UID`), create dir 0700.
+   **done**
 - **T1.5 — Replace homemade `atoi`/`isInt` with `strconv.Atoi`** (overflow).
+ **done**
 - **T1.6 — `get`: remove hardcoded `/tmp/in.m4a`**; plumb a real temp path
   (full impl is deferred with download+scrub — see "Deferred: download + scrub").
+   **done**
 - **T1.7 — Honest stub errors.** Only append the "run: yt-dlp -U" hint for
   real resolver failures, never for `ErrNotImplemented`.
-
+ **done**
 ### 1B — Bash — CLOSED, none of these will be done (T0.3)
 
 T0.3 froze `script.sh` as a reference. These eight were explicitly conditional
@@ -424,14 +430,82 @@ part and it does not rot. Three things to carry to the revisit:
   `core.ErrImpersonate` now carries the two fixes that can actually help.
   **done**
 
-## Phase 9 — Tests & CI (grows alongside, not after)
+## Phase 9 - COMPLETED — Tests & CI (grows alongside, not after)
+
+The header was accurate: most of this arrived with Phases 2-8 rather than as a
+Phase 9 push. Reviewed task by task 2026-08-24; what follows separates what was
+already deployed from what actually had to be built.
 
 - **T9.1** Unit tests with fake `Resolver`/`Player`/`Net` (the interfaces
   exist precisely for this): verb wiring, store selection
   (remember/private matrix), index-vs-stdin resolution.
+  **Already deployed:** the fakes, carrying most of the suite, and the store
+  matrix (`TestDiskStore`, `TestPrivateWritesNothing`,
+  `TestPrivateOverridesRemember`, `TestRuntimeStoreSurvivesTheProcess`).
+  **Missing, now built:**
+  (a) **verb wiring** — `cmd/chainsmoke` had ZERO test files. Added
+  `main_test.go`: `TestEgressVerbsGateOnUp` drives all five egress verbs through
+  real urfave/cli parsing with `Up()` refusing and asserts the resolver is never
+  touched — T0.2 checked at the layer where it is easiest to lose, since adding
+  a verb means remembering to gate it and nothing but a test enforces
+  remembering (`search` was once exactly this bug, T1.1). Plus
+  `TestNonEgressVerbsDoNotBringEgressUp` (a volume change must not bootstrap
+  Tor), `TestCommandTableIsWellFormed` (duplicate verb/alias — urfave resolves
+  the FIRST match, so a collision silently shadows), and
+  `TestWireStoreSelection` / `TestWireHandsDownEgressFlags` for invariant #4 and
+  T1.2 at the point the decision is made;
+  (b) **index-vs-stdin** — `ResolveIndexOrStdin` had no test at all, despite
+  being the invariant-#3 gate for `play`/`get`. Added a 9-row routing table plus
+  three targeted tests: the refusal must name the exposure, the store must NOT
+  be consulted on the argv-URL path (a cache miss would otherwise mask the
+  invariant message), and a real cache miss must propagate as itself.
+  Two things fell out of writing these. `globalFlags()` was extracted from
+  `main()` so the flag set is testable at all — and that made
+  `TestValueFlagsMatchesGlobalFlags` possible, which closes a footgun that was
+  previously a hand-maintained list: a value-taking global flag missing from
+  `valueFlags` in `completion.go` makes `--newflag completion` parse as the
+  completion verb.
+  Deliberately NOT tested: banner placement and bare-invocation routing. T10.1
+  and T10.2 rewrite exactly that, so those assertions would be written twice
+  against a worse seam. The command table, `wire()`, and subsystem call ORDER
+  are the parts Phase 10 leaves alone, and that is what these tests pin.
+  **done**
 - **T9.2** Linux CI: build + vet + unit tests; integration tests behind a
   build tag (needs T0.5).
+  **Nothing existed** — no `.github/`, no build tags anywhere.
+  Built `.github/workflows/ci.yml`: gofmt check (reported, never auto-applied),
+  `go vet ./...` over the whole module, `go test ./... -race`, a compile-only
+  run of the tagged suite, and a six-target cross-build matrix mirroring
+  `build.ps1`'s flags — plus an assertion that the artifact embeds no absolute
+  build paths, which is `-trimpath` regression-guarded rather than trusted.
+  **Linux specifically, and not by preference:** `-race` needs cgo and a C
+  toolchain, and the Windows dev box has neither — measured 2026-08-24,
+  `go: -race requires cgo`. So CI is the only place the race detector can run,
+  and `pkg/net` is genuinely concurrent (accept/splice goroutines, a
+  mutex-guarded ledger, an RWMutex in the SOCKS dialer). Every CI step was run
+  locally in WSL before committing the workflow; all six targets build and the
+  path assertion holds.
+  **Integration suite** (`//go:build integration`, 5 tests): `pkg/net` proves
+  the whole chain carries bytes through a live circuit, that remote DNS
+  genuinely resolves at the exit, that the ledger records the self-test tunnel,
+  and that `Rotate()` leaves egress usable; `pkg/player` spawns a real mpv and
+  round-trips `idle-active`, which is the only way to catch a spawn flag mpv
+  rejects — the fake socket can never surface that.
+  Behind a tag rather than `testing.Short()` because the default
+  `go test ./...` — the one CI runs and the one a contributor runs by reflex —
+  **must never open a circuit**. Each test SKIPS rather than fails when its
+  dependency is absent: a missing Tor is not a broken build, and a red suite
+  that means "you do not have tor installed" teaches people to ignore red
+  suites. Verified both ways — 5/5 pass against live Tor and real mpv on WSL,
+  5/5 skip cleanly with the dependency removed. CI runs the compile check only.
+  **done**
 - **T9.3** Keep `smoke.ps1` baseline current as stubs become real.
+  **Already deployed and maintained** — 35 cases, updated in step with every
+  phase through T8.3, including the `NotMatch` field added so the harness can
+  assert ABSENCES (no banner in a completion script). This is a standing
+  obligation rather than a task that completes: T10.10 folds in the
+  non-TTY/`--no-tui` cases next.
+  **done**
 
 ## Phase 10 — TUI (the default surface)
 
