@@ -2,8 +2,6 @@
 
 **Audience:** CLI users on linux/mac/windows. Stack: Go and Python core, bash orchestration of mpv + yt-dlp. All findings current as of August 11, 2026; dates flagged where staleness matters.
 
-**Project deadline:** 22.08.2026
-
 ## TL;DR
 - SoundCloud completed its progressive-MP3 → HLS/AAC migration on Dec 31 2025 and its official developer API is closed to new registrations, so you must build on the undocumented `api-v2.soundcloud.com` with a scraped `client_id` — practically, wrap yt-dlp's SoundCloud extractor (maintained, HLS/AAC + browser-impersonation support shipped in the 2026.02.21 release) rather than reimplement the stream flow.
 - The hard privacy problem is that mpv/ffmpeg have **no native SOCKS5 support**: bridge mpv/ffmpeg/yt-dlp through a local HTTP-to-SOCKS proxy onto Tor's SOCKS port 9050. **IMPLEMENTED (T2.2): that bridge is ~200 lines of in-process Go (line 49), not Privoxy and not gost, and it listens on an ephemeral port — see line 51 before wiring anything to `8118`.** The original research also proposed a Python `httpx`/`aiohttp-socks` client with `rdns=True`; the Go port has no Python in it, and remote DNS is structural rather than a flag.
@@ -143,3 +141,7 @@ Each subsystem maps to a build module:
 - Star counts and repo activity dates are point-in-time (imthaghost/scdl ~74 stars/16 forks as of this writing); re-check maintenance status before depending on any third-party repo.
 - The Go TUI subsection asserts **no version numbers or release dates** — the library architectures described (Bubble Tea's Elm loop, tview's retained widgets) are stable and long-standing, but current versions, maintenance status, and Windows-specific behavior were **not** verified for that note. Confirm before pinning a dependency.
 - The TUI's dependency on a non-blocking player collides with the native-Windows IPC gap (unix socket vs named pipe). Until that abstraction exists, a TUI developed on Windows can render and navigate but cannot drive real playback — plan the carcass accordingly and do playback integration on Linux/WSL.
+
+## Local logistics (31.08.2026)
+
+- locating /ch-archive directory leads you to the files that have been previously in chainsmoke's development yet they've fallen out of structure due to one or other reasons. it is important to ignore the content in /ch-archive during current development (prior to 31.08.2026) and resurface once in a re-check and/or status reading

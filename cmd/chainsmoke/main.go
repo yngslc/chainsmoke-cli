@@ -5,7 +5,7 @@
 //
 //    pkg/core/core.go       <- Track model, the 5 interfaces, App + its methods,
 //                              runtime paths. Imports nothing else in the tree.
-//    pkg/net/bridge.go      <- Tor+Privoxy bridge, proxy env, NEWNYM, self-test
+//    pkg/net/bridge.go      <- Tor bridge, proxy env, NEWNYM, self-test
 //    pkg/resolver/ytdlp.go  <- the ONE egress chokepoint: yt-dlp wrapper
 //    pkg/player/mpv.go      <- mpv; Phase 5 makes it a daemon + JSON-IPC client
 //    pkg/scrub/ffmpeg.go    <- ffmpeg +bitexact -> retag -> xattr -> mat2

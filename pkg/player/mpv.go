@@ -87,6 +87,10 @@ func (p *MPV) Ensure() error {
 		"--idle", "--no-video", "--no-config", "--no-ytdl",
 		"--gapless-audio", "--cache-on-disk=no",
 		"--input-ipc-server="+p.sock)
+
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start mpv: %w", err)
 	}

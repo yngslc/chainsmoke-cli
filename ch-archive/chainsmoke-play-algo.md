@@ -6,7 +6,7 @@ chainsmoke play <url>	        ❌ leaks	    ❌ leaks	        refused
 echo <url> | chainsmoke play	✅ clean	    ❌ still leaks	✅
 chainsmoke play (prompt)	    ✅ clean	    ✅ clean	        ✅ new
 chainsmoke play < url.txt	    ✅ clean	    ✅ clean	        ✅
-search → play N	                ✅ clean	    ✅ clean	        ⛔ needs T4.1
+search → play N	                ✅ clean	    ✅ clean	       ✅ 
 
 
 The prompt is the new best default for a human at a terminal. The pipe stays for scripts.
