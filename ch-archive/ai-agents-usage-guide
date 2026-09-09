@@ -1,0 +1,37 @@
+No terminal needed — it's invoked from inside a Claude Code conversation. Four ways, in the order you'll actually want them:
+
+1. @-mention — guaranteed, and the one you want
+
+
+@agent-chainsmoke-reviewer review the tree before I start Phase 10
+Type @ and pick it from the typeahead, or type @agent-chainsmoke-reviewer manually. This is the only form that guarantees your agent runs rather than leaving it to my judgment.
+
+2. Just ask — relies on delegation
+
+
+Have the chainsmoke-reviewer subagent do a Phase 10 check-up
+This works, and your description field is what I match against to decide. Yours is written well for this: it names the trigger cases (review, phase check-up, status read, second opinion), so plain "do a phase check-up" should route to it without you naming it at all.
+
+3. Terminal — whole session runs as the reviewer
+
+
+claude --agent chainsmoke-reviewer
+Different thing, worth knowing: this doesn't delegate to the agent, it makes the entire session adopt its system prompt, tools, and model. Useful if you want a dedicated review session with no other work mixed in. You can also pin it per-project with {"agent": "chainsmoke-reviewer"} in .claude/settings.json, though I wouldn't — you'd get the reviewer for every task in this repo.
+
+4. Follow-ups — once it's run, "continue that review and now look at pkg/net" resumes the same agent with its context intact, rather than starting a cold one.
+
+One thing /agents won't do: as of v2.1.198 it no longer opens a creation wizard, it just points you at .claude/agents/. So editing the file directly, the way you did, is now the normal path — not a workaround.
+
+Two corrections to what I told you last message, both worth knowing before your first run:
+
+Edit is in the tool list. The registration reads Read, Grep, Glob, Bash, Write, WebFetch, WebSearch, Edit — the harness added Edit even though my allowlist omitted it. I said "No Edit now"; that was wrong. Right now the read-only boundary is enforced only by the Boundaries section in the prompt body, not by the tool grant.
+
+That's a real fork, and it's yours because your original file asked for something I overrode: you wrote edit test scripts in permissions, and I resolved it to read-only on the grounds that the check-up protocol says redactions wait for your acceptance. Now that Edit is actually present, pick one:
+
+Make read-only structural — add disallowedTools: Edit to the frontmatter. The denylist strips it regardless of what's inherited. (Bash could still write files, so the prompt rule still carries weight — but it stops being the only thing.)
+Restore your original intent — leave Edit and relax the Boundaries bullet to permit smoke.ps1 specifically, so the reviewer can flip a case table when it finds one out of sync.
+I'd take the first. A reviewer that edits the harness it's reviewing can quietly make its own findings disappear, and smoke.ps1 is the regression baseline for the entire CLI surface. But you built it wanting the second, so say which.
+
+/agents is not a wizard anymore — I implied it was a management UI you could lean on. It isn't, per above.
+
+Want me to add disallowedTools: Edit and then run it on the current tree?
