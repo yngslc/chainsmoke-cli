@@ -480,7 +480,10 @@ already deployed from what actually had to be built.
   build paths, which is `-trimpath` regression-guarded rather than trusted.
   **Linux specifically, and not by preference:** `-race` needs cgo and a C
   toolchain, and the Windows dev box has neither — measured 2026-08-24,
-  `go: -race requires cgo`. So CI is the only place the race detector can run,
+  `go: -race requires cgo`. **Narrowed 2026-09-09:** that is true of Windows,
+  not of the box — WSL on the same machine has `gcc` and
+  `wsl -e bash -c "cd /mnt/d/sccli && go test ./... -race -count=1"` is green,
+  all packages. So the race detector has a local home as well as CI,
   and `pkg/net` is genuinely concurrent (accept/splice goroutines, a
   mutex-guarded ledger, an RWMutex in the SOCKS dialer). Every CI step was run
   locally in WSL before committing the workflow; all six targets build and the
@@ -525,14 +528,21 @@ Phase 3/4. Don't let the carcass wait on any of that.
 
 ### 10A — Entry point & carcass (no dependencies; do first)
 
-- **T10.1 — Split the entry point.** Route: no args + TTY → TUI; `-h`/`--help`
-  → banner + command table; `--version` → version line only; any explicit verb
-  → today's one-shot path. **Move the banner out of `main()`'s unconditional
-  print** so it stops prefixing every verb's output and polluting pipes.
-- **T10.2 — TTY guard + `--no-tui`.** If stdout is not a terminal, a bare
-  invocation must print help and exit, never launch the TUI. Without this,
-  `smoke.ps1`, CI, and `chainsmoke | grep` hang forever. Add `--no-tui` as the
-  explicit escape hatch. This is a hard prerequisite for T10.10.
+- **T10.1 — Split the entry point.** Route: no args + TTY on **both** stdin
+  and stdout → TUI; `-h`/`--help` → banner + command table; `--version` →
+  version line only; any explicit verb → today's one-shot path. **Move the
+  banner out of `main()`'s unconditional print** so it stops prefixing every
+  verb's output and polluting pipes.
+- **T10.2 — TTY guard + `--no-tui`.** If stdin **or** stdout is not a
+  terminal, a bare invocation must print help and exit, never launch the TUI.
+  Without the stdout half, `smoke.ps1`, CI, and `chainsmoke | grep` hang
+  forever; without the stdin half, `echo x | chainsmoke` in a real console
+  launches an alt-screen TUI reading keys from a pipe that never produces any,
+  with no way to quit (flagged 2026-09-09). Both helpers already exist —
+  `stdinIsTerminal()` in `pkg/core/core.go` and `stdoutIsTerminal()` in
+  `pkg/core/table.go` — so the rule costs nothing. Add `--no-tui` as the
+  explicit escape hatch. This is a hard prerequisite for T10.10, which needs a
+  case for each half.
 - **T10.3 — Pick the library.** Bubble Tea + lipgloss + bubbles (recommended:
   our state is a small explicit machine and every slow call is async) vs tview
   (faster conventional panel layout). Verify current versions/maintenance —
@@ -551,20 +561,50 @@ Phase 3/4. Don't let the carcass wait on any of that.
   progress · audit / privacy posture panel · settings (`--remember` /
   `--private` toggles) · help overlay. **Decide this before T10.6+**; the
   screen set determines which seams need wiring.
+  **Constraint on the settings candidate (2026-09-09):** a live `--private`
+  toggle collides with invariant #4 — the Store backend is chosen once in
+  `wire()` "for the whole run", and under a TUI a run is hours, not seconds. A
+  mid-session flip is either a lie (label changes, backend does not), a runtime
+  Store swap (nothing supports it, and the Store is invariant #1's chokepoint),
+  or a "restart required" no-op — and none of those remove the permalinks
+  already on disk from earlier searches. If a settings panel ships, store mode
+  should be **read-only** there (current backend + on-disk count from
+  `AuditReport`), with `purge` as the action. A real toggle has to be specified
+  as purge-then-switch or it silently leaves the disk copy. Also see PHASE10.md
+  Part 3, which proposes collapsing search/likes/playlists to one screen and
+  cutting `get`.
 - **T10.6 — Wire results to the Store.** Search input → `Resolver.Search` →
   `Store.SaveResults` → results list, sharing the cache with one-shot
   `play N`.
-- **T10.7 — Non-blocking playback (the TUI's biggest dependency).** Today
-  `mpvPlayer.Enqueue` runs `mpv` in the **foreground** and returns only when
-  the track ends — that freezes a TUI for the length of the song. Needs the
-  Phase 5 `--idle` daemon + JSON-IPC client, or at minimum a detached mpv the
-  TUI can signal. until the IPC layer abstracts unix
-  socket vs named pipe (`\\.\pipe\…`); decide that *before* writing the client.
+- **T10.7 — Event-reading IPC client (the TUI's biggest dependency).**
+  *Rewritten 2026-09-13; the original body described a foreground `Enqueue`
+  that T5.3 replaced.* The blocking problem is solved: `Enqueue` hands the
+  track to the `--idle` daemon over `loadfile` and returns, and the daemon
+  outlives the process (T0.1(a)). What remains is that the Phase 5 client is
+  **synchronous** — one request, one reply, async events discarded — and a TUI
+  must read `observe_property` events (`time-pos`, `playlist-pos`, `pause`,
+  `eof`) while idle. That is a second client behind the same `Command` seam
+  (reader goroutine, pending-request map, event channel), **not** a change to
+  the synchronous one, which the one-shot verbs depend on and 14 tests pin.
+  The socket-vs-named-pipe question is already answered by `dial()` in
+  `pkg/player/mpv.go`: the stdlib talks to the pipe fine. What it cannot do on
+  Windows is interrupt a blocked read — `Close()` does not unblock `os.File` on
+  a named pipe — so a wedged daemon hangs the TUI. Cancellable reads need
+  overlapped I/O (`go-winio`, a Windows-only dependency). **Decide that before
+  writing the client, not after.** Full plan: PHASE10.md Part 1C.
 - **T10.8 — Persistent egress status bar.** Always-visible
   `EGRESS: TOR ✓` / `EGRESS: DIRECT ⚠` indicator. The one-shot CLI prints its
   "NOT anonymized" warning once and it scrolls away; for a privacy tool a
   permanent posture indicator is a safety feature, not decoration. Pairs with
   T0.2 / T7.1.
+  **Undecided, and this task decides it by implication (2026-09-09):** an
+  honest always-on posture bar requires `Up()` to have run — i.e. at launch,
+  before the user asks for anything. Under the CLI that is a three-second
+  window; under a TUI the in-process CONNECT bridge (`pkg/net/bridge.go`,
+  loopback, unauthenticated — `handle()` checks nothing) becomes a
+  session-long local proxy. Decide explicitly whether the TUI brings egress up
+  at launch or on first use (with the bar reading `DOWN` until then), and
+  whether the bridge needs a per-session token before it is long-lived.
 
 ### 10C — Robustness & polish
 

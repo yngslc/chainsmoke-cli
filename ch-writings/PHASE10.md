@@ -61,11 +61,17 @@ Reuse rather than rebuild — these are already the right shape:
 
 ### B. Entry point split (T10.1 / T10.2)
 
-Route: no args + TTY → TUI · `-h`/`--help` → banner + command table ·
-`--version` → version line · any verb → today's one-shot path · `--no-tui` → help.
+Route: no args + TTY on **both stdin and stdout** → TUI · `-h`/`--help` →
+banner + command table · `--version` → version line · any verb → today's
+one-shot path · `--no-tui` → help.
 
-**T10.2 is a hard prerequisite for T10.10** — without the non-TTY guard,
-`smoke.ps1`, CI and `chainsmoke | grep` hang forever.
+**T10.2 is a hard prerequisite for T10.10** — without the stdout guard,
+`smoke.ps1`, CI and `chainsmoke | grep` hang forever. **The stdin half was
+added 2026-09-09:** `echo x | chainsmoke` in a real console passes a
+stdout-only check and launches an alt-screen TUI reading keys from a pipe that
+never produces any — no way to quit short of killing it from another window.
+`stdinIsTerminal()` (`pkg/core/core.go`) and `stdoutIsTerminal()`
+(`pkg/core/table.go`) both exist; require both. T10.10 needs a case for each.
 
 Note `bannerCorruptsOutput` (added T8.3) becomes partly redundant: it currently
 special-cases the completion protocol and `completion <shell>`. Once the banner
@@ -101,10 +107,21 @@ CLI as well as restoring alt-screen/raw mode for the TUI.
 ### E. Table reconciliation (T10.12) — mostly already satisfied
 
 Phase 8 built this correctly: formatting lives in core, both front-ends feed off
-the same `Store`. One concrete win — **both candidate libraries link
-`mattn/go-runewidth`**, so Phase 8's ~40-line `runeWidth` East-Asian-width
-approximation in `pkg/core/table.go` can be **deleted** and replaced with the
-real table. Net code reduction, and exactness we currently trade away.
+the same `Store`. One concrete win: Phase 8's ~40-line `runeWidth`
+East-Asian-width approximation in `pkg/core/table.go` can be **deleted** and
+replaced with a real table the TUI library already links. Net code reduction,
+and exactness we currently trade away.
+
+**Corrected 2026-09-09 — the target is `rivo/uniseg`, not `mattn/go-runewidth`.**
+This section originally said both candidates link `go-runewidth`. At the
+versions measured in August they did; at current versions they do not — tcell
+dropped `go-runewidth` between v2.8.1 and v2.13.10, so on the tview line T10.12
+would have become a *new direct dependency* rather than a deletion, against the
+one-dependency policy Part 2 defends. `rivo/uniseg v0.4.7` is linked by **all
+three** candidate lines at the same version (table in Part 2), so retargeting
+T10.12 at `uniseg` keeps it a deletion under every outcome of T10.3. On the
+Charm line, `charmbracelet/x/ansi.StringWidth` (grapheme-cluster correct; what
+lipgloss itself uses) is the equivalent.
 
 ### F. smoke.ps1 (T10.10)
 
@@ -115,26 +132,44 @@ case that launches the real TUI.**
 
 ---
 
-## Part 2 — Research: T10.3 library data (measured 2026-08-24)
+## Part 2 — Research: T10.3 library data (measured 2026-08-24, re-measured 2026-09-09)
 
 Measured properly — `go list -m all` overcounts by including test-only deps.
 These are modules **actually linked**, via `go version -m` on a real build
-(`CGO_ENABLED=0 -trimpath -s -w`):
+(`CGO_ENABLED=0 -trimpath -s -w`).
 
-| | Bubble Tea + bubbles + lipgloss | tview (tcell) |
+**The August table measured a superseded major line.** It pinned bubbletea
+v1.3.10 / lipgloss v1.1.0 / bubbles v1.0.0, but `bubbletea/v2` v2.0.9
+(2026-08-19), `lipgloss/v2` v2.0.6 (2026-08-11) and `bubbles/v2` v2.2.1
+(2026-08-24) had all shipped before it was written, and bubbletea v1's last
+release is 2025-09-17. T10.3's literal instruction is "verify current
+versions"; committing off the old table would pin a dead line. Re-measured
+2026-09-09, same host, same flags, current versions:
+
+| line | modules linked | binary | links `mattn/go-runewidth`? | links `rivo/uniseg`? |
+|---|---|---|---|---|
+| `github.com/charmbracelet/bubbletea` v1.3.10 + bubbles v1.0.0 + lipgloss v1.1.0 *(superseded)* | **25** | 2.93 MB | yes (v0.0.19) | yes (v0.4.7) |
+| `charm.land/bubbletea/v2` v2.0.9 + bubbles/v2 v2.2.1 + lipgloss/v2 v2.0.6 | **19** | 3.31 MB | yes (v0.0.27) | yes (v0.4.7) |
+| `rivo/tview` v0.42.0 + `gdamore/tcell/v2` **v2.13.10** (current) | **8** | 2.35 MB | **no** | yes (v0.4.7) |
+| `rivo/tview` v0.42.0 + `gdamore/tcell/v2` v2.8.1 *(the August pin)* | 9 | — | yes (v0.0.16) | yes (v0.4.7) |
+
+Two things the spike must know about the v2 Charm line, both measured:
+**the import path is `charm.land/bubbletea/v2`, not `github.com/...`** — the
+module's own `go.mod` declares `module charm.land/bubbletea/v2`, so the github
+path is a hard compile error even though the proxy resolves it; and **`View()`
+returns `tea.View`, not `string`**, so v1 examples do not port verbatim.
+
+| | Bubble Tea v2 + bubbles + lipgloss | tview (tcell) |
 |---|---|---|
-| modules linked | **25** | **9** |
-| test binary size | 2.8M | 2.4M |
-| versions | bubbletea v1.3.10, lipgloss v1.1.0, bubbles v1.0.0 | tview v0.42.0, tcell v2.8.1 |
 | async model | `tea.Cmd`/`tea.Msg` — every slow call is already message-shaped | `QueueUpdateDraw()` from your own goroutines |
 | prebuilt widgets | list, textinput, viewport, spinner, progress | list, form, flex, table, modal |
 | notable transitive | `atotto/clipboard`, `sahilm/fuzzy`, `xo/terminfo`, `muesli/termenv` | all terminal-related, nothing surprising |
 
-Both bring `mattn/go-runewidth` (see E above).
+`rivo/uniseg` is common to every line and is T10.12's target (see E above).
 
 **The tension to weigh at T10.3:** INSTRUCTIONS.md's dependency policy (written
 in T8.1) states the shipping binary has *one* direct dependency, and that this
-is "a property worth defending." Bubble Tea takes that to ~26; tview to ~10.
+is "a property worth defending." Bubble Tea v2 takes that to ~20; tview to ~9.
 Against that, INSTRUCTIONS.md *also* already recommends Bubble Tea on
 architectural grounds — chainsmoke's state is a small explicit machine and every
 slow thing (yt-dlp resolve, mpv IPC, Tor bootstrap) completes asynchronously,
@@ -167,7 +202,8 @@ privacy-config, etc."* Mapped against the actual verb surface, that is:
 | **Help overlay** | static | ready |
 | **Get / download** | `Scrubber` | **deferred — Phase 6 is deferred**, leave it out |
 
-Three notes for your decision:
+Five notes for your decision (4 and 5 added 2026-09-09 — two choices the
+inventory was making by implication):
 
 1. Search/Likes/Playlists are **one screen with three sources**, not three
    screens — they all produce `[]Track` into the same store and the same list
@@ -177,6 +213,22 @@ Three notes for your decision:
 3. The egress status bar is the one screen I would argue for regardless of what
    else ships — the one-shot CLI prints its "NOT anonymized" warning once and it
    scrolls away, which for a privacy tool is a real gap.
+4. **The privacy/config screen cannot carry a live `--private` toggle.**
+   Invariant #4 fixes the Store backend once in `wire()` "for the whole run",
+   and a TUI run is hours. A mid-session flip is a lie, a runtime Store swap
+   (unsupported, and the Store is invariant #1's chokepoint), or a no-op — and
+   none of them remove permalinks already written by earlier searches. Make
+   store mode **read-only** on that screen (backend + on-disk count from
+   `AuditReport`) with `purge` as the action. If a toggle is genuinely wanted,
+   specify it as purge-then-switch; anything else silently leaves the disk copy.
+5. **Decide when the TUI calls `Up()`.** Note 3's always-on bar is only honest
+   if egress is already verified — i.e. at launch. Under the CLI that is a
+   three-second window; under a TUI the in-process CONNECT bridge (loopback,
+   unauthenticated — `handle()` in `pkg/net/bridge.go` checks nothing) becomes
+   a session-long local proxy. Options: `Up()` at launch (and consider a
+   per-session token on the bridge before it is long-lived), or `Up()` on first
+   use with the bar reading `DOWN` until then. Either is defensible; the plan
+   currently picks the first without saying so.
 
 ---
 
@@ -201,7 +253,9 @@ never leaves unknown-state code.
    Decide the `go-winio` question at the top of this step.
 9. **T10.11** — narrow-terminal degradation using the existing `OutputWidth()`;
    measured: the banner's widest printed line is **78 cols**.
-10. **T10.12** — delete `runeWidth`, adopt `go-runewidth`.
+10. **T10.12** — delete `runeWidth`, adopt `rivo/uniseg` (retargeted
+    2026-09-09; see E — `go-runewidth` is no longer linked by the current
+    tview line).
 
 Steps 1–3 are worth doing even if the TUI were cancelled: the split makes
 `pkg/core` testable as values, and T10.9 fixes a live leak.
@@ -212,10 +266,13 @@ Steps 1–3 are worth doing even if the TUI were cancelled: the split makes
 
 - `go vet ./...` clean and `go test ./...` green after **every** step; expect the
   suite to grow as `pkg/core` tests move from output-scraping to value assertions.
-- `go test ./... -race` on Linux (WSL). **Measured: `-race` cannot run on this
-  Windows box at all** — `go: -race requires cgo`, no C toolchain. Since T10.7
-  and the Bubble Tea loop are the most concurrent code in the project, T9.2's
-  Linux CI matters more here than anywhere else so far.
+- `go test ./... -race` in WSL, after every concurrent step. **Measured:
+  `-race` cannot run under native Windows** — `go: -race requires cgo`, no C
+  toolchain — **but it runs in WSL on the same box** (gcc 15.2; verified
+  2026-09-09, all packages green, no races in `pkg/net` today). That is the
+  baseline the TUI's event loop and T10.7's second IPC client are built on top
+  of, so run it locally rather than waiting on CI:
+  `wsl -e bash -c "cd /mnt/d/sccli && go test ./... -race -count=1"`.
 - `smoke.ps1` — must still pass, and must **not hang**. The T10.2 guard is what
   makes that true; verify by running the harness *before* wiring any TUI screen.
 - Live over Tor, from inside WSL: search → likes → playlist → play, confirming

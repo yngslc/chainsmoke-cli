@@ -87,10 +87,6 @@ func (p *MPV) Ensure() error {
 		"--idle", "--no-video", "--no-config", "--no-ytdl",
 		"--gapless-audio", "--cache-on-disk=no",
 		"--input-ipc-server="+p.sock)
-
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start mpv: %w", err)
 	}
@@ -281,9 +277,26 @@ func (p *MPV) Enqueue(streamURL, title string) error {
 	// "filename" is the whole signed URL — so without force-media-title, `np`
 	// prints Policy and Signature straight to the terminal (measured 2026-08-22,
 	// invariant #3). The title is the fix, not a nicety.
-	args := []any{"loadfile", streamURL, "append-play"}
+	opts := map[string]any{}
 	if title != "" {
-		args = append(args, -1, map[string]any{"force-media-title": title})
+		opts["force-media-title"] = title
+	}
+	// The proxy rides the loadfile, not the daemon's environment. A daemon
+	// outlives the run that spawned it and the bridge picks a new ephemeral
+	// port every run, so by run 2 an inherited http_proxy names a dead port —
+	// and `daemon start` never brings egress up at all. Per-load is the only
+	// binding that is correct for every track (measured 2026-09-09: the option
+	// propagates to HLS child segments). ProxyURL yields prose ("<down>",
+	// "DIRECT (no proxy)") when there is no proxy; only a real URL is passed,
+	// the same rule httpClient and resolver.proxyArgs follow.
+	if proxy := p.net.ProxyURL(); strings.Contains(proxy, "://") {
+		opts["stream-lavf-o"] = "http_proxy=" + proxy
+	}
+	// loadfile is `<url> [flags [index [options]]]` — one options map, in the
+	// fourth slot, or mpv rejects the command.
+	args := []any{"loadfile", streamURL, "append-play"}
+	if len(opts) > 0 {
+		args = append(args, -1, opts)
 	}
 	if _, err := p.Command(args...); err != nil {
 		return err

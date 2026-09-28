@@ -383,6 +383,98 @@ func TestEnqueueForcesTheTitle(t *testing.T) {
 	}
 }
 
+// TestEnqueueCarriesTheProxyPerLoad is the egress-shape test the 2026-09-05
+// regression showed was missing. mpv has no proxy flag and no proxy default:
+// the daemon's ONLY route to the bridge used to be an inherited http_proxy, and
+// `cmd.Env = []string{"PATH=..."}` in Ensure() severed it — 131 tests and 35
+// smoke cases stayed green while every byte of audio went direct (measured
+// 2026-09-09 against a loopback origin). Binding the proxy to the daemon was
+// the root cause: a daemon outlives the run that spawned it, the bridge's port
+// changes every run, and `daemon start` never calls Up() at all. So the proxy
+// rides each loadfile instead, and this asserts what actually crosses the
+// socket — the one place the leak is visible before mpv opens a connection.
+//
+// Three rows, three ways the first attempt at this got it wrong: the option
+// must be there with a real proxy; it must be there with NO title (it was gated
+// on one); and ProxyURL's prose sentinels must never be forwarded (mpv would be
+// told `http_proxy=DIRECT (no proxy)`). The options map is parsed, not
+// substring-matched, because a second map appended as a fifth positional looks
+// fine to Contains() and is rejected by mpv.
+func TestEnqueueCarriesTheProxyPerLoad(t *testing.T) {
+	// A proxy that answers everything. For a plain-http origin Go sends the
+	// preflight to the proxy in absolute form rather than CONNECT, so a 200 to
+	// anything is enough to stand in for the bridge.
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer proxy.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer origin.Close()
+
+	for _, tc := range []struct {
+		name, proxy, title string
+		wantOpt            string // "" means stream-lavf-o must be absent
+	}{
+		{"live proxy, titled", proxy.URL, "Lemon Black", "http_proxy=" + proxy.URL},
+		{"live proxy, untitled", proxy.URL, "", "http_proxy=" + proxy.URL},
+		{"direct sentinel", "DIRECT (no proxy)", "Lemon Black", ""},
+		{"down sentinel", "<down>", "Lemon Black", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			var first string
+			go func() {
+				sc := bufio.NewScanner(server)
+				for sc.Scan() {
+					if first == "" {
+						first = sc.Text()
+					}
+					fmt.Fprintf(server, `{"request_id":%d,"error":"success"}`+"\n", requestID(t, sc.Text()))
+				}
+			}()
+
+			p := New("unused.sock", fakeNet{proxy: tc.proxy})
+			p.ipc = newIPC(client)
+			if err := p.Enqueue(origin.URL+"/playlist.m3u8?Signature=secret", tc.title); err != nil {
+				t.Fatalf("Enqueue() = %v", err)
+			}
+
+			var msg struct {
+				Command []json.RawMessage `json:"command"`
+			}
+			if err := json.Unmarshal([]byte(first), &msg); err != nil {
+				t.Fatalf("loadfile is not JSON: %v\n%s", err, first)
+			}
+
+			// Collect every options map and where it sits. There must be at
+			// most one, and it must be the fourth positional.
+			var opts map[string]string
+			for i, raw := range msg.Command {
+				if len(raw) == 0 || raw[0] != '{' {
+					continue
+				}
+				if opts != nil {
+					t.Fatalf("loadfile carries two options maps — mpv takes one, in slot 4:\n%s", first)
+				}
+				if i != 4 {
+					t.Fatalf("options map is positional %d, want 4 (after the -1 index):\n%s", i, first)
+				}
+				if err := json.Unmarshal(raw, &opts); err != nil {
+					t.Fatalf("options map: %v\n%s", err, first)
+				}
+			}
+
+			got := opts["stream-lavf-o"]
+			if got != tc.wantOpt {
+				t.Errorf("stream-lavf-o = %q, want %q\n%s", got, tc.wantOpt, first)
+			}
+			if tc.title != "" && opts["force-media-title"] != tc.title {
+				t.Errorf("force-media-title = %q, want %q — the proxy must not displace the title\n%s",
+					opts["force-media-title"], tc.title, first)
+			}
+		})
+	}
+}
+
 // TestNowPlayingNeverPrintsAURL is the backstop: whatever ends up in mpv's
 // playlist, `np` must not be the thing that puts a signed URL on a terminal.
 func TestNowPlayingNeverPrintsAURL(t *testing.T) {
