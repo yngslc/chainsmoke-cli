@@ -3,8 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"slices"
-	"strings"
 
 	"github.com/urfave/cli/v2"
 )
@@ -21,57 +19,6 @@ import (
 // Fish is different and gets the library's real generator: fish completions are
 // declarative, so ToFishCompletion writes out every verb, alias and flag with
 // its usage text, which is strictly better than a callback.
-
-// bannerCorruptsOutput reports whether printing the wordmark would break what
-// the user actually asked for.
-//
-// Two cases, and both are real rather than theoretical. During the completion
-// PROTOCOL every banner line becomes a completion candidate, so pressing TAB
-// would offer "________" and "======" alongside the verbs. And
-// `chainsmoke completion bash >> ~/.bashrc` would paste ASCII art into a file
-// the shell then tries to execute.
-//
-// This is NOT the general banner fix (T10.1/T10.2 owns moving it behind a TTY
-// check); it is the narrow suppression that makes T8.3 possible at all.
-func bannerCorruptsOutput(args []string) bool {
-	if len(args) < 2 {
-		return false
-	}
-	// Same test urfave itself makes: the shell function always appends the flag
-	// last, and a "--" anywhere disables completion.
-	if args[len(args)-1] == "--generate-bash-completion" && !slices.Contains(args, "--") {
-		return true
-	}
-	return firstVerb(args[1:]) == "completion"
-}
-
-// valueFlags are the global flags that consume the NEXT argument. Kept as an
-// explicit list because firstVerb has to skip those values, and getting it
-// wrong would read `--proxy completion` as the completion verb. It must stay in
-// step with the global flag set in main().
-var valueFlags = []string{"proxy", "impersonate", "tor-socks"}
-
-// firstVerb returns the first argument that is a command name rather than a
-// global flag or a flag's value. "" when there is none.
-func firstVerb(args []string) string {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "--" {
-			return ""
-		}
-		if !strings.HasPrefix(a, "-") {
-			return a
-		}
-		name := strings.TrimLeft(a, "-")
-		if strings.Contains(name, "=") { // --proxy=... carries its own value
-			continue
-		}
-		if slices.Contains(valueFlags, name) {
-			i++ // skip the value
-		}
-	}
-	return ""
-}
 
 func completionCommand() *cli.Command {
 	return &cli.Command{

@@ -204,17 +204,17 @@ func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
 //
 // The prompt goes to stderr so `chainsmoke play | ...` keeps a clean stdout.
 func (a *App) readLine(prompt string) (string, error) {
-	if a.Stdin == nil && stdinIsTerminal() {
+	if a.Stdin == nil && StdinIsTerminal() {
 		fmt.Fprint(os.Stderr, prompt)
 	}
 	line, err := bufio.NewReader(a.stdin()).ReadString('\n')
 	return strings.TrimSpace(line), err
 }
 
-// stdinIsTerminal reports whether stdin is an interactive console rather than a
+// StdinIsTerminal reports whether stdin is an interactive console rather than a
 // pipe or a file. Uses the character-device bit so this needs no extra
 // dependency and behaves the same on Windows and POSIX.
-func stdinIsTerminal() bool {
+func StdinIsTerminal() bool {
 	fi, err := os.Stdin.Stat()
 	if err != nil {
 		return false

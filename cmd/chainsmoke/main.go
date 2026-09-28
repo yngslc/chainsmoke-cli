@@ -10,6 +10,7 @@
 //    pkg/player/mpv.go      <- mpv; Phase 5 makes it a daemon + JSON-IPC client
 //    pkg/scrub/ffmpeg.go    <- ffmpeg +bitexact -> retag -> xattr -> mat2
 //    pkg/store/store.go     <- Store interface, memory + disk backends
+//    cmd/chainsmoke/session.go <- play session: holds the bridge while the queue plays
 //    cmd/chainsmoke/tui.go  <- TUI (Phase 10, not yet wired)
 //
 //  If you find yourself adding a type or an algorithm HERE, it belongs in a
@@ -34,10 +35,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/urfave/cli/v2"
 
@@ -82,9 +86,7 @@ func wire(app *core.App, remember, private bool, proxy, impersonate string, allo
 }
 
 // globalFlags is the app-level flag set, extracted from main() so it can be
-// tested (T9.1) and so `valueFlags` in completion.go can be checked against it
-// rather than kept in sync by hand — a flag added here but missed there makes
-// `--newflag completion` parse as the completion verb.
+// tested (T9.1).
 func globalFlags() []cli.Flag {
 	return []cli.Flag{
 		&cli.BoolFlag{Name: "remember", Usage: "persist history/results to disk (default: ephemeral)"},
@@ -110,6 +112,7 @@ func commands(app *core.App) []*cli.Command {
 			Flags: []cli.Flag{
 				&cli.IntFlag{Name: "limit", Value: 10, Usage: "max results to return"},
 			},
+			Before: banner,
 			Action: func(c *cli.Context) error {
 				if c.Args().Len() == 0 {
 					return errors.New("usage: chainsmoke search <term>")
@@ -142,6 +145,7 @@ func commands(app *core.App) []*cli.Command {
 			Flags: []cli.Flag{
 				&cli.IntFlag{Name: "limit", Usage: "keep only the first N (default: the whole page)"},
 			},
+			Before: banner,
 			Action: func(c *cli.Context) error {
 				ref, err := app.HandleOrStdin(c.Args().First(), "user handle: ",
 					"usage: chainsmoke likes <user>   (or pipe the handle on stdin)")
@@ -169,6 +173,7 @@ func commands(app *core.App) []*cli.Command {
 			Flags: []cli.Flag{
 				&cli.IntFlag{Name: "limit", Usage: "keep only the first N (default: the whole set)"},
 			},
+			Before: banner,
 			Action: func(c *cli.Context) error {
 				ref, err := app.HandleOrStdin(c.Args().First(), "<user>/<set>: ",
 					"usage: chainsmoke playlist <user>/<set>   (or pipe it on stdin)")
@@ -192,6 +197,7 @@ func commands(app *core.App) []*cli.Command {
 			Description: "With no argument, reads exactly one URL from stdin:\n" +
 				"   echo \"https://soundcloud.com/artist/track\" | chainsmoke play\n" +
 				"URLs are never accepted in argv — the OS process list is world-readable.",
+			Before: banner,
 			Action: func(c *cli.Context) error {
 				if err := app.Net.Up(); err != nil { // chokepoint first
 					return err
@@ -207,7 +213,23 @@ func commands(app *core.App) []*cli.Command {
 				if err != nil {
 					return core.YtdlpHint(err)
 				}
-				return app.EnqueueAhead(entries)
+				if err := app.EnqueueAhead(entries); err != nil {
+					return err
+				}
+				if c.App.Metadata[inSession] == true {
+					return nil // typed at a session prompt, which already holds the bridge
+				}
+				// mpv streams through the bridge in THIS process, so returning
+				// now would cut it off before the first segment (session.go).
+				in, interactive := app.Stdin, false
+				if in == nil {
+					in, interactive = os.Stdin, core.StdinIsTerminal()
+				}
+				sig := make(chan os.Signal, 1)
+				signal.Notify(sig, os.Interrupt)
+				defer signal.Stop(sig)
+				playSession(app, in, interactive, sig, time.Second)
+				return nil
 			},
 		},
 		{
@@ -219,6 +241,7 @@ func commands(app *core.App) []*cli.Command {
 				&cli.StringFlag{Name: "out", Value: "./track.m4a", Usage: "output file path"},
 				&cli.BoolFlag{Name: "nuclear", Usage: "ffmpeg+mat2 full strip instead of selective"},
 			},
+			Before: banner,
 			Action: func(c *cli.Context) error {
 				if err := app.Net.Up(); err != nil {
 					return err
@@ -397,11 +420,11 @@ func commands(app *core.App) []*cli.Command {
 			Name: "daemon", Usage: "player daemon lifecycle",
 			Subcommands: []*cli.Command{
 				{Name: "start", Usage: "Start the mpv daemon if it is not running",
-					Action: func(*cli.Context) error { return app.Play.Ensure() }},
+					Before: banner, Action: func(*cli.Context) error { return app.Play.Ensure() }},
 				{Name: "stop", Usage: "Stop the mpv daemon (ends the session)",
-					Action: func(*cli.Context) error { return app.Play.Down() }},
+					Before: banner, Action: func(*cli.Context) error { return app.Play.Down() }},
 				{Name: "status", Usage: "Report whether the mpv daemon is reachable",
-					Action: func(*cli.Context) error {
+					Before: banner, Action: func(*cli.Context) error {
 						s, err := app.Play.NowPlaying()
 						if err != nil {
 							return err
@@ -421,15 +444,6 @@ func commands(app *core.App) []*cli.Command {
 
 func main() {
 	app := &core.App{Version: BuildVersion}
-
-	// The banner still prints for every other verb — that is T10.1/T10.2's to
-	// change, not this one's. It is suppressed only where it would corrupt the
-	// output rather than merely clutter it: the completion protocol, whose every
-	// line becomes a candidate, and `completion <shell>`, whose output is a
-	// script the user redirects into a file (T8.3).
-	if !bannerCorruptsOutput(os.Args) {
-		printBanner()
-	}
 
 	cliApp := &cli.App{
 		Name:                 "chainsmoke",
@@ -471,14 +485,35 @@ func main() {
 	}
 }
 
-// printBanner writes the wordmark.
+// banner is the Before hook on the verbs that reach SoundCloud or drive the
+// player session: search, likes, playlist, play, get, and daemon start/stop/
+// status. Everything else — help, --version, completion, the transport remote
+// controls, audit/rotate/purge — prints no art (dev's call, 2026-09-28).
 //
-// KNOWN GAP (T10.1/T10.2): this runs unconditionally on stdout, before argument
-// parsing, so it prefixes every verb's output, pollutes pipes, and corrupts
-// `--generate-bash-completion`. Phase 10 moves it behind a TTY check and
-// restricts it to bare invocations and --help. Left as-is deliberately: moving
-// it changes the smoke baseline and belongs with the TUI entry-point split.
-func printBanner() {
+// A hook rather than a print in main() so that urfave decides what counts as
+// help, not a hand-rolled argv scan: Command.Run returns for --help/-h and for
+// the completion protocol BEFORE it calls Before (command.go, v2.27.7), so
+// `search --help`, `daemon start --help` and TAB never reach it. It must sit on
+// the leaf commands, never on `daemon` itself: a parent's Before runs before
+// its subcommand has parsed --help.
+//
+// A piped stdout gets nothing, for the reason the results table becomes TSV
+// there (core.PrintResults): `chainsmoke search x | cut -f2` must read data,
+// not art. Any other Writer was handed to us deliberately — the tests.
+func banner(c *cli.Context) error {
+	w := c.App.Writer
+	if w == os.Stdout && !core.StdoutIsTerminal() {
+		return nil
+	}
+	if c.App.Metadata[inSession] == true {
+		return nil // the window that opened the session already shows it
+	}
+	printBanner(w)
+	return nil
+}
+
+// printBanner writes the logo and wordmark to w.
+func printBanner(w io.Writer) {
 	const outline = `==============================================================================`
 
 	// Raw string literals: the art contains backslashes, so it must never be
@@ -503,8 +538,8 @@ func printBanner() {
 / /___/ __  / ___ |_/ // /|  /___/ / /  / / /_/ / /| |/ /___
 \____/_/ /_/_/  |_/___/_/ |_//____/_/  /_/\____/_/ |_/_____/`
 
-	fmt.Println(outline)
-	fmt.Println(logo)
-	fmt.Println(wordmark)
-	fmt.Println(outline)
+	fmt.Fprintln(w, outline)
+	fmt.Fprintln(w, logo)
+	fmt.Fprintln(w, wordmark)
+	fmt.Fprintln(w, outline)
 }

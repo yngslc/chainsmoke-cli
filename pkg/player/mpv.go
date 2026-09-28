@@ -436,15 +436,66 @@ func (p *MPV) NowPlaying() (string, error) {
 //
 // A daemon that is already gone is not an error — Purge must not stop halfway
 // because there was nothing to tear down.
+//
+// Asking only reaches the mpv that OWNS the endpoint. Another mpv started on it
+// never gets the pipe: it logs "Couldn't create first pipe instance", then idles
+// with no IPC at all, where no `quit` can reach it (measured 2026-09-28). So
+// Down ends by killing every mpv whose argv still names this endpoint — the
+// endpoint, not the name "mpv", so a player the user started is left alone.
 func (p *MPV) Down() error {
 	if p.ipc == nil {
+		// A fresh process — `daemon stop`, `purge` — has not dialled yet, and
+		// returning here is what made both of them silent no-ops: exit 0, daemon
+		// still running (measured 2026-09-28). Dial first; nothing answering
+		// means there is no one to ask.
+		if rw, err := dial(p.sock); err == nil {
+			p.ipc = newIPC(rw)
+		}
+	}
+	var err error
+	grace := time.Duration(0)
+	if p.ipc != nil {
+		// Best effort: mpv closes the connection as it exits, so the reply to
+		// `quit` frequently never arrives. That is a successful quit, not a fault.
+		_, _ = p.Command("quit")
+		err = p.ipc.Close()
+		p.ipc = nil
+		grace = quitGrace
+	}
+	return errors.Join(err, reap(p.sock, grace))
+}
+
+// quitGrace is how long a daemon that was asked to quit gets to exit on its own
+// before Down counts it with the strays.
+const quitGrace = 2 * time.Second
+
+// reap kills whatever mpv still runs on sock once grace is up, and reports it:
+// a stray is a fault worth seeing, not routine.
+func reap(sock string, grace time.Duration) error {
+	arg := "--input-ipc-server=" + sock
+	strays := waitGone(arg, grace)
+	if len(strays) == 0 {
 		return nil
 	}
-	// Best effort: mpv closes the connection as it exits, so the reply to
-	// `quit` frequently never arrives. That is a successful quit, not a fault.
-	_, _ = p.Command("quit")
+	for _, pid := range strays {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Kill() // one already gone — a wrapper whose child just died — is fine
+		}
+	}
+	// Kill is asynchronous on Windows; only the process table can say it worked.
+	if left := waitGone(arg, time.Second); len(left) > 0 {
+		return fmt.Errorf("mpv still running after kill (pid %v)", left)
+	}
+	fmt.Fprintf(os.Stderr, "chainsmoke: killed %d stray mpv process(es) that quit could not reach\n", len(strays))
+	return nil
+}
 
-	err := p.ipc.Close()
-	p.ipc = nil
-	return err
+// waitGone polls for up to d until no mpv carries arg, and returns the pids of
+// any that still do.
+func waitGone(arg string, d time.Duration) []int {
+	pids := daemons(arg)
+	for deadline := time.Now().Add(d); len(pids) > 0 && time.Now().Before(deadline); pids = daemons(arg) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	return pids
 }

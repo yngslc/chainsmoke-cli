@@ -93,7 +93,7 @@ and output against the current baseline:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .claude\skills\run-chainsmoke\smoke.ps1
-# → PASS x35, "smoke: all 35 cases pass", exit 0
+# → PASS x38, "smoke: all 38 cases pass", exit 0
 ```
 
 **When you implement a subsystem, flip the corresponding expectations in the
@@ -124,9 +124,14 @@ Verified behavior baseline (what the carcass does today):
 
 `play` today: `net.Up` (system tor on :9050, else a private one, else refuse —
 `--proxy` or `--allow-direct` override) → `Ensure()` spawns the mpv daemon →
-`Meta`/`Stream` resolve through the chokepoint → `EnqueueAhead` plays with a
-foreground `mpv --no-video`. A real end-to-end play needs a live SoundCloud URL
-and makes a network request, so it is not part of the offline smoke baseline.
+`Meta`/`Stream` resolve through the chokepoint → `EnqueueAhead` queues on the
+daemon with `loadfile` → **then `play` holds** (`cmd/chainsmoke/session.go`):
+on a terminal it becomes a `chainsmoke>` prompt (`np`, `vol 40`, `next`,
+`search …`, `play N`; `q`/Ctrl+D/Ctrl+C stops), otherwise it waits for the
+queue to drain. See the "play holds the Tor path" gotcha for why. A real
+end-to-end play needs a live SoundCloud URL and makes a network request, so it
+is not part of the offline smoke baseline — verified live 2026-09-28 instead:
+`time-pos` ran 0 → 31.7s in real time with the daemon muted.
 
 ## Direct invocation (dev loop)
 
@@ -144,7 +149,7 @@ fails closed unless `--allow-direct` is passed.
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # 131 passing: core 48, net 29, resolver 21, player 14, store 13, cmd 6
+go test ./...   # 140 passing: core 48, net 30, resolver 21, player 17, store 13, cmd 11 (+1 unix-only, skipped on Windows)
 ```
 
 **The integration suite is separate and opt-in** (T9.2). Five tests behind
@@ -190,20 +195,17 @@ at the same cell.
 
 `cmd/chainsmoke/main_test.go` (T9.1) tests **wiring, never the entry point** —
 that distinction is load-bearing, because T10.1/T10.2 rewrite bare-invocation
-routing and banner placement, and anything asserting those would be written
-twice. What it does pin survives Phase 10: `TestEgressVerbsGateOnUp` drives all
-five egress verbs with `Up()` refusing and asserts the resolver is never
-touched; `TestCommandTableIsWellFormed` catches a duplicate verb or alias, where
-urfave resolves the FIRST match and silently shadows the second; and
-`TestValueFlagsMatchesGlobalFlags` closes the `valueFlags` sync footgun that was
-previously a hand-maintained list. Add a global flag and that last test tells
-you if you forgot `completion.go`.
+routing, and anything asserting that would be written twice. What it does pin
+survives Phase 10: `TestEgressVerbsGateOnUp` drives all five egress verbs with
+`Up()` refusing and asserts the resolver is never touched;
+`TestCommandTableIsWellFormed` catches a duplicate verb or alias, where urfave
+resolves the FIRST match and silently shadows the second; and
+`TestBannerClassification` walks every command path and fails on any verb not
+explicitly classified as banner / no banner — add a verb and it makes you
+decide. `TestBannerSkipsHelpAndCompletion` drives real argv through urfave to
+prove help, `--version` and TAB never print the art.
 
 ## Gotchas
-- **`valueFlags` in `completion.go` must list every value-taking global flag.**
-  `TestValueFlagsMatchesGlobalFlags` enforces it now, so adding a flag to
-  `globalFlags()` and forgetting `completion.go` fails a test instead of shipping
-  — the bug it prevents is `--newflag completion` parsing as the completion verb.
 - **Build `.\cmd\chainsmoke`, never `.`** — see Build. This is the single most
   common way to think the tree is broken when it isn't.
 - **`go build` alone does not prove the module is sound.** It only compiles the
@@ -232,9 +234,21 @@ you if you forgot `completion.go`.
   same `Command` seam, not a change to this one.
 - **`daemon start` leaves mpv running, and `stop` deliberately does not kill
   it.** `stop` is mpv's own `stop` (queue cleared, session kept); `daemon stop`
-  is what sends `quit` (T5.5). After a smoke run there will be an idle mpv on
-  the named pipe — that is also why the `np-idle` case sits after
-  `daemon-start`.
+  is what sends `quit` (T5.5). **Until 2026-09-28 `daemon stop` and `purge` were
+  silent no-ops**: `Down()` returned before dialling in a fresh process, so both
+  exited 0 and the daemon lived on. Fixed, and pinned by smoke's `daemon-stop`
+  → `np-gone` pair on the real named pipe. A smoke run no longer leaves an mpv
+  behind: the final `teardown` case stops the one the failing `play` cases
+  start (`play` runs `Ensure()` before it validates its argument).
+- **`quit` only reaches the mpv that owns the pipe; `Down()` kills the rest.**
+  A second mpv started on `\\.\pipe\chainsmoke-mpv` logs `Couldn't create first
+  pipe instance`, then idles with no IPC, where no `quit` can reach it
+  (measured 2026-09-28). So `daemon stop`/`purge` finish by killing every
+  `mpv.exe`/`mpv.com` whose command line names that endpoint, and print
+  `killed N stray mpv process(es)` when they do. An mpv the user started
+  without that endpoint is never touched (`TestDownKillsStrays`). Note that
+  `mpv` resolves to the `mpv.com` wrapper (PATHEXT), so one daemon is two
+  processes in `tasklist`.
 - **`audit` is the ONE verb that still runs when egress is down (T7.1).** Every
   other verb aborts on `Up()`'s refusal because it is about to send traffic;
   audit sends nothing of its own, and a diagnostic that refuses to run exactly
@@ -285,15 +299,18 @@ you if you forgot `completion.go`.
   `pkg/store/store_test.go`, not just intended.
 - **Unknown verbs exit 3, not 1** (urfave/cli's `CommandNotFound` path). Every
   other failure is exit 1 — there is no MISUSE/NOT_FOUND differentiation yet.
-- **The banner prints on stdout for every verb**, before argument parsing, and
-  pollutes pipes. Known, deliberate, owned by T10.1/T10.2 — do not "fix" it in
-  an unrelated change. **Two exceptions exist** and they are not the general
-  fix: `bannerCorruptsOutput` suppresses it for `--generate-bash-completion`
-  (every wordmark line would become a completion candidate) and for
-  `completion <shell>` (the script gets redirected into `~/.bashrc`). If you add
-  a global flag that takes a VALUE, add it to `valueFlags` in
-  `cmd/chainsmoke/completion.go` too, or `--newflag completion` will be misread
-  as the completion verb.
+- **The banner prints only for the SoundCloud/session verbs, and only on a
+  TTY (dev's call, 2026-09-28).** It is a `Before: banner` hook on `search`,
+  `likes`, `playlist`, `play`, `get` and `daemon start|stop|status`; nothing
+  else prints it — not help, `--version`, completion, the remote controls, or
+  audit/rotate/purge. urfave returns for `--help`/`-h` and for the completion
+  protocol *before* calling a command's Before, which is what keeps the art off
+  `search --help` and TAB. Two ways to break it: putting the hook on `daemon`
+  itself (a parent's Before runs before its subcommand parses `--help`, so the
+  art lands above `daemon start --help`), and adding a verb without classifying
+  it — `TestBannerClassification` catches both. A piped stdout never gets it,
+  so smoke.ps1 cannot see it at all; it asserts the absence instead. This
+  replaced `bannerCorruptsOutput`/`valueFlags`, which no longer exist.
 - **The results table decides its columns from the DATA (T8.1).** Measured
   2026-08-24 through Tor, `--flat-playlist` returns three shapes: `scsearch`
   carries title+uploader+duration, user pages (`/likes`, `/tracks`) carry title
@@ -320,13 +337,21 @@ you if you forgot `completion.go`.
   `mpv --idle`, and `Enqueue` sends `loadfile <url> append-play` over the socket
   with `force-media-title`. One process, and the signed URL never touches argv
   (invariant #3). The only `exec.Command("mpv", ...)` left is the daemon spawn.
-- **A daemon outlives the run that spawned it, and its proxy env does not
-  follow.** The bridge picks a NEW ephemeral port every run, `Ensure()` reuses a
-  live daemon, and mpv's environment is fixed at spawn — so run 2 talks to a
-  daemon whose `http_proxy` still names run 1's dead port. Measured 2026-08-24:
-  this **fails closed** (the track silently does not start; no leak), which is
-  the right direction but still broken playback. The fix is per-load options on
-  `loadfile` rather than inherited env; not yet done.
+- **`play` holds the Tor path open, and must.** The CONNECT bridge lives in the
+  `play` process; mpv opens each stream and every later HLS segment
+  asynchronously, after `loadfile` has already answered "success". So the proxy
+  rides each `loadfile` (`stream-lavf-o=http_proxy=<bridge>`, not inherited env
+  — a reused daemon's env names a dead port), AND `play` stays alive while the
+  queue plays. Measured 2026-09-28 on a loopback replica: a `play` that returned
+  at once → `httpproxy: -10054` → `Failed to open` → daemon idle with the
+  entries still queued; the identical run with its proxy kept alive played. Both
+  failure modes are **fail-closed** — the origin saw zero connections once the
+  proxy died, HTTPS/CONNECT path included — so "▶ printed, silence" is broken
+  playback, never a leak. The flip side: if playback ever "just works" after a
+  change to how mpv is spawned, suspect it went direct (see T7.3).
+- **`Net.Up()` is once per process.** A play session runs several verbs, each
+  calling `Up()`; a second pass would start another bridge (and maybe another
+  private tor) that `Down()` never closes. `TestUpIsIdempotent` pins it.
 - **mpv JSON-IPC works on BOTH targets** — unix socket under WSL, named pipe
   (`\\.\pipe\chainsmoke-mpv`) on native Windows; verified against mpv 0.41 with
   a live `get_property` round-trip. Same protocol, different dial. `core.SocketPath()`

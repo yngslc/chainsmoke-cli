@@ -286,6 +286,24 @@ func TestUpRefusesDirectWithoutOptIn(t *testing.T) {
 	}
 }
 
+// TestUpIsIdempotent: a play session runs several verbs in one process, and each
+// calls Up(). The track already playing rides the FIRST bridge, and Down() only
+// closes b.cb and kills b.torCmd — so a second Up() that started a new bridge
+// would leak the old one, and one that spawned a second private tor would orphan
+// the first along with its DataDirectory. Once egress is up, Up() is a no-op.
+//
+// torSocks points at a dead port, so without the guard this Up() would go
+// looking for Tor, find none, and refuse — i.e. fail a session mid-song.
+func TestUpIsIdempotent(t *testing.T) {
+	b := &Bridge{verified: true, proxy: "http://127.0.0.1:1", torSocks: "127.0.0.1:1"}
+	if err := b.Up(); err != nil {
+		t.Fatalf("second Up() = %v, want nil: egress is already up in this process", err)
+	}
+	if got := b.ProxyURL(); got != "http://127.0.0.1:1" {
+		t.Errorf("second Up() moved the proxy to %q; queued tracks still point at the first", got)
+	}
+}
+
 // TestSocksErrorCarriesCode: waitUsable branches on the raw reply byte, so the
 // code has to survive wrapping. String matching would be fragile.
 func TestSocksErrorCarriesCode(t *testing.T) {

@@ -66,13 +66,18 @@ if (Test-Path $env:XDG_CONFIG_HOME) { Remove-Item -Recurse -Force $env:XDG_CONFI
 
 # -- case table: args / stdin / expected exit / expected output substring ----
 $cases = @(
-    @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version' },
-    @{ Name = 'help';         Args = @('--help');            Exit = 0; Match = 'privacy-focused SoundCloud CLI' },
+    # The banner (framed by '=====') prints only for the SoundCloud/session verbs,
+    # and only on a TTY (2026-09-28). This harness reads through a pipe, so no
+    # case may carry it; the NotMatch on version/help/search-flags/daemon-start
+    # pins that — all four printed it before. Which verbs get it on a terminal is
+    # TestBannerClassification's job, not this harness's: a pipe cannot tell.
+    @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version'; NotMatch = '=====' },
+    @{ Name = 'help';         Args = @('--help');            Exit = 0; Match = 'privacy-focused SoundCloud CLI'; NotMatch = '=====' },
     # T3.3: `search` is implemented now, so a bare search would leave the box —
     # and with no tor up, leave it UNANONYMIZED. Pointing --impersonate at a
     # target yt-dlp cannot load kills it before it opens a socket: the case
     # stays offline AND proves the resolver injected our flag (T3.4).
-    @{ Name = 'search-flags'; Args = @('--allow-direct', '--impersonate', 'smoke-invalid', 'search', 'roshina'); Exit = 1; Match = 'rejected --impersonate' },
+    @{ Name = 'search-flags'; Args = @('--allow-direct', '--impersonate', 'smoke-invalid', 'search', 'roshina'); Exit = 1; Match = 'rejected --impersonate'; NotMatch = '=====' },
     # With mpv+yt-dlp installed, play/daemon clear the tool checks. `play 1` then
     # fails in the store (empty cache) BEFORE any egress — deterministic, no
     # network. `daemon start` = Ensure() = mpv present, so it now succeeds.
@@ -92,16 +97,24 @@ $cases = @(
     # Match the invariant itself, not an incidental word in the remediation
     # text — the previous 'stdin' match broke when the message was reworded.
     @{ Name = 'url-in-argv';  Args = @('--allow-direct', 'play', 'https://soundcloud.com/a/b'); Exit = 1; Match = 'not accepted in argv' },
-    @{ Name = 'daemon-start'; Args = @('daemon', 'start');   Exit = 0; Match = '' },
+    @{ Name = 'daemon-start'; Args = @('daemon', 'start');   Exit = 0; Match = ''; NotMatch = '=====' },
     # T5.2/T5.5: `np` is a real IPC round-trip now, so it runs AFTER daemon-start
     # — otherwise the result depends on whether a daemon happened to be left
     # over from an earlier run. An idle daemon is a state, not an error.
     @{ Name = 'np-idle';      Args = @('np');                Exit = 0; Match = 'nothing playing' },
+    @{ Name = 'stop-ok';      Args = @('stop');              Exit = 0; Match = '' },
+    # T5.5: `daemon stop` really quits mpv. Until 2026-09-28 it exited 0 and
+    # left the daemon running (Down() returned before dialling in a fresh
+    # process), which is also why every smoke run used to leave an mpv behind.
+    # np-gone is the proof: the pipe no longer answers. stop-ok sits ABOVE this
+    # pair because it needs a live daemon.
+    @{ Name = 'daemon-stop';  Args = @('daemon', 'stop');    Exit = 0; Match = '' },
+    @{ Name = 'np-gone';      Args = @('np');                Exit = 1; Match = 'unreachable' },
     # stdin contract: URLs never ride in argv; `get` reads one line from stdin,
     # then dies in the scrubber stub. Proves the stdin path is wired.
     @{ Name = 'get-stdin';    Args = @('--allow-direct', 'get'); Exit = 1; Match = 'not implemented'; Stdin = 'https://soundcloud.com/artist/track' },
+    # With no daemon left, purge's player teardown finds nothing — not an error.
     @{ Name = 'purge-ok';     Args = @('purge');             Exit = 0; Match = '' },
-    @{ Name = 'stop-ok';      Args = @('stop');              Exit = 0; Match = '' },
     # urfave/cli exits 3 (not 1) for unknown commands
     @{ Name = 'unknown-verb'; Args = @('bogus');             Exit = 3; Match = 'No help topic' },
 
@@ -174,7 +187,10 @@ $cases = @(
     @{ Name = 'comp-protocol'; Args = @('--generate-bash-completion'); Exit = 0; Match = 'likes'; NotMatch = '=====' },
     @{ Name = 'comp-bash';     Args = @('completion', 'bash'); Exit = 0; Match = '_chainsmoke_complete'; NotMatch = '=====' },
     @{ Name = 'comp-fish';     Args = @('completion', 'fish'); Exit = 0; Match = 'complete -c chainsmoke'; NotMatch = '=====' },
-    @{ Name = 'comp-badshell'; Args = @('completion', 'tcsh'); Exit = 1; Match = 'unknown shell' }
+    @{ Name = 'comp-badshell'; Args = @('completion', 'tcsh'); Exit = 1; Match = 'unknown shell' },
+    # Last, always: `play` runs Ensure() before it validates its argument, so
+    # the failing play cases above still start a daemon. Leave nothing behind.
+    @{ Name = 'teardown';      Args = @('daemon', 'stop');   Exit = 0; Match = '' }
 )
 
 # -- run ---------------------------------------------------------------------

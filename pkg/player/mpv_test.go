@@ -8,6 +8,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -473,6 +477,139 @@ func TestEnqueueCarriesTheProxyPerLoad(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDownWithoutADaemonIsNotAnError: purge calls Down() on machines that never
+// started a daemon, and a purge must not stop halfway because there was nothing
+// to take down.
+func TestDownWithoutADaemonIsNotAnError(t *testing.T) {
+	p := New(filepath.Join(t.TempDir(), "no-daemon.sock"), fakeNet{})
+	if err := p.Down(); err != nil {
+		t.Fatalf("Down() with no daemon = %v, want nil", err)
+	}
+}
+
+// TestDownFromAFreshProcessSendsQuit is the path `daemon stop` and `purge`
+// actually take: a new process that has never dialled the daemon. Down() used to
+// return early on p.ipc == nil, so both verbs exited 0 and the daemon lived on
+// (measured 2026-09-28). Unix socket only — serving a Windows named pipe from a
+// test needs go-winio; smoke.ps1's daemon-stop case covers that target for real.
+func TestDownFromAFreshProcessSendsQuit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named-pipe server needs go-winio; covered by smoke.ps1 daemon-stop")
+	}
+	sock := filepath.Join(t.TempDir(), "mpv.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			got <- ""
+			return
+		}
+		defer c.Close()
+		sc := bufio.NewScanner(c)
+		if !sc.Scan() {
+			got <- ""
+			return
+		}
+		got <- sc.Text() // then close without replying, as a quitting mpv does
+	}()
+
+	p := New(sock, fakeNet{}) // fresh: nothing has dialled yet
+	if err := p.Down(); err != nil {
+		t.Fatalf("Down() = %v, want nil", err)
+	}
+	select {
+	case line := <-got:
+		if !strings.Contains(line, `"quit"`) {
+			t.Errorf("daemon received %q, want a quit command", line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Down() never reached the daemon — `daemon stop` would be a no-op")
+	}
+}
+
+// TestDownKillsStrays: `quit` over IPC reaches only the mpv that owns the
+// endpoint. A second mpv started on it never gets the pipe and idles forever
+// with no IPC, and it used to survive both `daemon stop` and `purge`. Down must
+// kill it, and must spare what merely resembles it: an mpv on another endpoint
+// (a prefix match would take it) and a process that names the endpoint but is
+// not mpv.
+func TestDownKillsStrays(t *testing.T) {
+	endpoint := filepath.Join(t.TempDir(), "mpv.sock")
+	if runtime.GOOS == "windows" {
+		endpoint = fmt.Sprintf(`\\.\pipe\chainsmoke-test-%d`, os.Getpid())
+	}
+	stray := standIn(t, "mpv", endpoint)
+	spared := map[string]<-chan struct{}{
+		"an mpv on another endpoint": standIn(t, "mpv", endpoint+"-other"),
+		"a non-mpv process":          standIn(t, "grep", endpoint),
+	}
+
+	if err := New(endpoint, fakeNet{}).Down(); err != nil {
+		t.Fatalf("Down() = %v", err)
+	}
+	select {
+	case <-stray:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stray mpv outlived Down() — purge would leave it running")
+	}
+	time.Sleep(300 * time.Millisecond) // a wrong kill would have landed by now
+	for what, exited := range spared {
+		select {
+		case <-exited:
+			t.Errorf("Down() killed %s", what)
+		default:
+		}
+	}
+}
+
+// standIn starts a copy of this test binary named name, with the argv Ensure()
+// gives mpv, and returns a channel that closes when it exits. TestMain makes
+// the copy idle until killed; cleanup kills it whatever the test did.
+func standIn(t *testing.T, name, endpoint string) <-chan struct{} {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	bin := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(bin, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "--idle", "--input-ipc-server="+endpoint)
+	cmd.Env = append(os.Environ(), "CHAINSMOKE_STAND_IN=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	t.Cleanup(func() { _ = cmd.Process.Kill(); <-exited })
+	return exited
+}
+
+// TestMain doubles as the stand-in daemon for TestDownKillsStrays: run with
+// CHAINSMOKE_STAND_IN set, this binary idles the way an mpv without its pipe
+// does. The minute is a backstop, so a failed test cannot leave one behind.
+func TestMain(m *testing.M) {
+	if os.Getenv("CHAINSMOKE_STAND_IN") == "1" {
+		time.Sleep(time.Minute)
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
 }
 
 // TestNowPlayingNeverPrintsAURL is the backstop: whatever ends up in mpv's

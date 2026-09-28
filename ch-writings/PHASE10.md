@@ -73,10 +73,15 @@ never produces any — no way to quit short of killing it from another window.
 `stdinIsTerminal()` (`pkg/core/core.go`) and `stdoutIsTerminal()`
 (`pkg/core/table.go`) both exist; require both. T10.10 needs a case for each.
 
-Note `bannerCorruptsOutput` (added T8.3) becomes partly redundant: it currently
-special-cases the completion protocol and `completion <shell>`. Once the banner
-is behind a TTY+no-args check, those cases fall out naturally — but **keep the
-`--generate-bash-completion` guard**, because that path can run against a TTY.
+~~Note `bannerCorruptsOutput` (added T8.3) becomes partly redundant~~ —
+**superseded 2026-09-28: `bannerCorruptsOutput` and `valueFlags` are gone.** The
+banner is now a `Before` hook on the SoundCloud/session verbs, TTY-only, so the
+`--generate-bash-completion` guard is urfave's own: `Command.Run` returns for
+the completion protocol before it calls `Before`, and `Before` is additionally
+skipped when `shellComplete` is set (command.go, v2.27.7) — which holds against
+a TTY too. Nothing to port at T10.1. **But note the route line above**: it
+still says `-h`/`--help` → banner, which the dev reversed the same day (help
+prints no art). Reconcile it when T10.1 is picked up.
 
 ### C. Second IPC client (T10.7)
 
@@ -103,6 +108,15 @@ only a comment. This is not merely a TUI concern — today Ctrl+C during playbac
 skips urfave's `After()` hook, so a **private tor daemon and its temp
 DataDirectory are orphaned and outlive the process**. T10.9 fixes that for the
 CLI as well as restoring alt-screen/raw mode for the TUI.
+
+**A second, separate exit-path question — observed 2026-09-28, detail in
+TASKS.md T10.9:** mpv itself always outlives the process (T0.1(a), by design),
+so the question isn't whether it keeps running but whether an already-playing
+daemon can keep fetching once its egress path dies. Measured for the plain-HTTP
+case: no — mpv's own network layer does not fall back to a direct connection
+when the per-`loadfile` proxy dies mid-stream, it just hits EOF. The real
+bridge's CONNECT/HTTPS path and a genuine multi-segment HLS fixture are still
+unmeasured; don't generalize past the plain-HTTP result yet.
 
 ### E. Table reconciliation (T10.12) — mostly already satisfied
 

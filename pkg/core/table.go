@@ -48,7 +48,7 @@ const (
 // for display costs the user nothing functional.
 func (a *App) PrintResults(ts []Track) {
 	w := a.out()
-	RenderResults(w, ts, OutputWidth(), w == os.Stdout && stdoutIsTerminal())
+	RenderResults(w, ts, OutputWidth(), w == os.Stdout && StdoutIsTerminal())
 }
 
 // RenderResults draws the result set at the given width.
@@ -235,9 +235,9 @@ func OutputWidth() int {
 	return defaultWidth
 }
 
-// stdoutIsTerminal mirrors stdinIsTerminal: the character-device bit, so this
+// StdoutIsTerminal mirrors StdinIsTerminal: the character-device bit, so this
 // needs no dependency and answers the same on Windows and POSIX.
-func stdoutIsTerminal() bool {
+func StdoutIsTerminal() bool {
 	fi, err := os.Stdout.Stat()
 	if err != nil {
 		return false

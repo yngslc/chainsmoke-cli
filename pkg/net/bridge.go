@@ -162,6 +162,13 @@ func (b *Bridge) waitUsable(ctx context.Context, target string) error {
 // anonymized path can be built, fallback() decides: refuse, or run DIRECT if
 // the user passed --allow-direct.
 func (b *Bridge) Up() error {
+	// Once per process. A play session runs several verbs, each calling Up(),
+	// while queued tracks keep riding the first bridge: a second pass would start
+	// another bridge and maybe another private tor, and Down() only tears down
+	// the newest of each — orphaning the rest (TestUpIsIdempotent).
+	if b.verified || b.direct {
+		return nil
+	}
 	b.up = true
 
 	// Gate 1 — an explicit --proxy replaces the bridge but keeps the SAME

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -19,10 +19,10 @@ import (
 // -----------------------------------------------------------------------------
 //
 // These test the WIRING, never the entry point. That distinction is deliberate:
-// T10.1/T10.2 will rewrite how a bare invocation is routed and where the banner
-// prints, so anything asserting that would have to be written twice. The command
-// table, wire(), and the order in which a verb touches its subsystems are the
-// parts Phase 10 leaves alone.
+// T10.1/T10.2 will rewrite how a bare invocation is routed, so anything
+// asserting that would have to be written twice. The command table — including
+// which verbs open with the banner — wire(), and the order in which a verb
+// touches its subsystems are the parts Phase 10 leaves alone.
 
 // recordingNet counts Up() and can refuse it, which is how the fail-closed
 // ordering below gets proven rather than assumed.
@@ -188,30 +188,98 @@ func TestCommandTableIsWellFormed(t *testing.T) {
 	walk(commands(app), "")
 }
 
-// TestValueFlagsMatchesGlobalFlags closes a documented footgun. firstVerb() in
-// completion.go must skip the VALUE of a value-taking global flag, or
-// `--proxy completion` is misread as the completion verb and the banner is
-// suppressed for an ordinary run. That list was maintained by hand; this makes
-// the compiler-adjacent check a test instead.
-func TestValueFlagsMatchesGlobalFlags(t *testing.T) {
-	var want []string
-	for _, f := range globalFlags() {
-		// Bool flags consume nothing; everything else takes the next argument.
-		if _, isBool := f.(*cli.BoolFlag); isBool {
-			continue
-		}
-		want = append(want, f.Names()[0])
+// TestBannerClassification pins which commands open with the ASCII banner, and
+// it covers EVERY command path: a verb added later is missing from this table
+// and fails here until someone decides which side it is on. The rule (dev,
+// 2026-09-28): the banner is for reaching SoundCloud or driving the player
+// session — never help, completion, the remote controls, or maintenance.
+func TestBannerClassification(t *testing.T) {
+	want := map[string]bool{
+		// reaches SoundCloud
+		"search": true, "likes": true, "playlist": true, "play": true, "get": true,
+		// drives the player session
+		"daemon start": true, "daemon stop": true, "daemon status": true,
+		// The parent stays bare: its Before runs before the subcommand parses
+		// --help, so a hook here would print art above `daemon start --help`.
+		"daemon": false,
+		// remote controls: frequent, local, and would drown in art
+		"np": false, "toggle": false, "seek": false, "vol": false,
+		"next": false, "prev": false, "pause": false, "stop": false,
+		// maintenance and meta
+		"rotate": false, "audit": false, "purge": false, "completion": false,
 	}
 
-	for _, name := range want {
-		if !slices.Contains(valueFlags, name) {
-			t.Errorf("global flag --%s takes a value but is missing from valueFlags in "+
-				"completion.go; `--%s completion` would be read as the completion verb", name, name)
+	app, _, _, _ := wiredApp()
+	hook := reflect.ValueOf(banner).Pointer()
+	seen := map[string]bool{}
+	var walk func(cmds []*cli.Command, path string)
+	walk = func(cmds []*cli.Command, path string) {
+		for _, c := range cmds {
+			name := path + c.Name
+			seen[name] = true
+			got := c.Before != nil && reflect.ValueOf(c.Before).Pointer() == hook
+			if w, listed := want[name]; !listed {
+				t.Errorf("%q is unclassified: add it here, true if it reaches SoundCloud "+
+					"or drives the player session, false otherwise", name)
+			} else if got != w {
+				t.Errorf("%q opens with the banner = %v, want %v", name, got, w)
+			}
+			walk(c.Subcommands, name+" ")
 		}
 	}
-	for _, name := range valueFlags {
-		if !slices.Contains(want, name) {
-			t.Errorf("valueFlags lists --%s, which is not a value-taking global flag", name)
+	walk(commands(app), "")
+	for name := range want {
+		if !seen[name] {
+			t.Errorf("%q is classified here but no longer exists — drop it", name)
+		}
+	}
+}
+
+// TestBannerSkipsHelpAndCompletion runs real argv through urfave and checks
+// what reaches the writer. The table above says which commands carry the hook;
+// this proves urfave never calls it for help, --version or completion —
+// `chainsmoke --help` and `chainsmoke daemon --help` were the dev's two named
+// cases — and that an alias shares its command's hook.
+func TestBannerSkipsHelpAndCompletion(t *testing.T) {
+	var art bytes.Buffer
+	printBanner(&art)
+
+	for _, tc := range []struct {
+		args   []string
+		banner bool
+	}{
+		{[]string{"search", "x"}, true},
+		{[]string{"ls", "x"}, true}, // an alias is the same *cli.Command
+		{[]string{"daemon", "start"}, true},
+
+		{nil, false}, // bare invocation shows help (until T10.1 routes it to the TUI)
+		{[]string{"--help"}, false},
+		{[]string{"-h"}, false},
+		{[]string{"--version"}, false},
+		{[]string{"help", "search"}, false},
+		{[]string{"search", "--help"}, false},
+		{[]string{"search", "-h"}, false},
+		{[]string{"daemon", "--help"}, false},
+		{[]string{"daemon", "help"}, false},
+		{[]string{"daemon", "start", "--help"}, false},
+		{[]string{"search", "x", "--generate-bash-completion"}, false},
+		{[]string{"vol", "50"}, false},
+	} {
+		app, _, _, _ := wiredApp()
+		var out bytes.Buffer
+		cliApp := &cli.App{
+			Name:                 "chainsmoke",
+			Version:              "test",
+			EnableBashCompletion: true,
+			Flags:                globalFlags(),
+			Commands:             commands(app),
+			Writer:               &out,
+			ErrWriter:            io.Discard,
+		}
+		_ = cliApp.Run(append([]string{"chainsmoke"}, tc.args...))
+		if got := strings.Contains(out.String(), art.String()); got != tc.banner {
+			t.Errorf("chainsmoke %s: banner printed = %v, want %v",
+				strings.Join(tc.args, " "), got, tc.banner)
 		}
 	}
 }

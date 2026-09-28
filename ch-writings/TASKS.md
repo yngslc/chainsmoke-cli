@@ -612,6 +612,49 @@ Phase 3/4. Don't let the carcass wait on any of that.
   be restored on normal quit, on `SIGINT`/`SIGTERM`, **and on panic** — a crash
   that skips this leaves the user's shell with no echo. Deferred restore plus
   an explicit recover.
+  **Observed 2026-09-28, not yet fixed — two separate concerns living under
+  this one task, do not conflate them:**
+  1. **mpv itself is left running by design.** `daemon-start` in `smoke.ps1`
+     leaves a live `mpv.exe` after the harness exits (reproduced: `tasklist`
+     showed it still up), and `stop`/Ctrl+C never kill it — this is T5.5/T0.1(a)
+     as written, not a bug. An **idle** daemon has an empty playlist and issues
+     no HTTP requests at all, so on its own it cannot leak; the open question is
+     what an **already-playing** daemon does once its egress path dies mid-track.
+     **Corrected 2026-09-28:** half of this was a bug, not the design. `daemon
+     stop` and `purge` never sent `quit` — `Down()` returned before dialling in
+     a fresh process — so nothing could take the daemon down. Fixed; smoke now
+     ends with it stopped. `quit` still missed a *second* mpv on the endpoint,
+     which never gets the pipe and idles with no IPC (measured), so `Down()`
+     now also kills every mpv whose argv names the endpoint
+     (`TestDownKillsStrays`). And the "open question" answered itself as a worse
+     bug: the egress path died *every* time, because `play` returned right after
+     `loadfile` and took the in-process bridge with it — no track ever got past
+     opening. `play` now holds the bridge as a session (prompt on a terminal,
+     wait-for-drain otherwise), which also traps Ctrl+C for that one verb; the
+     global handler this task asks for is still open.
+  2. **Measured (plain HTTP only): once the per-`loadfile` proxy dies
+     mid-stream, mpv/ffmpeg does NOT fall back to a direct connection.** Method:
+     a throwaway `--idle` daemon on a dedicated pipe, loaded via the real IPC
+     wire format with the exact option `Enqueue` sends
+     (`stream-lavf-o=http_proxy=<url>`), against a local origin behind a local
+     forward-proxy standing in for the bridge; the proxy process was killed 34s
+     into a drip-fed transfer. Result: `mpv.log` shows
+     `[160.419] wav: Packet corrupt` → `EOF reached` at the exact instant the
+     proxy died, then `finished playback, success (reason 0)` — the origin's own
+     request log confirms **zero** further connections after the kill. This
+     complements the earlier dead-from-the-start proxy test (T7.3/the
+     `project-mpv-proxy-env-trap` finding): together they cover "proxy never up"
+     and "proxy dies mid-transfer," and both fail closed for this mechanism.
+     **Not yet covered, and still open:** the real bridge is CONNECT-only for
+     HTTPS (the SoundCloud CDN's actual scheme), whereas this test used a plain
+     absolute-form HTTP relay; and this tested one continuous connection dying,
+     not a *fresh* segment dial made after the proxy is already dead (HLS's
+     real shape). Re-run against a CONNECT-tunnelling proxy and a real
+     multi-segment HLS fixture before treating this as closed.
+  3. **Unrelated to both of the above:** the private Tor daemon orphan on
+     Ctrl+C (PHASE10.md Part D) is a different process leaking for a different
+     reason — `Net.Down()`, not `Play.Down()`, and it isn't touched by anything
+     measured here.
 - **T10.10 — Smoke harness must not hang.** Add cases asserting a
   non-TTY/`--no-tui` bare invocation exits with help (proves T10.2), and that
   verbs print no banner. Never add a case that launches the real TUI.
