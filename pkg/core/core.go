@@ -212,15 +212,8 @@ func (a *App) readLine(prompt string) (string, error) {
 }
 
 // StdinIsTerminal reports whether stdin is an interactive console rather than a
-// pipe or a file. Uses the character-device bit so this needs no extra
-// dependency and behaves the same on Windows and POSIX.
-func StdinIsTerminal() bool {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
+// pipe, a file, or a null device (isTerminal in term_*.go).
+func StdinIsTerminal() bool { return isTerminal(os.Stdin) }
 
 // preloadAhead is how many tracks are resolved and queued before this process
 // exits: the one that plays, plus one waiting behind it. Not the whole
@@ -262,7 +255,7 @@ func (a *App) EnqueueAhead(entries []Track) error {
 		// Playback starts in the daemon and outlives this process, so without
 		// a line here `play` would exit instantly and silently — which reads as
 		// "nothing happened" rather than "it is playing".
-		fmt.Fprintf(a.out(), "▶ %s\n", t.Title)
+		fmt.Fprintf(a.out(), "▶ %s\n", Clean(t.Title)) // third-party text, like the table
 	}
 
 	if queued == 0 {

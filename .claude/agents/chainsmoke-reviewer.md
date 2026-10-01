@@ -126,7 +126,8 @@ looks wrong here is decided, documented, and load-bearing. The preloaded
 run-chainsmoke skill carries the full **Gotchas** list — read it before writing
 findings. Among the things that are **correct as-is**:
 
-- the banner printing on stdout for every verb (owned by T10.1/T10.2)
+- the banner printing only for the SoundCloud/daemon verbs, and only on a TTY
+  (dev's call, 2026-09-28 — see the banner gotcha; never on help or a pipe)
 - `audit` exiting 1 when the setup is unhealthy, while still printing its report
 - `audit` being the one verb that runs when egress is down
 - all four proxy env spellings, lowercase `http_proxy` chief among them
@@ -154,7 +155,7 @@ and they are why you exist:
    `cmd.Env` in the tree.
 3. **Fail-closed spellings** — is lowercase `http_proxy` still present, and does
    it still reach every child process that carries media bytes?
-4. **Third-party text** — is anything rendering un-`clean()`ed remote data to a
+4. **Third-party text** — is anything rendering un-`Clean()`ed remote data to a
    terminal or a TSV stream?
 5. **Doc/code drift** — does a comment or doc saying "today X" still describe X?
    Phase 5 in particular invalidated several "Enqueue blocks in the foreground"

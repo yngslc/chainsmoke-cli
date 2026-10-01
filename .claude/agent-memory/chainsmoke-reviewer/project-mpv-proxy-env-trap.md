@@ -1,31 +1,36 @@
 ---
 name: project-mpv-proxy-env-trap
-description: The mpv daemon's proxy is bound at spawn time via inherited env only — stripping or missing that env makes playback WORK while leaking directly, so "playback started working" is a leak signal here, not a fix.
+description: mpv's proxy rides each loadfile (stream-lavf-o), with env as defence in depth — but it is silently skipped by no_proxy, by any value not starting with exactly http://, and by a missing --no-ytdl; "playback started working" can still mean a leak.
 metadata:
   type: project
 ---
 
-The mpv daemon has no explicit proxy wiring. Its only route to the bridge is the
-four env spellings `pkg/net.exportProxyEnv` sets in the chainsmoke process,
-inherited at `exec.Command("mpv", ...)` spawn time. Nothing on `loadfile` carries
-a proxy.
+Since `b375de1` the proxy rides every `loadfile` as
+`stream-lavf-o=http_proxy=<bridge>` (`MPV.Enqueue`), and the daemon also
+inherits the four env spellings from `pkg/net.exportProxyEnv` as defence in
+depth. The per-load binding is what makes `daemon start` and daemon reuse safe.
 
-**Why:** measured 2026-09-09 during the Phase 10 gate review. Commit `e2f2e01`
-added `cmd.Env = []string{"PATH=..."}` to `MPV.Ensure()`, which stripped that
-inheritance. Local experiment (dead proxy on 127.0.0.1:1, loopback origin, mpv
-0.41): with the stripped env mpv issued `GET /probe.mp3 HTTP/1.1` straight to the
-origin; with the env inherited the origin saw nothing. Same code, one line apart.
+**Why:** two leaks, both measured on a loopback origin with a fake proxy and
+real mpv. First, 2026-09-09: `e2f2e01` stripped mpv's env to `PATH`, and mpv
+fetched the origin directly. Second, 2026-10-01, found by both the reviewer and
+the debater: libavformat honours a proxy only when the value starts with exactly
+`http://`, so `--proxy HTTP://` or `https://` went direct. It also honours
+`no_proxy` even over the per-load option, so `no_proxy=*` went direct. In both
+cases the Go preflight still tunnelled, so this was a correlation leak. All of
+it is fixed:
+- `Up()` lower-cases `--proxy` and refuses `https://`.
+- `Enqueue` refuses any non-`http://` value before the preflight.
+- `Ensure()` spawns mpv with the env minus `no_proxy`, and keeps the rest.
 
-**How to apply:** treat any change to how mpv is spawned, or any report that
-"playback started working again", as a possible fail-open. The failure this
-replaces — a daemon reused across runs pointing at last run's dead ephemeral
-bridge port — is silent non-playback, which is the *safe* symptom. The durable
-fix is per-load options on `loadfile` (`stream-lavf-o=http_proxy=...`) plus an
-allowlisted env that keeps lowercase `http_proxy`, so the proxy is bound per
-track rather than per daemon. Also note `daemon start` never calls `Net.Up()`, so
-a daemon started that way was never proxied even before `e2f2e01`, and `Ensure()`
-reuses a live daemon rather than re-spawning it.
+A before/after rig showed three BYPASS rows become clean.
 
-Re-verify before acting: check whether `cmd.Env` is still set in
-`pkg/player/mpv.go` and whether `Enqueue` has grown per-file options.
-Related: [[feedback-verify-dont-recall]].
+**How to apply:** treat any change to how mpv is spawned, to `Enqueue`'s
+options, or to how `--proxy` is stored as a possible fail-open, and treat
+"playback started working again" as a leak signal, not a fix. `--no-ytdl` is
+load-bearing too: without it, a failed load runs mpv's ytdl hook, which spawns
+yt-dlp with the URL in argv and no proxy. Pinned by `TestEnsureSpawnsTheDaemonSafely`,
+`TestEnqueueRefusesAProxyMpvWouldIgnore` and
+`TestOverrideIsStoredWithALowercaseScheme`.
+
+Re-verify before acting: read `Ensure()`/`Enqueue()` in `pkg/player/mpv.go`
+and Gate 1 in `pkg/net/bridge.go`. Related: [[feedback-verify-dont-recall]].

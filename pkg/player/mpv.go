@@ -27,8 +27,9 @@ import (
 var ErrToolMissing = errors.New("mpv not found on PATH — install mpv to play")
 
 // MPV drives the persistent `mpv --idle` daemon over JSON-IPC (TASKS.md Phase
-// 5). The daemon and the IPC client are real; Enqueue still plays in the
-// foreground, which is the remaining T5.3 gap documented on that method.
+// 5). Enqueue queues a track with `loadfile` and returns at once (T5.3). The
+// stream still rides this process's bridge, which is why `play` holds a session
+// while it plays (cmd/chainsmoke/session.go).
 type MPV struct {
 	sock string   // where the IPC daemon listens
 	net  core.Net // egress handle: the preflight must not bypass the chokepoint
@@ -51,6 +52,11 @@ func New(sock string, n core.Net) *MPV { return &MPV{sock: sock, net: n} }
 // status verb can report it without reaching into the struct.
 func (p *MPV) SocketPath() string { return p.sock }
 
+// startTimeout is how long Ensure waits for a daemon to answer. It was 3s, and
+// a cold start measured longer than that on 2026-09-28: Ensure reported
+// failure while that mpv went on booting.
+var startTimeout = 10 * time.Second
+
 // Ensure starts mpv's persistent IPC daemon if it is not already live.
 func (p *MPV) Ensure() error {
 	if _, err := exec.LookPath("mpv"); err != nil {
@@ -58,6 +64,21 @@ func (p *MPV) Ensure() error {
 	}
 	if p.live() {
 		return nil
+	}
+
+	// An mpv already started on this endpoint that does not answer yet is
+	// most likely still booting: one an earlier Ensure gave up on, or one
+	// another process just spawned. A second would never get the pipe and
+	// would idle as a stray (see Down), so this one gets the window first.
+	// Still silent after it, it is a stray or wedged, not slow, and it must
+	// not make every later call wait: clear it and start fresh.
+	if len(daemons("--input-ipc-server="+p.sock)) > 0 {
+		if p.waitLive(startTimeout) {
+			return nil
+		}
+		if err := reap(p.sock, 0); err != nil {
+			return err
+		}
 	}
 
 	if runtime.GOOS != "windows" {
@@ -77,9 +98,10 @@ func (p *MPV) Ensure() error {
 	//                       above, the same reason the resolver passes
 	//                       --ignore-config to yt-dlp
 	//   --no-ytdl           mpv must NEVER resolve a URL itself. Its ytdl hook
-	//                       does not fire for direct media URLs (measured), but
-	//                       a page URL reaching it would spawn a yt-dlp outside
-	//                       the chokepoint — no proxy flags, no impersonation.
+	//                       fires for a page URL, and also when a direct media
+	//                       URL FAILS to load (on_load_fail, measured
+	//                       2026-10-01): either way it spawns yt-dlp outside the
+	//                       chokepoint, with the URL in argv and no proxy.
 	//   --gapless-audio     this is a music queue, not a video player
 	//   --cache-on-disk=no  already the default; stated because "stream bytes
 	//                       never touch the disk" is a promise, not a preference
@@ -87,19 +109,43 @@ func (p *MPV) Ensure() error {
 		"--idle", "--no-video", "--no-config", "--no-ytdl",
 		"--gapless-audio", "--cache-on-disk=no",
 		"--input-ipc-server="+p.sock)
+	// The user's environment, minus no_proxy: libavformat honours it even for
+	// the proxy each loadfile carries, so no_proxy=* (or a pattern matching the
+	// CDN) fetched the signed URL directly while the preflight tunnelled
+	// (measured 2026-10-01). Everything else stays — audio needs it, and
+	// stripping the environment to PATH was the e2f2e01 leak.
+	cmd.Env = withoutNoProxy(os.Environ())
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start mpv: %w", err)
 	}
 	go func() { _ = cmd.Wait() }()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if p.live() {
-			return nil
-		}
-		time.Sleep(25 * time.Millisecond)
+	if p.waitLive(startTimeout) {
+		return nil
 	}
 	return fmt.Errorf("mpv IPC endpoint %s did not become responsive", p.sock)
+}
+
+// withoutNoProxy returns env without no_proxy in either spelling, which on
+// Windows are one variable.
+func withoutNoProxy(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); !strings.EqualFold(k, "no_proxy") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// waitLive polls the liveness probe until it answers or d runs out.
+func (p *MPV) waitLive(d time.Duration) bool {
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		if p.live() {
+			return true
+		}
+	}
+	return false
 }
 
 // live is the T1.15 liveness probe: a full request/reply round-trip, not a
@@ -270,6 +316,15 @@ func (p *MPV) Enqueue(streamURL, title string) error {
 	if err := p.net.Assert(); err != nil { // T0.2: fail closed before any egress
 		return err
 	}
+	// libavformat uses a proxy only when the value starts with exactly
+	// "http://" and silently fetches DIRECT otherwise — HTTP://, https://,
+	// socks5:// all go around it (mpv manual; measured 2026-10-01). Refuse
+	// before the preflight, which would tunnel while the stream did not. The
+	// error names the scheme only: a --proxy URL can carry credentials.
+	if proxy := p.net.ProxyURL(); strings.Contains(proxy, "://") && !strings.HasPrefix(proxy, "http://") {
+		return fmt.Errorf("refusing to queue: mpv cannot use a %s:// proxy and would fetch the stream directly",
+			proxy[:strings.Index(proxy, "://")])
+	}
 	if err := p.preflight(streamURL); err != nil {
 		return fmt.Errorf("%w: %v", core.ErrDeadStream, err)
 	}
@@ -422,7 +477,9 @@ func (p *MPV) NowPlaying() (string, error) {
 	if strings.Contains(s, "://") || strings.Contains(s, "Signature=") {
 		return "<playing: title unavailable, URL withheld>", nil
 	}
-	return s, nil
+	// The SoundCloud title Enqueue set: third-party text bound for a terminal,
+	// scrubbed the same way the results table scrubs it.
+	return core.Clean(s), nil
 }
 
 // Down stops the daemon and then closes our end of the pipe (T5.5). It is the

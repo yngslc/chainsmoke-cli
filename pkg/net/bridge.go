@@ -186,7 +186,12 @@ func (b *Bridge) Up() error {
 			return fmt.Errorf("--proxy %s did not complete a CONNECT to %s: %w",
 				b.override, egressProbeTarget, err)
 		}
-		b.proxy = b.override
+		// Stored lower-cased: checkProxyScheme accepts HTTP://, but libavformat
+		// honours a proxy only when it starts with exactly "http://" and fetches
+		// the stream DIRECTLY otherwise, while the preflight still tunnels
+		// (measured 2026-10-01). url.Parse lower-cases the scheme, nothing else.
+		u, _ := url.Parse(b.override) // checkProxyScheme has already parsed it
+		b.proxy = u.String()
 		b.socksAddr = ""
 		exportProxyEnv(b.proxy)
 		b.verified = true
@@ -941,8 +946,16 @@ func checkProxyScheme(raw string) error {
 		return fmt.Errorf("--proxy %q is not a URL (want http://host:port)", raw)
 	}
 	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
+	case "http":
 		return nil
+	case "https":
+		// Same split as SOCKS: libavformat honours a proxy only when it starts
+		// with exactly "http://" and fetches the stream DIRECTLY otherwise
+		// (mpv manual; measured 2026-10-01).
+		return fmt.Errorf("--proxy %s is a TLS (https://) proxy, which mpv/ffmpeg cannot use — "+
+			"libavformat would fetch the stream directly.\n"+
+			"  yt-dlp would tunnel and playback would not — a partial-egress split.\n"+
+			"  Point --proxy at the proxy's plain http:// listener, or drop it and use Tor.", raw)
 	case "socks5", "socks5h", "socks4", "socks4a":
 		return fmt.Errorf("--proxy %s is a SOCKS proxy, which mpv/ffmpeg cannot use "+
 			"(no SOCKS support in libavformat).\n"+

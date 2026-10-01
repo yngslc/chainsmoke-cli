@@ -159,6 +159,25 @@ func TestEnqueueAheadStopsAtPreloadAhead(t *testing.T) {
 	}
 }
 
+// TestEnqueueAheadScrubsTheTitleItPrints: the ▶ line is third-party text on a
+// terminal, like the results table, and gets the same scrub. An ESC in a title
+// must not repaint the screen, and a newline must not forge a second line.
+func TestEnqueueAheadScrubsTheTitleItPrints(t *testing.T) {
+	hostile := Track{Title: "red \x1b[31mALERT\x1b[0m\n▶ forged", Permalink: "https://soundcloud.com/a/x"}
+	var out strings.Builder
+	app := &App{
+		Res:  fakeResolver{streams: map[string]string{hostile.Permalink: "https://cdn/x"}},
+		Play: &queueingPlayer{fakePlayer: fakePlayer{log: &log{}}}, Out: &out,
+	}
+
+	if err := app.EnqueueAhead([]Track{hostile}); err != nil {
+		t.Fatalf("EnqueueAhead() = %v", err)
+	}
+	if strings.ContainsRune(out.String(), 0x1b) || strings.Count(out.String(), "\n") != 1 {
+		t.Errorf("the ▶ line printed the title raw: %q", out.String())
+	}
+}
+
 // TestEnqueueAheadFailsWhenNothingQueues: skip-not-abort is not "never fail".
 // If every track is dead the user must hear about it, not get silence.
 func TestEnqueueAheadFailsWhenNothingQueues(t *testing.T) {

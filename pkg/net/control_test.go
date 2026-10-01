@@ -190,13 +190,37 @@ func TestCheckProxySchemeRejectsSOCKS(t *testing.T) {
 			t.Errorf("refusal should explain why, got %q", err)
 		}
 	}
-	for _, raw := range []string{"http://127.0.0.1:8118", "https://proxy.example:3128"} {
+	// https:// is the same split: libavformat uses a proxy only when it starts
+	// with exactly "http://" and goes DIRECT otherwise (2026-10-01, N-2).
+	if err := checkProxyScheme("https://proxy.example:3128"); err == nil || !strings.Contains(err.Error(), "mpv/ffmpeg") {
+		t.Errorf("checkProxyScheme(https://…) = %v, want a refusal that explains why", err)
+	}
+	for _, raw := range []string{"http://127.0.0.1:8118", "HTTP://127.0.0.1:8118"} { // Up() lower-cases it
 		if err := checkProxyScheme(raw); err != nil {
 			t.Errorf("checkProxyScheme(%q) = %v, want nil", raw, err)
 		}
 	}
 	if err := checkProxyScheme("127.0.0.1:8118"); err == nil {
 		t.Error("a bare host:port has no scheme and should be refused")
+	}
+}
+
+// TestOverrideIsStoredWithALowercaseScheme: checkProxyScheme accepts HTTP://
+// (it compares case-insensitively), and Up() used to store the value as typed.
+// libavformat honours a proxy only when it starts with exactly "http://", so
+// mpv fetched the signed URL directly while the preflight went through the
+// proxy (measured 2026-10-01, report-debate/debaters-output.md claim 3).
+func TestOverrideIsStoredWithALowercaseScheme(t *testing.T) {
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		t.Setenv(k, "") // Up() exports the proxy; give the test process its own values back
+	}
+	addr := connectStub(t, "HTTP/1.1 200 Connection established\r\n\r\n")
+	b := New("HTTP://"+addr, false, "127.0.0.1:1")
+	if err := b.Up(); err != nil {
+		t.Fatalf("Up() = %v", err)
+	}
+	if got, want := b.ProxyURL(), "http://"+addr; got != want {
+		t.Errorf("ProxyURL() = %q, want %q — mpv ignores any proxy not starting with exactly http://", got, want)
 	}
 }
 

@@ -100,7 +100,8 @@ Cheap, mechanical, no verification required:
 ## Do not flag deliberate behavior
 
 The preloaded run-chainsmoke skill carries the Gotchas list. Read it before
-flagging anything. Do not report: the banner on stdout, `audit` exiting 1 while
+flagging anything. Do not report: the banner showing only on SoundCloud/daemon
+verbs on a TTY (dev's call, 2026-09-28), `audit` exiting 1 while
 still printing, the four proxy env spellings, `likes`' one-column table, exit 3
 for unknown verbs, `stop` vs `daemon stop`, the process-scoped ledger, `--private`
 reading nothing, the three-state posture, or `script.sh` being broken by design.

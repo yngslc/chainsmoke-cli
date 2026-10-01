@@ -30,9 +30,10 @@ if (-not $GoExe) {
 #
 #   -trimpath   MEASURED 2026-08-24: without it the binary embeds absolute
 #               source paths — "D:/sccli/pkg/core/browse.go" and 14 more. That
-#               discloses the builder's drive letter and directory layout to
-#               anyone holding the binary, which is a poor look on a tool people
-#               choose for its threat model. With it: zero hits.
+#               discloses the builder's drive letter and directory layout (and,
+#               through module-cache paths, their username) to anyone holding
+#               the binary, which is a poor look on a tool people choose for its
+#               threat model. With it: zero hits — and Build() checks that.
 #   -s -w       drop the symbol table and DWARF. Smaller download, and one less
 #               copy of the build environment to read out of the file.
 #   -X          stamps the version `--version` and `audit` report. Without it
@@ -43,6 +44,11 @@ if (-not $GoExe) {
 # and it keeps the build reproducible across machines.
 $ldflags = "-s -w -X main.BuildVersion=$Version"
 
+# CI asserts -trimpath on its artifacts; these are the ones that actually ship
+# (09/09 debate, #7). Go embeds paths with forward slashes, and the module cache
+# sits under the user profile, so the username is part of what would leak.
+$buildPaths = @((Get-Location).Path, $env:USERPROFILE) | ForEach-Object { $_ -replace '\\', '/' }
+
 function Build($goos, $goarch, $out) {
     Write-Host ("building {0,-14} -> {1}" -f "$goos/$goarch", $out)
     $env:CGO_ENABLED = '0'
@@ -50,6 +56,12 @@ function Build($goos, $goarch, $out) {
     $env:GOARCH = $goarch
     & $GoExe build -trimpath -ldflags $ldflags -o $out .\cmd\chainsmoke
     if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: build failed for $goos/$goarch"; exit 1 }
+    $bytes = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $out)))
+    foreach ($p in $buildPaths) {
+        if ($bytes.IndexOf($p, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            Write-Host "FATAL: $out embeds the build path $p - is -trimpath still set?"; exit 1
+        }
+    }
 }
 
 # vet the whole module first: `go build .\cmd\chainsmoke` compiles only that

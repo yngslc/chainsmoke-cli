@@ -2,8 +2,9 @@
 #
 # Linux, because that is where the checks this project cares about can actually
 # run. `-race` needs cgo and a C toolchain, which the Windows dev box does not
-# have — measured 2026-08-24: `go: -race requires cgo`. So the race detector has
-# no home except here, and pkg/net is genuinely concurrent (bridge accept and
+# have — measured 2026-08-24: `go: -race requires cgo`. So natively the race
+# detector has no home except here (the dev box can also run it under WSL), and
+# pkg/net is genuinely concurrent (bridge accept and
 # splice goroutines, a mutex-guarded ledger, an RWMutex in the SOCKS dialer).
 #
 # What this deliberately does NOT do: run the integration suite. Those tests are

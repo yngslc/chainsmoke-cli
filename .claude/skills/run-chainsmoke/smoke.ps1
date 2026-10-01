@@ -7,10 +7,10 @@
 # Exit 1  = one or more cases diverged.
 # Exit 2  = no Go toolchain / build failure.
 #
-# The case table below encodes the CURRENT behavior of the carcass: most verbs
-# hit ErrNotImplemented stubs. When you implement a subsystem (pkg/net,
-# pkg/resolver, pkg/player, ...), flip the corresponding expectations here —
-# this script is the CLI-wiring regression harness, not a test of SoundCloud.
+# The case table below encodes the CURRENT behavior of the CLI. Only `get`
+# still dies in a stub (pkg/scrub). When you change a verb's behavior, flip the
+# corresponding expectations here — this script is the CLI-wiring regression
+# harness, not a test of SoundCloud, and it must never leave the box.
 
 param([string]$GoExe)
 
@@ -54,6 +54,9 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go build failed (output above).'; 
 # whether THIS machine happens to be running tor — it passed on a box with no
 # tor and failed the moment one appeared, which is a harness bug, not a
 # regression. Port 1 (tcpmux) is never bound in practice.
+# EVERY --allow-direct row needs it too: with a tor listening, Up() verifies a
+# real CONNECT through it to api-v2.soundcloud.com before the verb even fails,
+# so six "offline" rows were each opening a Tor stream (2026-10-01 review, N-5).
 $noTor = @('--tor-socks', '127.0.0.1:1')
 
 # Every audit case below reads and writes a saved config (T7.1). Point
@@ -63,6 +66,14 @@ $noTor = @('--tor-socks', '127.0.0.1:1')
 # real config on this machine would silently break.
 $env:XDG_CONFIG_HOME = Join-Path ([System.IO.Path]::GetTempPath()) 'chainsmoke-smoke-cfg'
 if (Test-Path $env:XDG_CONFIG_HOME) { Remove-Item -Recurse -Force $env:XDG_CONFIG_HOME }
+# The same goes for both stores: the purge cases below would otherwise wipe the
+# developer's real results cache and --remember state, and play-nocache would
+# depend on whatever a real search left behind. core.RuntimeDir/StateDir honour
+# these on Windows too. (The mpv pipe name is fixed, so the daemon cases still
+# share the real one — purge-first stops any daemon left running.)
+$env:XDG_RUNTIME_DIR = Join-Path ([System.IO.Path]::GetTempPath()) 'chainsmoke-smoke-run'
+$env:XDG_STATE_HOME  = Join-Path ([System.IO.Path]::GetTempPath()) 'chainsmoke-smoke-state'
+foreach ($d in $env:XDG_RUNTIME_DIR, $env:XDG_STATE_HOME) { if (Test-Path $d) { Remove-Item -Recurse -Force $d } }
 
 # -- case table: args / stdin / expected exit / expected output substring ----
 $cases = @(
@@ -73,30 +84,36 @@ $cases = @(
     # TestBannerClassification's job, not this harness's: a pipe cannot tell.
     @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version'; NotMatch = '=====' },
     @{ Name = 'help';         Args = @('--help');            Exit = 0; Match = 'privacy-focused SoundCloud CLI'; NotMatch = '=====' },
+    # Bare invocation down a pipe: today the command table. T10.1/T10.2 route a
+    # bare TTY run to the TUI but must keep THIS (help, exit 0, no hang), so the
+    # case exists before they land and they flip nothing (09/09 review, A-5).
+    @{ Name = 'bare-pipe';    Args = @();                    Exit = 0; Match = 'COMMANDS:'; NotMatch = '=====' },
     # T3.3: `search` is implemented now, so a bare search would leave the box —
     # and with no tor up, leave it UNANONYMIZED. Pointing --impersonate at a
-    # target yt-dlp cannot load kills it before it opens a socket: the case
-    # stays offline AND proves the resolver injected our flag (T3.4).
-    @{ Name = 'search-flags'; Args = @('--allow-direct', '--impersonate', 'smoke-invalid', 'search', 'roshina'); Exit = 1; Match = 'rejected --impersonate'; NotMatch = '=====' },
+    # target yt-dlp cannot load kills it before it opens a socket, and $noTor
+    # keeps Up() from probing through a running tor: the case stays offline AND
+    # proves the resolver injected our flag (T3.4).
+    @{ Name = 'search-flags'; Args = @($noTor + @('--allow-direct', '--impersonate', 'smoke-invalid', 'search', 'roshina')); Exit = 1; Match = 'rejected --impersonate'; NotMatch = '=====' },
     # With mpv+yt-dlp installed, play/daemon clear the tool checks. `play 1` then
     # fails in the store (empty cache) BEFORE any egress — deterministic, no
     # network. `daemon start` = Ensure() = mpv present, so it now succeeds.
-    # np stays stubbed (raw play has no IPC daemon to query).
-    # (If mpv/yt-dlp are NOT installed, play/daemon instead fail with 'mpv not
-    # found on PATH' — reinstall per SKILL.md or adjust these two rows.)
-    # T4.1 made the result cache survive between processes, so this case is no
-    # longer deterministic on its own: a real `search` from an earlier session
-    # would leave a result #1 sitting in $XDG_RUNTIME_DIR and `play 1` would go
-    # resolve it. Purge first, then assert the empty-cache message.
+    # (If mpv is NOT installed, daemon-start instead fails with 'mpv not found
+    # on PATH' — reinstall per SKILL.md or adjust that row.)
+    # The sandboxed stores above start empty, so play-nocache no longer needs a
+    # purge to be deterministic. purge-first stays for the daemon: it stops any
+    # mpv left on the shared pipe, which np-none below depends on.
     @{ Name = 'purge-first';  Args = @('purge');               Exit = 0; Match = '' },
-    @{ Name = 'play-nocache'; Args = @('--allow-direct', 'play', '1'); Exit = 1; Match = 'no cached result' },
+    @{ Name = 'play-nocache'; Args = @($noTor + @('--allow-direct', 'play', '1')); Exit = 1; Match = 'no cached result' },
     # T4.3: --private is memory-only, so a cache written by a normal run must be
     # invisible to it. Nothing to set up — a fresh process has no memory.
-    @{ Name = 'private-nocache'; Args = @('--private', '--allow-direct', 'play', '1'); Exit = 1; Match = 'no cached result' },
+    @{ Name = 'private-nocache'; Args = @($noTor + @('--private', '--allow-direct', 'play', '1')); Exit = 1; Match = 'no cached result' },
     # URL in argv is refused (invariant #3 / T1.3): must arrive on stdin.
     # Match the invariant itself, not an incidental word in the remediation
     # text — the previous 'stdin' match broke when the message was reworded.
-    @{ Name = 'url-in-argv';  Args = @('--allow-direct', 'play', 'https://soundcloud.com/a/b'); Exit = 1; Match = 'not accepted in argv' },
+    @{ Name = 'url-in-argv';  Args = @($noTor + @('--allow-direct', 'play', 'https://soundcloud.com/a/b')); Exit = 1; Match = 'not accepted in argv' },
+    # The three play cases above fail on their argument, and play now checks it
+    # BEFORE Ensure() — so none of them may have started a daemon (2026-10-01).
+    @{ Name = 'np-none';      Args = @('np');                Exit = 1; Match = 'unreachable' },
     @{ Name = 'daemon-start'; Args = @('daemon', 'start');   Exit = 0; Match = ''; NotMatch = '=====' },
     # T5.2/T5.5: `np` is a real IPC round-trip now, so it runs AFTER daemon-start
     # — otherwise the result depends on whether a daemon happened to be left
@@ -112,7 +129,7 @@ $cases = @(
     @{ Name = 'np-gone';      Args = @('np');                Exit = 1; Match = 'unreachable' },
     # stdin contract: URLs never ride in argv; `get` reads one line from stdin,
     # then dies in the scrubber stub. Proves the stdin path is wired.
-    @{ Name = 'get-stdin';    Args = @('--allow-direct', 'get'); Exit = 1; Match = 'not implemented'; Stdin = 'https://soundcloud.com/artist/track' },
+    @{ Name = 'get-stdin';    Args = @($noTor + @('--allow-direct', 'get')); Exit = 1; Match = 'not implemented'; Stdin = 'https://soundcloud.com/artist/track' },
     # With no daemon left, purge's player teardown finds nothing — not an error.
     @{ Name = 'purge-ok';     Args = @('purge');             Exit = 0; Match = '' },
     # urfave/cli exits 3 (not 1) for unknown commands
@@ -130,7 +147,7 @@ $cases = @(
     @{ Name = 'proxy-wired';   Args = @('--proxy', 'http://127.0.0.1:9', 'play', '1'); Exit = 1; Match = 'not reachable' },
     # T1.5: strconv.Atoi rejects an out-of-range index instead of the old
     # accumulator silently wrapping it to a negative number.
-    @{ Name = 'index-overflow'; Args = @('--allow-direct', 'play', '99999999999999999999'); Exit = 1; Match = 'out of range' },
+    @{ Name = 'index-overflow'; Args = @($noTor + @('--allow-direct', 'play', '99999999999999999999')); Exit = 1; Match = 'out of range' },
     # Input validation on the transport verbs: mpv must never receive an empty
     # or non-numeric argument (cli-developer: "validate user input early").
     @{ Name = 'seek-arity';    Args = @('seek');              Exit = 1; Match = 'usage' },
@@ -188,8 +205,8 @@ $cases = @(
     @{ Name = 'comp-bash';     Args = @('completion', 'bash'); Exit = 0; Match = '_chainsmoke_complete'; NotMatch = '=====' },
     @{ Name = 'comp-fish';     Args = @('completion', 'fish'); Exit = 0; Match = 'complete -c chainsmoke'; NotMatch = '=====' },
     @{ Name = 'comp-badshell'; Args = @('completion', 'tcsh'); Exit = 1; Match = 'unknown shell' },
-    # Last, always: `play` runs Ensure() before it validates its argument, so
-    # the failing play cases above still start a daemon. Leave nothing behind.
+    # Last, always: a safety net so no run leaves an mpv behind, even if a case
+    # above fails between daemon-start and daemon-stop.
     @{ Name = 'teardown';      Args = @('daemon', 'stop');   Exit = 0; Match = '' }
 )
 

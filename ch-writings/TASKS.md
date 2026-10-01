@@ -418,6 +418,8 @@ part and it does not rot. Three things to carry to the revisit:
   cases — this is NOT the general banner fix, which stays T10.1/T10.2's; it is
   the narrow suppression without which T8.3 cannot work at all. Two smoke cases
   assert the absence, which is why the harness grew a `NotMatch` field.
+  *(Superseded 2026-09-28: `bannerCorruptsOutput` is gone — the banner became a
+  TTY-only `Before` hook, which urfave skips for completion; PHASE10.md Part B.)*
   `build.ps1` cross-builds all six targets. **MEASURED 2026-08-24: without
   `-trimpath` the binary embeds absolute source paths** — `D:/sccli/pkg/core/
   browse.go` and 14 more — disclosing the builder's drive letter and directory
@@ -503,7 +505,7 @@ already deployed from what actually had to be built.
   5/5 skip cleanly with the dependency removed. CI runs the compile check only.
   **done**
 - **T9.3** Keep `smoke.ps1` baseline current as stubs become real.
-  **Already deployed and maintained** — 35 cases, updated in step with every
+  **Already deployed and maintained** — 35 cases (40 as of 2026-10-01), updated in step with every
   phase through T8.3, including the `NotMatch` field added so the harness can
   assert ABSENCES (no banner in a completion script). This is a standing
   obligation rather than a task that completes: T10.10 folds in the
@@ -512,10 +514,14 @@ already deployed from what actually had to be built.
 
 ## Phase 10 — TUI (the default surface)
 
-Decided 2026-08-14. Bare `chainsmoke` opens a **TUI**; `-h`/`--help` prints the
-ASCII banner + command table; explicit verbs stay one-shot and quiet. Full
+Decided 2026-08-14. Bare `chainsmoke` opens a **TUI**; ~~`-h`/`--help` prints the
+ASCII banner + command table; explicit verbs stay one-shot and quiet~~ explicit
+verbs stay one-shot (banner rule revised below). Full
 rationale, library comparison, and constraints: INSTRUCTIONS.md → *"Go TUI
-architecture — the default surface"*.
+architecture — the default surface"*. **Banner revised 2026-09-28 (dev's
+call):** help prints no art; the banner opens the SoundCloud/player verbs
+(`search`, `likes`, `playlist`, `play`, `get`, `daemon start|stop|status`) on a
+TTY only. The TUI decision is unchanged.
 
 Build it the way `main.go` was built: **carcass first** — real layout, real
 navigation, real keybindings, stubbed data — then wire the seams one at a time.
@@ -529,18 +535,25 @@ Phase 3/4. Don't let the carcass wait on any of that.
 ### 10A — Entry point & carcass (no dependencies; do first)
 
 - **T10.1 — Split the entry point.** Route: no args + TTY on **both** stdin
-  and stdout → TUI; `-h`/`--help` → banner + command table; `--version` →
+  and stdout → TUI; ~~`-h`/`--help` → banner + command table~~ `-h`/`--help` →
+  command table, no banner (2026-09-28); `--version` →
   version line only; any explicit verb → today's one-shot path. **Move the
   banner out of `main()`'s unconditional print** so it stops prefixing every
   verb's output and polluting pipes.
+  **Half done 2026-09-28 (dev's call):** the banner is out of `main()` — a
+  `Before: banner` hook on the SoundCloud/player verbs, TTY-only — and
+  `-h`/`--help` prints the command table with **no** art, reversing the route
+  above. What remains is the TUI route itself. smoke's `bare-pipe` case
+  already pins the non-TTY bare invocation (help, exit 0).
 - **T10.2 — TTY guard + `--no-tui`.** If stdin **or** stdout is not a
   terminal, a bare invocation must print help and exit, never launch the TUI.
   Without the stdout half, `smoke.ps1`, CI, and `chainsmoke | grep` hang
   forever; without the stdin half, `echo x | chainsmoke` in a real console
   launches an alt-screen TUI reading keys from a pipe that never produces any,
   with no way to quit (flagged 2026-09-09). Both helpers already exist —
-  `stdinIsTerminal()` in `pkg/core/core.go` and `stdoutIsTerminal()` in
-  `pkg/core/table.go` — so the rule costs nothing. Add `--no-tui` as the
+  `core.StdinIsTerminal()` and `core.StdoutIsTerminal()` (exported 2026-09-28;
+  real console/tty checks since 2026-10-01, so a null device is not a TTY) —
+  so the rule costs nothing. Add `--no-tui` as the
   explicit escape hatch. This is a hard prerequisite for T10.10, which needs a
   case for each half.
 - **T10.3 — Pick the library.** Bubble Tea + lipgloss + bubbles (recommended:
@@ -585,7 +598,8 @@ Phase 3/4. Don't let the carcass wait on any of that.
   must read `observe_property` events (`time-pos`, `playlist-pos`, `pause`,
   `eof`) while idle. That is a second client behind the same `Command` seam
   (reader goroutine, pending-request map, event channel), **not** a change to
-  the synchronous one, which the one-shot verbs depend on and 14 tests pin.
+  the synchronous one, which the one-shot verbs depend on and the `pkg/player`
+  suite pins.
   The socket-vs-named-pipe question is already answered by `dial()` in
   `pkg/player/mpv.go`: the stdlib talks to the pipe fine. What it cannot do on
   Windows is interrupt a blocked read — `Close()` does not unblock `os.File` on
@@ -651,13 +665,26 @@ Phase 3/4. Don't let the carcass wait on any of that.
      not a *fresh* segment dial made after the proxy is already dead (HLS's
      real shape). Re-run against a CONNECT-tunnelling proxy and a real
      multi-segment HLS fixture before treating this as closed.
+     **Updated 2026-10-01:** the CONNECT half is measured. In the shipped shape
+     over IPC with an `https` origin, CONNECT is used, and a dead, 404, 502 or
+     200-then-close proxy produced zero direct connections (review
+     CH-2026-10-01, M-2/M-3). A fresh segment dial is a fresh connection, so it
+     meets the same decision. Two bypasses were found and closed the same day:
+     an inherited `no_proxy`, and any proxy value that is not a literal
+     `http://`. A loopback rig showed both BYPASS before the fix and clean
+     after. The real multi-segment HLS fixture through the real bridge remains
+     open, because it needs live egress.
   3. **Unrelated to both of the above:** the private Tor daemon orphan on
      Ctrl+C (PHASE10.md Part D) is a different process leaking for a different
      reason — `Net.Down()`, not `Play.Down()`, and it isn't touched by anything
      measured here.
 - **T10.10 — Smoke harness must not hang.** Add cases asserting a
   non-TTY/`--no-tui` bare invocation exits with help (proves T10.2), and that
-  verbs print no banner. Never add a case that launches the real TUI.
+  ~~verbs print no banner~~ no banner ever reaches a pipe (2026-09-28 rule).
+  Never add a case that launches the real TUI.
+  **Partly in place 2026-10-01:** `bare-pipe` covers the non-TTY bare
+  invocation, and no case can see the banner through a pipe (`NotMatch '====='`
+  on four of them). Still to add with T10.2: `--no-tui`.
 - **T10.11 — Narrow-terminal degradation.** The wordmark is ~62 cols inside a
   78-col frame; the smoke cloud ~60. Below that, wrapping destroys the art —
   detect width and degrade (smaller art, or none) instead of wrapping. Keep the

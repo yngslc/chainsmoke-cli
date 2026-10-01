@@ -79,7 +79,7 @@ func renderTSV(w io.Writer, ts []Track) {
 		if t.Duration > 0 {
 			dur = strconv.Itoa(t.Duration)
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", i+1, clean(t.Title), clean(t.Uploader), dur)
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", i+1, Clean(t.Title), Clean(t.Uploader), dur)
 	}
 }
 
@@ -110,9 +110,9 @@ func renderTable(w io.Writer, ts []Track, width int) {
 
 	titleW, uploaderW, timeW := 0, 0, 0
 	for _, t := range ts {
-		titleW = max(titleW, displayWidth(clean(t.Title)))
+		titleW = max(titleW, displayWidth(Clean(t.Title)))
 		if hasUploader {
-			uploaderW = max(uploaderW, displayWidth(clean(t.Uploader)))
+			uploaderW = max(uploaderW, displayWidth(Clean(t.Uploader)))
 		}
 		if hasDuration {
 			timeW = max(timeW, displayWidth(FormatDuration(t.Duration)))
@@ -184,7 +184,7 @@ func renderTable(w io.Writer, ts []Track, width int) {
 	rows := make([]string, 0, len(ts)+1)
 	rows = append(rows, row("#", "TITLE", "UPLOADER", "TIME"))
 	for i, t := range ts {
-		rows = append(rows, row(strconv.Itoa(i+1), clean(t.Title), clean(t.Uploader), FormatDuration(t.Duration)))
+		rows = append(rows, row(strconv.Itoa(i+1), Clean(t.Title), Clean(t.Uploader), FormatDuration(t.Duration)))
 	}
 
 	rule := 0
@@ -235,25 +235,18 @@ func OutputWidth() int {
 	return defaultWidth
 }
 
-// StdoutIsTerminal mirrors StdinIsTerminal: the character-device bit, so this
-// needs no dependency and answers the same on Windows and POSIX.
-func StdoutIsTerminal() bool {
-	fi, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
+// StdoutIsTerminal mirrors StdinIsTerminal for stdout.
+func StdoutIsTerminal() bool { return isTerminal(os.Stdout) }
 
 // -----------------------------------------------------------------------------
 // Width arithmetic
 // -----------------------------------------------------------------------------
 
-// clean strips the characters that would break a row rather than appear in it.
+// Clean strips the characters that would break a row rather than appear in it.
 // Track titles are attacker-influenced text from a third party: a tab would
 // wreck the TSV form, a newline would forge an extra row, and an ANSI escape
 // would let a title repaint the terminal. None of them belong in a cell.
-func clean(s string) string {
+func Clean(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {

@@ -202,11 +202,12 @@ func commands(app *core.App) []*cli.Command {
 				if err := app.Net.Up(); err != nil { // chokepoint first
 					return err
 				}
-				if err := app.Play.Ensure(); err != nil {
-					return err
-				}
 				t, err := app.ResolveIndexOrStdin(c.Args().First())
 				if err != nil {
+					return err
+				}
+				// After the argument, so a typo does not leave a daemon behind.
+				if err := app.Play.Ensure(); err != nil {
 					return err
 				}
 				entries, err := app.Res.Meta(t.Permalink)
@@ -361,7 +362,8 @@ func commands(app *core.App) []*cli.Command {
 				// Up()'s refusal is REPORTED here rather than obeyed, which is
 				// the one place in the tool that is true. Every other verb must
 				// abort on it because it is about to send traffic; audit is a
-				// diagnostic that sends nothing of its own, and a diagnostic
+				// diagnostic that sends no SoundCloud traffic of its own (its
+				// local DNS probe asks a neutral name), and a diagnostic
 				// that refuses to run precisely when the thing it diagnoses is
 				// broken is useless. The exit code below still carries the
 				// failure, so nothing is laundered into a pass.
@@ -467,8 +469,11 @@ func main() {
 		// and the daemon plus its temp DataDirectory outlive us forever. A
 		// DETECTED system tor is never touched — Down() only kills what we own.
 		//
-		// NOT covered: SIGINT. Ctrl+C during playback skips this entirely
-		// (T10.9 territory), so a private tor can still leak that way.
+		// NOT covered: signals. A running play session traps Ctrl+C and returns
+		// through here (session.go); Ctrl+C or SIGTERM anywhere else — including
+		// play's resolve phase before the session starts — skips this, so a
+		// private tor can still leak that way (T10.9; PHASE10.md Part D says
+		// why a handler cannot simply call Down()).
 		After: func(*cli.Context) error {
 			if app.Net != nil {
 				return app.Net.Down()

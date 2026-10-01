@@ -27,6 +27,13 @@ type consoleScreenBufferInfo struct {
 	MaximumWindowSize coord
 }
 
+// isTerminal asks the console API, which answers only for a real console. NUL
+// is a character device as well, so the device bit alone would call it one.
+func isTerminal(f *os.File) bool {
+	var mode uint32
+	return syscall.GetConsoleMode(syscall.Handle(f.Fd()), &mode) == nil
+}
+
 // terminalWidth returns the console's VISIBLE width, or 0 when stdout is not a
 // console.
 //

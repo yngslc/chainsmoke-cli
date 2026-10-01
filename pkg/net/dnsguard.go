@@ -36,8 +36,15 @@ import (
 // *.sndcdn.com / soundcloud.com left the host during a play — is a CI job
 // (T7.2). A process cannot prove that about itself; do not pretend otherwise.
 
-// leakDomains are the names whose local resolvability we report on.
-var leakDomains = []string{"soundcloud.com", "sndcdn.com"}
+// probeName is what `audit` resolves to answer "would a lookup that bypassed
+// the bridge be visible to a local resolver?". It is deliberately NOT a
+// SoundCloud name. This probe used to resolve soundcloud.com and sndcdn.com,
+// i.e. send on every `audit` the exact plaintext query INSTRUCTIONS.md:128 says
+// must fail the build (found 2026-10-01: review N-4, debate claim 4). A
+// resolver that answers one name sees every name, and a blocked soundcloud.com
+// would still have been seen asking, so a neutral name answers the same
+// question without telling the resolver anything.
+var probeName = "example.com"
 
 // dnsProbeTimeout keeps `audit` responsive on a host with no working resolver,
 // where a lookup would otherwise sit through the full system retry schedule.
@@ -71,13 +78,9 @@ func CheckLocalDNSVisibility(ctx context.Context, host string) (visible bool, de
 	}
 }
 
-// AuditDNS probes every name we care about. Returns whether any was locally
-// visible, plus one report line per name.
-func AuditDNS(ctx context.Context) (anyVisible bool, lines []string) {
-	for _, d := range leakDomains {
-		v, detail := CheckLocalDNSVisibility(ctx, d)
-		anyVisible = anyVisible || v
-		lines = append(lines, detail)
-	}
-	return anyVisible, lines
+// AuditDNS probes the local resolver with probeName. Returns whether it
+// answered, plus one report line.
+func AuditDNS(ctx context.Context) (visible bool, lines []string) {
+	v, detail := CheckLocalDNSVisibility(ctx, probeName)
+	return v, []string{detail}
 }

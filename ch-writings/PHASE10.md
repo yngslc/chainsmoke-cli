@@ -3,7 +3,9 @@
 ## Context
 
 Bare `chainsmoke` should open a TUI; explicit verbs stay one-shot and quiet
-(decided 2026-08-14, TASKS.md Phase 10). This is not a new feature bolted on
+(decided 2026-08-14, TASKS.md Phase 10; since the dev's 2026-09-28 call the
+SoundCloud/player verbs open with the banner on a TTY, never down a pipe, and
+help prints none). This is not a new feature bolted on
 the side — it is a **second front-end over the same `Store`/`Resolver`/`Player`
 interfaces**, and the existing code is not shaped to support one.
 
@@ -56,22 +58,24 @@ Critical files: `pkg/core/core.go`, `pkg/core/browse.go`, `cmd/chainsmoke/main.g
 Reuse rather than rebuild — these are already the right shape:
 - `RenderResults(w, ts, width, tty)` — `[]Track` in, writer out (`pkg/core/table.go`)
 - `OutputWidth()` — `$COLUMNS` → ioctl/kernel32 → 80. **Directly reusable for T10.11.**
-- `FormatDuration`, `clean()` — the TUI needs both for identical reasons
+- `FormatDuration`, `Clean()` (exported 2026-10-01) — the TUI needs both for identical reasons
 - `Config` / `Drift` / `LoadConfig` / `SaveConfig` — the privacy-config screen's whole model already exists (Phase 7)
 
 ### B. Entry point split (T10.1 / T10.2)
 
 Route: no args + TTY on **both stdin and stdout** → TUI · `-h`/`--help` →
-banner + command table · `--version` → version line · any verb → today's
-one-shot path · `--no-tui` → help.
+command table, no banner (dev's call, 2026-09-28) · `--version` → version line ·
+any verb → today's one-shot path · `--no-tui` → help.
 
 **T10.2 is a hard prerequisite for T10.10** — without the stdout guard,
 `smoke.ps1`, CI and `chainsmoke | grep` hang forever. **The stdin half was
 added 2026-09-09:** `echo x | chainsmoke` in a real console passes a
 stdout-only check and launches an alt-screen TUI reading keys from a pipe that
 never produces any — no way to quit short of killing it from another window.
-`stdinIsTerminal()` (`pkg/core/core.go`) and `stdoutIsTerminal()`
-(`pkg/core/table.go`) both exist; require both. T10.10 needs a case for each.
+`core.StdinIsTerminal()` and `core.StdoutIsTerminal()` both exist (exported
+2026-09-28; since 2026-10-01 they ask the console/tty itself, so `NUL` and
+`/dev/null` no longer pass as terminals); require both. T10.10 needs a case for
+each.
 
 ~~Note `bannerCorruptsOutput` (added T8.3) becomes partly redundant~~ —
 **superseded 2026-09-28: `bannerCorruptsOutput` and `valueFlags` are gone.** The
@@ -79,9 +83,8 @@ banner is now a `Before` hook on the SoundCloud/session verbs, TTY-only, so the
 `--generate-bash-completion` guard is urfave's own: `Command.Run` returns for
 the completion protocol before it calls `Before`, and `Before` is additionally
 skipped when `shellComplete` is set (command.go, v2.27.7) — which holds against
-a TTY too. Nothing to port at T10.1. **But note the route line above**: it
-still says `-h`/`--help` → banner, which the dev reversed the same day (help
-prints no art). Reconcile it when T10.1 is picked up.
+a TTY too. Nothing to port at T10.1. The route line above was reconciled with
+that reversal on 2026-10-01 (help prints no art).
 
 ### C. Second IPC client (T10.7)
 
@@ -92,8 +95,8 @@ prints no art). Reconcile it when T10.1 is picked up.
 > behind this same seam, not a change to this one."*
 
 So: new type in `pkg/player`, same `Command` seam, **do not modify the
-synchronous client** — the one-shot verbs depend on its behavior and 14 tests
-pin it. New client needs a reader goroutine, `map[int64]chan message`, and an
+synchronous client** — the one-shot verbs depend on its behavior and the
+`pkg/player` suite pins it. New client needs a reader goroutine, `map[int64]chan message`, and an
 event channel for `observe_property` (`time-pos`, `playlist-pos`, `pause`, `eof`).
 
 **Windows caveat, already documented in `dial()`:** a named pipe opened via
@@ -104,10 +107,24 @@ a Windows-only dependency. Decide this *before* writing the client, not after.
 ### D. Signal handling (T10.9) — fixes a pre-existing leak
 
 **Measured: nothing in the tree traps SIGINT.** `grep -rn "signal.Notify"` returns
-only a comment. This is not merely a TUI concern — today Ctrl+C during playback
-skips urfave's `After()` hook, so a **private tor daemon and its temp
+only a comment. This is not merely a TUI concern — Ctrl+C or SIGTERM anywhere
+outside a running play session (which traps Ctrl+C since 2026-09-28) skips
+urfave's `After()` hook, so a **private tor daemon and its temp
 DataDirectory are orphaned and outlive the process**. T10.9 fixes that for the
 CLI as well as restoring alt-screen/raw mode for the TUI.
+
+**Design constraint found 2026-10-01 (not yet built):** the handler cannot
+simply call `Net.Down()`. A signal arrives on its own goroutine while the main
+one may still be in `Up()`. `ensureTor` sets `torCmd`/`torDir` *before* the
+bootstrap wait, and `Bridge` has no lock. `Down()` also nils `b.cb`, which the
+main goroutine dereferences unlocked (`Verify`, `Reisolate`, the ledger). So a
+signal-time `Down()` is a data race and can panic the main goroutine on the
+way out. Needed instead: a teardown that kills the private tor and removes its
+DataDirectory without mutating the shared fields, reading them under a mutex
+that `ensureTor` also takes. Plus: install the handler after `wire()` (so
+`app.Net` is no longer being written), and let the `play` session keep Ctrl+C
+while it runs (it has playback to stop first). On Windows, closing the console
+arrives as SIGTERM with a few seconds to clean up, so trap SIGTERM too.
 
 **A second, separate exit-path question — observed 2026-09-28, detail in
 TASKS.md T10.9:** mpv itself always outlives the process (T0.1(a), by design),
@@ -117,6 +134,14 @@ case: no — mpv's own network layer does not fall back to a direct connection
 when the per-`loadfile` proxy dies mid-stream, it just hits EOF. The real
 bridge's CONNECT/HTTPS path and a genuine multi-segment HLS fixture are still
 unmeasured; don't generalize past the plain-HTTP result yet.
+**Updated 2026-10-01:** the CONNECT/HTTPS half is now measured at the
+connection level (review CH-2026-10-01, M-2/M-3). In the shipped shape over IPC
+with an `https` origin, CONNECT is used, and a dead, 404, 502 or 200-then-close
+proxy produced zero direct connections. Each new segment is a new connection,
+so it hits the same decision. Two bypasses were found and closed the same day:
+`no_proxy` in mpv's environment, and any proxy value that is not a literal
+`http://` (re-measured before/after on a loopback rig). Still unmeasured: a
+real multi-segment HLS stream through the real bridge, which needs live egress.
 
 ### E. Table reconciliation (T10.12) — mostly already satisfied
 
@@ -139,10 +164,12 @@ lipgloss itself uses) is the equivalent.
 
 ### F. smoke.ps1 (T10.10)
 
-All 35 cases currently run against a binary that prints the banner
+~~All 35 cases currently run against a binary that prints the banner
 unconditionally. Add: non-TTY bare invocation exits with help; verbs print no
-banner (the `NotMatch` field added in T8.3 already supports this). **Never add a
-case that launches the real TUI.**
+banner~~ **Updated 2026-10-01:** both are in place. The banner never reaches a
+pipe since 2026-09-28 (`NotMatch '====='` pins it), and `bare-pipe` asserts the
+non-TTY bare invocation prints help and exits 0. Left for T10.2: `--no-tui`.
+**Never add a case that launches the real TUI.**
 
 ---
 
@@ -172,6 +199,11 @@ Two things the spike must know about the v2 Charm line, both measured:
 module's own `go.mod` declares `module charm.land/bubbletea/v2`, so the github
 path is a hard compile error even though the proxy resolves it; and **`View()`
 returns `tea.View`, not `string`**, so v1 examples do not port verbatim.
+A third, recorded 2026-10-01 from the 09/09 debate (#4, measured that day): the
+v2 line links `github.com/charmbracelet/ultraviolet` at an untagged
+**pseudo-version**, `v0.0.0-20260811164956-006e29f97886`. If v2 wins, that
+module is pinned to a commit, not a release, so pin it deliberately and
+re-check it at each upgrade.
 
 | | Bubble Tea v2 + bubbles + lipgloss | tview (tcell) |
 |---|---|---|

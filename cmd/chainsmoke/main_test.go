@@ -157,6 +157,25 @@ func TestNonEgressVerbsDoNotBringEgressUp(t *testing.T) {
 	}
 }
 
+// TestPlayRejectsBadInputBeforeStartingThePlayer: a `play` that is going to fail
+// on its argument must not spawn mpv first. It used to call Ensure() before
+// reading the argument, so every typo left a daemon running behind it.
+func TestPlayRejectsBadInputBeforeStartingThePlayer(t *testing.T) {
+	for name, args := range map[string][]string{
+		"URL in argv":        {"play", "https://soundcloud.com/artist/track"},
+		"index out of range": {"play", "99999999999999999999"},
+		"no index, no stdin": {"play"},
+	} {
+		app, _, _, p := wiredApp()
+		if err := runVerb(app, args...); err == nil {
+			t.Errorf("%s: play succeeded, want an error", name)
+		}
+		if p.ensures != 0 {
+			t.Errorf("%s: Ensure() ran %d times before the argument was rejected", name, p.ensures)
+		}
+	}
+}
+
 // TestCommandTableIsWellFormed catches the class of mistake that breaks every
 // verb at once. A duplicate name or alias is the specific one that has bitten
 // this CLI before: urfave/cli resolves the FIRST match, so a second `pause`

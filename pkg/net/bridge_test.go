@@ -206,6 +206,18 @@ func TestConnectBridgeNegotiatesIsolation(t *testing.T) {
 
 // TestConnectRequestNeverResolvesHostnames pins the encoder directly: a
 // hostname must go out as a domain, an IP literal as an IP.
+func TestDNSProbeNeverAsksForSoundCloud(t *testing.T) {
+	// `audit` used to resolve soundcloud.com and sndcdn.com through the system
+	// resolver to ask whether such a lookup would be visible, which sent that
+	// very lookup on every run (2026-10-01, review N-4). The probe may ask the
+	// local resolver anything except the names it exists to protect.
+	for _, protected := range []string{"soundcloud", "sndcdn"} {
+		if strings.Contains(strings.ToLower(probeName), protected) {
+			t.Errorf("audit's local DNS probe resolves %q — a plaintext lookup of a protected name", probeName)
+		}
+	}
+}
+
 func TestConnectRequestNeverResolvesHostnames(t *testing.T) {
 	req, err := connectRequest("api-v2.soundcloud.com:443")
 	if err != nil {

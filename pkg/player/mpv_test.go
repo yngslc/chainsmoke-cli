@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -542,10 +543,7 @@ func TestDownFromAFreshProcessSendsQuit(t *testing.T) {
 // (a prefix match would take it) and a process that names the endpoint but is
 // not mpv.
 func TestDownKillsStrays(t *testing.T) {
-	endpoint := filepath.Join(t.TempDir(), "mpv.sock")
-	if runtime.GOOS == "windows" {
-		endpoint = fmt.Sprintf(`\\.\pipe\chainsmoke-test-%d`, os.Getpid())
-	}
+	endpoint := testEndpoint(t)
 	stray := standIn(t, "mpv", endpoint)
 	spared := map[string]<-chan struct{}{
 		"an mpv on another endpoint": standIn(t, "mpv", endpoint+"-other"),
@@ -570,10 +568,196 @@ func TestDownKillsStrays(t *testing.T) {
 	}
 }
 
-// standIn starts a copy of this test binary named name, with the argv Ensure()
-// gives mpv, and returns a channel that closes when it exits. TestMain makes
-// the copy idle until killed; cleanup kills it whatever the test did.
-func standIn(t *testing.T, name, endpoint string) <-chan struct{} {
+// TestEnsureWaitsForADaemonStillStarting: an mpv already started on the
+// endpoint that does not answer yet is booting, not missing. Ensure used to
+// give up after 3s (a cold start measured longer, 2026-09-28), and the next
+// call spawned a second mpv, which can never get the pipe and idles as a
+// stray. Here the booting mpv is a stand-in, and the test brings its endpoint
+// up 300ms in. Unix socket only, as in TestDownFromAFreshProcessSendsQuit; the
+// decision being tested is the same code on both targets.
+func TestEnsureWaitsForADaemonStillStarting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named-pipe server needs go-winio; TestEnsureReplacesADaemonThatNeverAnswers covers the shared path")
+	}
+	endpoint := testEndpoint(t)
+	useStandInMPV(t)
+	booting := standIn(t, "mpv", endpoint)
+	t.Cleanup(func() { _ = reap(endpoint, 0) }) // anything Ensure wrongly started
+
+	up := make(chan net.Listener, 1)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		ln, err := net.Listen("unix", endpoint)
+		up <- ln
+		for err == nil {
+			var c net.Conn
+			if c, err = ln.Accept(); err == nil {
+				go answerIdle(c)
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		if ln := <-up; ln != nil {
+			ln.Close()
+		}
+	})
+
+	if err := New(endpoint, fakeNet{}).Ensure(); err != nil {
+		t.Fatalf("Ensure() = %v, want nil once the starting daemon answers", err)
+	}
+	if n := len(daemons("--input-ipc-server=" + endpoint)); n != 1 {
+		t.Errorf("%d mpv on the endpoint, want 1 — Ensure started another while the first was booting", n)
+	}
+	select {
+	case <-booting:
+		t.Error("Ensure killed the mpv that was still starting")
+	default:
+	}
+}
+
+// TestEnsureReplacesADaemonThatNeverAnswers: the wait must be bounded. An mpv
+// still silent after the whole window is a stray or wedged, not slow, and it
+// must not make every later `play` wait and fail. Ensure clears it and starts a
+// fresh one.
+func TestEnsureReplacesADaemonThatNeverAnswers(t *testing.T) {
+	endpoint := testEndpoint(t)
+	useStandInMPV(t)
+	startTimeout = 200 * time.Millisecond
+	stray := standIn(t, "mpv", endpoint)
+	t.Cleanup(func() { _ = reap(endpoint, 0) }) // the replacement Ensure starts
+
+	// A stand-in never answers IPC, so the replacement times out too. That
+	// error is expected; what is left running is the point.
+	_ = New(endpoint, fakeNet{}).Ensure()
+
+	select {
+	case <-stray:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ensure left the silent mpv running")
+	}
+	if n := len(daemons("--input-ipc-server=" + endpoint)); n != 1 {
+		t.Errorf("%d mpv on the endpoint after Ensure, want exactly its replacement", n)
+	}
+}
+
+// TestEnsureSpawnsTheDaemonSafely pins what Ensure hands mpv, which no test
+// looked at before (2026-10-01 review, R-3/N-1/N-3). The stand-in reports the
+// argv and environment it was spawned with.
+//   - no_proxy is dropped: libavformat honours it even for the proxy each
+//     loadfile carries, so a user's no_proxy=* (or a pattern matching the CDN)
+//     sent mpv to the CDN directly while the preflight went through Tor
+//     (measured 2026-10-01, by both the reviewer and the debater).
+//   - the rest of the environment survives: e2f2e01 stripped it to PATH, and
+//     that was a leak too.
+//   - --no-ytdl is there: without it a failed load runs mpv's ytdl hook, which
+//     spawns yt-dlp with the URL in argv and no proxy (measured 2026-10-01).
+func TestEnsureSpawnsTheDaemonSafely(t *testing.T) {
+	endpoint := testEndpoint(t)
+	useStandInMPV(t)
+	startTimeout = 200 * time.Millisecond // a stand-in never answers; its env is the point
+	dump := filepath.Join(t.TempDir(), "env")
+	t.Setenv("CHAINSMOKE_STAND_IN_ENV", dump)
+	t.Setenv("no_proxy", "*")
+	t.Setenv("http_proxy", "http://127.0.0.1:1")
+	t.Cleanup(func() { _ = reap(endpoint, 0) })
+
+	_ = New(endpoint, fakeNet{}).Ensure()
+
+	var env []string
+	for deadline := time.Now().Add(5 * time.Second); env == nil && time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		if b, err := os.ReadFile(dump); err == nil {
+			env = strings.Split(string(b), "\n")
+		}
+	}
+	if env == nil {
+		t.Fatal("the daemon Ensure spawned never reported its environment")
+	}
+	if argv := env[0]; !slices.Contains(strings.Fields(argv), "--no-ytdl") {
+		t.Errorf("mpv was spawned without --no-ytdl: %s", argv)
+	}
+	kept := false
+	for _, kv := range env[1:] {
+		k, v, _ := strings.Cut(kv, "=")
+		if strings.EqualFold(k, "no_proxy") {
+			t.Errorf("mpv was spawned with %s=%s — libavformat would skip the proxy", k, v)
+		}
+		kept = kept || strings.EqualFold(k, "http_proxy") && v == "http://127.0.0.1:1"
+	}
+	if !kept {
+		t.Error("http_proxy did not reach mpv — the environment was stripped, not filtered")
+	}
+}
+
+// TestEnqueueRefusesAProxyMpvWouldIgnore: libavformat uses a proxy only when it
+// starts with exactly "http://", and silently fetches direct otherwise. So any
+// other proxy value must stop the track before the preflight, or the preflight
+// would tunnel while the stream went around it.
+func TestEnqueueRefusesAProxyMpvWouldIgnore(t *testing.T) {
+	for _, proxy := range []string{"HTTP://127.0.0.1:1", "https://127.0.0.1:1", "socks5://127.0.0.1:1"} {
+		client, server := net.Pipe()
+		got := make(chan string, 1)
+		go func() {
+			defer close(got) // "" when nothing reached mpv
+			if sc := bufio.NewScanner(server); sc.Scan() {
+				got <- sc.Text()
+			}
+		}()
+		p := New("unused.sock", fakeNet{proxy: proxy})
+		p.ipc = newIPC(client)
+
+		// The proxy is dead, so a preflight would fail too — with ErrDeadStream.
+		// A refusal is the error that comes back without it, before any request.
+		err := p.Enqueue("https://cdn.example/x.m3u8?Signature=s", "t")
+		switch {
+		case err == nil || errors.Is(err, core.ErrDeadStream):
+			t.Errorf("Enqueue with proxy %s = %v, want a refusal before the preflight", proxy, err)
+		case strings.Contains(err.Error(), "127.0.0.1"):
+			t.Errorf("the refusal repeats the proxy address (it may carry credentials): %v", err)
+		}
+		client.Close()
+		if line := <-got; line != "" {
+			t.Errorf("with proxy %s, mpv was sent %s", proxy, line)
+		}
+		server.Close()
+	}
+}
+
+// testEndpoint is an IPC endpoint no real daemon uses.
+func testEndpoint(t *testing.T) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(`\\.\pipe\chainsmoke-test-%d-%s`, os.Getpid(), t.Name())
+	}
+	return filepath.Join(t.TempDir(), "mpv.sock")
+}
+
+// useStandInMPV makes `mpv` on PATH a stand-in, so anything Ensure spawns is a
+// copy of this test binary that idles, never a real player. It also keeps
+// Ensure's runtime-dir write out of the real one, and restores startTimeout.
+func useStandInMPV(t *testing.T) {
+	t.Setenv("PATH", filepath.Dir(standInBinary(t, "mpv")))
+	t.Setenv("CHAINSMOKE_STAND_IN", "1")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	old := startTimeout
+	t.Cleanup(func() { startTimeout = old })
+}
+
+// answerIdle plays a daemon on one connection: every request gets a success
+// reply carrying its own request_id, which is all live() asks for.
+func answerIdle(c net.Conn) {
+	defer c.Close()
+	sc := bufio.NewScanner(c)
+	for sc.Scan() {
+		var req struct {
+			ID int `json:"request_id"`
+		}
+		_ = json.Unmarshal(sc.Bytes(), &req)
+		fmt.Fprintf(c, `{"data":true,"request_id":%d,"error":"success"}`+"\n", req.ID)
+	}
+}
+
+// standInBinary copies this test binary into a fresh directory as name (.exe
+// on Windows) and returns its path.
+func standInBinary(t *testing.T, name string) string {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
@@ -590,7 +774,15 @@ func standIn(t *testing.T, name, endpoint string) <-chan struct{} {
 	if err := os.WriteFile(bin, b, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "--idle", "--input-ipc-server="+endpoint)
+	return bin
+}
+
+// standIn starts a copy of this test binary named name, with the argv Ensure()
+// gives mpv, and returns a channel that closes when it exits. TestMain makes
+// the copy idle until killed; cleanup kills it whatever the test did.
+func standIn(t *testing.T, name, endpoint string) <-chan struct{} {
+	t.Helper()
+	cmd := exec.Command(standInBinary(t, name), "--idle", "--input-ipc-server="+endpoint)
 	cmd.Env = append(os.Environ(), "CHAINSMOKE_STAND_IN=1")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -601,15 +793,46 @@ func standIn(t *testing.T, name, endpoint string) <-chan struct{} {
 	return exited
 }
 
-// TestMain doubles as the stand-in daemon for TestDownKillsStrays: run with
-// CHAINSMOKE_STAND_IN set, this binary idles the way an mpv without its pipe
-// does. The minute is a backstop, so a failed test cannot leave one behind.
+// TestMain doubles as the stand-in daemon for the Down and Ensure tests: run
+// with CHAINSMOKE_STAND_IN set, this binary idles the way an mpv without its
+// pipe does. The minute is a backstop, so a failed test cannot leave one behind.
 func TestMain(m *testing.M) {
 	if os.Getenv("CHAINSMOKE_STAND_IN") == "1" {
+		if f := os.Getenv("CHAINSMOKE_STAND_IN_ENV"); f != "" { // argv line, then env; written whole, then renamed
+			report := append([]string{strings.Join(os.Args[1:], " ")}, os.Environ()...)
+			_ = os.WriteFile(f+".tmp", []byte(strings.Join(report, "\n")), 0o600)
+			_ = os.Rename(f+".tmp", f)
+		}
 		time.Sleep(time.Minute)
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+// TestNowPlayingScrubsTheTitle: media-title is the SoundCloud title Enqueue
+// handed mpv, so it is third-party text, and `np` puts it on a terminal. An
+// OSC sequence in it could retitle the window; an ESC could repaint the screen.
+func TestNowPlayingScrubsTheTitle(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		sc := bufio.NewScanner(server)
+		for sc.Scan() {
+			fmt.Fprintf(server, `{"data":"red \u001b[31mALERT\u001b]0;pwned\u0007","request_id":%d,"error":"success"}`+"\n",
+				requestID(t, sc.Text()))
+		}
+	}()
+
+	p := New("unused.sock", fakeNet{})
+	p.ipc = newIPC(client)
+
+	got, err := p.NowPlaying()
+	if err != nil {
+		t.Fatalf("NowPlaying() = %v", err)
+	}
+	if strings.IndexFunc(got, func(r rune) bool { return r < 0x20 }) >= 0 {
+		t.Errorf("NowPlaying() = %q — control characters reached the terminal", got)
+	}
 }
 
 // TestNowPlayingNeverPrintsAURL is the backstop: whatever ends up in mpv's

@@ -5,8 +5,8 @@ description: Build, run, and test chainsmoke, the privacy-focused SoundCloud Go 
 
 `chainsmoke` is a privacy-focused SoundCloud CLI over Tor. The entry point is
 `cmd/chainsmoke/main.go` — CLI surface and wiring only — over `pkg/{core,net,
-resolver,player,scrub,store}`, whose subsystems are still largely
-`ErrNotImplemented` stubs. Drive it via
+resolver,player,scrub,store}`. Every subsystem is real except `pkg/scrub`,
+which is still an `ErrNotImplemented` stub (so `get` dies there). Drive it via
 `.claude\skills\run-chainsmoke\smoke.ps1`, which vets, builds `chainsmoke.exe`,
 and asserts the current behavior baseline. `script.sh` is the frozen bash
 prototype (T0.3) — reference only, never edited to fix bugs.
@@ -78,7 +78,9 @@ It vets first, then builds with `-trimpath -ldflags "-s -w -X main.BuildVersion=
 and `CGO_ENABLED=0`. **`-trimpath` is not cosmetic:** measured 2026-08-24, a
 build without it embeds 15 absolute source paths (`D:/sccli/pkg/core/browse.go`
 and friends), disclosing the builder's drive letter and directory layout to
-anyone holding the binary. `-s -w` takes 13 MB to 8.9 MB. The Linux artifact is
+anyone holding the binary. Since 2026-10-01 `build.ps1` checks this on every
+artifact, as CI does: it fails if the repo path or `%USERPROFILE%` (module-cache
+paths carry the username) appears in the binary. `-s -w` takes 13 MB to 8.9 MB. The Linux artifact is
 confirmed `statically linked` by `file(1)`; darwin cross-compiles but has no
 dev target here, so it is untested.
 
@@ -93,7 +95,7 @@ and output against the current baseline:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .claude\skills\run-chainsmoke\smoke.ps1
-# → PASS x38, "smoke: all 38 cases pass", exit 0
+# → PASS x40, "smoke: all 40 cases pass", exit 0
 ```
 
 **When you implement a subsystem, flip the corresponding expectations in the
@@ -104,6 +106,7 @@ Verified behavior baseline (what the carcass does today):
 | invocation | exit | behavior |
 |---|---|---|
 | `.\chainsmoke.exe --help` | 0 | full command/flag table |
+| `.\chainsmoke.exe` (bare, piped) | 0 | the same command table — smoke's `bare-pipe`. T10.1 routes a bare TTY run to the TUI; this row must not change |
 | `.\chainsmoke.exe --version` | 0 | `chainsmoke version development` |
 | `.\chainsmoke.exe search kendrick` | 0/1 | real scsearch through the chokepoint (T3.3) — needs egress; fails closed without it. Prints the T8.1 table on a TTY, TSV down a pipe |
 | `.\chainsmoke.exe likes <user>` | 0/1 | `/likes` page through Meta (T8.2); handle validated BEFORE `Net.Up()`, so a typo costs no circuit |
@@ -149,7 +152,7 @@ fails closed unless `--allow-direct` is passed.
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # 140 passing: core 48, net 30, resolver 21, player 17, store 13, cmd 11 (+1 unix-only, skipped on Windows)
+go test ./...   # 149 passing: core 50, net 32, resolver 21, player 21, store 13, cmd 12 (+2 unix-only, skipped on Windows)
 ```
 
 **The integration suite is separate and opt-in** (T9.2). Five tests behind
@@ -169,8 +172,10 @@ Tor Browser bundle).
 
 **CI is Linux, and not by preference** (`.github/workflows/ci.yml`). `-race`
 needs cgo and a C toolchain, and this Windows box has neither — measured
-2026-08-24: `go: -race requires cgo`. So the race detector has no home except
-CI, which matters because `pkg/net` is the genuinely concurrent part (accept and
+2026-08-24: `go: -race requires cgo`. So natively the race detector has no
+home except CI. On this box it also runs under WSL, which has the toolchain:
+`wsl -e bash -lc "export PATH=\$PATH:/usr/local/go/bin; cd /mnt/d/sccli && go test ./... -race"`
+(green 2026-10-01). It matters because `pkg/net` is the genuinely concurrent part (accept and
 splice goroutines, a mutex-guarded ledger, an RWMutex in the SOCKS dialer). CI
 runs gofmt, vet, `test -race`, a compile-only pass over the tagged suite so it
 cannot rot behind its tag, and the six-target cross-build with an assertion that
@@ -184,8 +189,8 @@ taxonomy against stderr captured from real yt-dlp, including which recovery
 hint each failure earns; `pkg/net` pins the fail-closed proxy spelling and the
 egress ledger; `pkg/core` pins what `audit` may claim, that a page URL built
 from user input cannot leave soundcloud.com, and that the results table never
-prints a permalink. `cmd/` and `pkg/scrub` have none — the CLI surface is
-covered by smoke.ps1 instead.
+prints a permalink. `pkg/scrub` has none, and `cmd/` tests wiring only (see
+below) — the CLI surface itself is covered by smoke.ps1.
 
 `pkg/core/table_test.go` is the one place tests exist for a non-security
 reason: column alignment is arithmetic (display cells, not bytes or runes), and
@@ -222,8 +227,10 @@ prove help, `--version` and TAB never print the art.
   you draw decides everything: yt-dlp is given a 15s socket timeout and up to 3
   attempts, rotating the circuit between the slow ones, so a bad draw can take
   ~65s before it gives up. `chainsmoke: ... rotating circuit, retrying (2/3)` on
-  stderr is the policy working. Measured 2026-08-19: roughly 1 in 3 fresh
-  circuits completes a SoundCloud request at all.
+  stderr is the policy working. Measured 2026-08-19 over 6 fresh circuits
+  (`pkg/resolver/ytdlp.go:29-31`): one completed in 22.9s, every other one
+  stalled. Treat it as "most circuits fail SoundCloud", not a precise rate
+  (n=6; this line said "1 in 3" until 2026-10-01).
 - **`rotate` now brings egress up first.** Without a live bridge there is
   nothing to re-isolate, and on a system tor with no ControlPort (this box) the
   verb used to fail outright. It now exits 0 and says which half it managed.
@@ -237,9 +244,9 @@ prove help, `--version` and TAB never print the art.
   is what sends `quit` (T5.5). **Until 2026-09-28 `daemon stop` and `purge` were
   silent no-ops**: `Down()` returned before dialling in a fresh process, so both
   exited 0 and the daemon lived on. Fixed, and pinned by smoke's `daemon-stop`
-  → `np-gone` pair on the real named pipe. A smoke run no longer leaves an mpv
-  behind: the final `teardown` case stops the one the failing `play` cases
-  start (`play` runs `Ensure()` before it validates its argument).
+  → `np-gone` pair on the real named pipe. `play` checks its argument before
+  `Ensure()` (2026-10-01), so a typo no longer spawns a daemon — smoke's
+  `np-none` pins that — and the final `teardown` case is only a safety net.
 - **`quit` only reaches the mpv that owns the pipe; `Down()` kills the rest.**
   A second mpv started on `\\.\pipe\chainsmoke-mpv` logs `Couldn't create first
   pipe instance`, then idles with no IPC, where no `quit` can reach it
@@ -251,7 +258,10 @@ prove help, `--version` and TAB never print the art.
   processes in `tasklist`.
 - **`audit` is the ONE verb that still runs when egress is down (T7.1).** Every
   other verb aborts on `Up()`'s refusal because it is about to send traffic;
-  audit sends nothing of its own, and a diagnostic that refuses to run exactly
+  audit sends no SoundCloud traffic of its own (its one local DNS lookup is a
+  neutral name — until 2026-10-01 it resolved soundcloud.com and sndcdn.com
+  itself, the exact query INSTRUCTIONS.md:128 forbids; review N-4). And a
+  diagnostic that refuses to run exactly
   when the thing it diagnoses is broken is useless. It prints the report and
   then returns the failure, so the exit code is unchanged — do not "fix" the
   non-zero exit by making the report a success.
@@ -321,11 +331,16 @@ prove help, `--version` and TAB never print the art.
 - **A terminal gets the table, a pipe gets TSV.** Four fields, no header, no
   truncation, duration in SECONDS and empty (not 0) when unknown. smoke.ps1
   captures through a pipe, so it always sees the TSV path — assert on TSV there.
+  "Terminal" means a real console/tty (`isTerminal` in `pkg/core/term_*.go`),
+  not the character-device bit: `NUL` and `/dev/null` carry that bit too, so
+  until 2026-10-01 `play 1 < /dev/null` (nohup, cron) opened the prompt, read
+  EOF and stopped playback at once. It now waits for the queue to drain.
 - **Track titles are third-party text and are scrubbed before display.** A
   newline would forge a numbered row (pointing `play N` at something the user
   never saw), a tab would wreck the TSV, an ESC would repaint the terminal.
-  `clean()` in `pkg/core/table.go` handles it; `TestCleanRejectsHostileTitles`
-  is the guard.
+  `core.Clean()` in `pkg/core/table.go` handles it; `TestCleanRejectsHostileTitles`
+  is the guard. Since 2026-10-01 it also covers the two other places a title
+  reaches the terminal, the `▶` line and `np` (09/09 review, CQ-4).
 - **`likes`/`playlist` take a HANDLE, never a URL**, and that is the deliberate
   line: a handle is the same exposure as `search <term>`, a track URL is not
   (invariant #3). `cleanHandle`'s allowlist is also the reason the URL handed to
@@ -349,6 +364,24 @@ prove help, `--version` and TAB never print the art.
   proxy died, HTTPS/CONNECT path included — so "▶ printed, silence" is broken
   playback, never a leak. The flip side: if playback ever "just works" after a
   change to how mpv is spawned, suspect it went direct (see T7.3).
+  Ending a session sends mpv's global `stop`, so quitting one of two concurrent
+  `play` sessions stops the other's queue too: one daemon, one playlist (N-6).
+- **mpv's proxy has two silent bypasses, closed 2026-10-01 — keep them closed.**
+  libavformat honours a proxy only when the value starts with exactly `http://`
+  (so `HTTP://` and `https://` meant DIRECT), and it honours `no_proxy` even
+  over the per-`loadfile` option (so a user's `no_proxy=*` meant DIRECT). In both
+  cases the Go preflight still tunnelled, so the CDN saw the same signed URL
+  from Tor and from the real IP seconds apart. Now `Up()` lower-cases `--proxy`
+  and refuses `https://`, `Enqueue` refuses any non-`http://` value before the
+  preflight, and `Ensure()` drops `no_proxy` from mpv's environment while keeping
+  the rest (stripping all of it was the `e2f2e01` leak). `--no-ytdl` is
+  load-bearing as well: without it, a failed load runs mpv's ytdl hook, which
+  spawns yt-dlp with the URL in argv and no proxy. Pinned by
+  `TestOverrideIsStoredWithALowercaseScheme`, `TestEnqueueRefusesAProxyMpvWouldIgnore`
+  and `TestEnsureSpawnsTheDaemonSafely`. These were measured before and after the
+  fix on a loopback rig (fake origin plus fake proxy, real mpv on a scratch pipe):
+  three BYPASS rows became clean. Re-run such a rig if you touch the spawn or
+  `Enqueue`.
 - **`Net.Up()` is once per process.** A play session runs several verbs, each
   calling `Up()`; a second pass would start another bridge (and maybe another
   private tor) that `Down()` never closes. `TestUpIsIdempotent` pins it.
