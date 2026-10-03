@@ -630,7 +630,9 @@ Phase 3/4. Don't let the carcass wait on any of that.
   this one task, do not conflate them:**
   1. **mpv itself is left running by design.** `daemon-start` in `smoke.ps1`
      leaves a live `mpv.exe` after the harness exits (reproduced: `tasklist`
-     showed it still up), and `stop`/Ctrl+C never kill it — this is T5.5/T0.1(a)
+     showed it still up), and `stop` never kills it (~~nor Ctrl+C~~ — corrected
+     2026-10-03: Ctrl+C DOES kill it on both systems, because the daemon shares
+     the terminal's process group/console; CH-DEBATE-2026-10-03 #2) — this is T5.5/T0.1(a)
      as written, not a bug. An **idle** daemon has an empty playlist and issues
      no HTTP requests at all, so on its own it cannot leak; the open question is
      what an **already-playing** daemon does once its egress path dies mid-track.
@@ -672,8 +674,20 @@ Phase 3/4. Don't let the carcass wait on any of that.
      meets the same decision. Two bypasses were found and closed the same day:
      an inherited `no_proxy`, and any proxy value that is not a literal
      `http://`. A loopback rig showed both BYPASS before the fix and clean
-     after. The real multi-segment HLS fixture through the real bridge remains
-     open, because it needs live egress.
+     after. ~~The real multi-segment HLS fixture through the real bridge remains
+     open, because it needs live egress.~~ **Updated 2026-10-03
+     (CH-DEBATE-2026-10-03 #1, #9):**
+     - The no_proxy fix first missed a *reused* daemon, one started by an older
+       build or by hand, and that one bypassed. `Ensure()` now marks what it
+       spawns and replaces any daemon that lacks the mark (measured
+       before/after).
+     - A 6-segment HLS fixture on loopback, needing no egress, put the
+       playlist and every segment through the per-`loadfile` proxy, with 0
+       direct connections. With the proxy killed after segment 1, nothing
+       reached the origin.
+     - Still open: HTTPS segments over CONNECT through the real `ConnectBridge`.
+       That takes a loopback TLS origin and a SOCKS5 stand-in, not the
+       internet.
   3. **Unrelated to both of the above:** the private Tor daemon orphan on
      Ctrl+C (PHASE10.md Part D) is a different process leaking for a different
      reason — `Net.Down()`, not `Play.Down()`, and it isn't touched by anything

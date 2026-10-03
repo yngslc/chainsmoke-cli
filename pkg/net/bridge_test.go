@@ -8,6 +8,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -206,6 +209,42 @@ func TestConnectBridgeNegotiatesIsolation(t *testing.T) {
 
 // TestConnectRequestNeverResolvesHostnames pins the encoder directly: a
 // hostname must go out as a domain, an IP literal as an IP.
+// TestPrivateTorDiesWithItsOwner: Ctrl+C reaches tor through the process group
+// and it exits, but a closed terminal sends SIGHUP, which tor treats as a
+// reload and survives re-parented. kill, SIGKILL and crashes skip every
+// handler too (measured 2026-10-03, CH-DEBATE-2026-10-03 #2). Naming us as the
+// owning process makes tor exit on its own once we are gone, however we went.
+func TestPrivateTorDiesWithItsOwner(t *testing.T) {
+	want := fmt.Sprintf("__OwningControllerProcess %d\n", os.Getpid())
+	if rc := privateTorrc(9999, 9998, "data"); !strings.Contains(rc, want) {
+		t.Errorf("the private tor's torrc does not name its owner:\n%s", rc)
+	}
+}
+
+// TestNamedTorSocksNeverSpawnsATor: --tor-socks names a specific tor. Nothing
+// listening there used to fall through to spawning a private tor that
+// bootstraps onto the network, which is how smoke's "offline" $noTor rows
+// would leave the box on a machine with tor on PATH (CH-DEBATE-2026-10-03 #3).
+// The fake tor here is not an executable, so a spawn attempt fails loudly
+// instead of bootstrapping.
+func TestNamedTorSocksNeverSpawnsATor(t *testing.T) {
+	dir := t.TempDir()
+	name := "tor"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("not a program"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	err := New("", false, "127.0.0.1:1").Up()
+	if err == nil || strings.Contains(err.Error(), "tor could not be started") ||
+		!strings.Contains(err.Error(), "no Tor SOCKS listener") {
+		t.Errorf("Up() with --tor-socks 127.0.0.1:1 = %v, want a fail-closed refusal that never tried to spawn tor", err)
+	}
+}
+
 func TestDNSProbeNeverAsksForSoundCloud(t *testing.T) {
 	// `audit` used to resolve soundcloud.com and sndcdn.com through the system
 	// resolver to ask whether such a lookup would be visible, which sent that

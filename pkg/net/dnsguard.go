@@ -18,11 +18,14 @@ import (
 // Nothing in the data path can regress without that test going red.
 //
 // So what is left for a runtime check? Not "did we leak" — we cannot leak by
-// construction. What remains is the weaker, still-worth-reporting question:
-// CAN this host resolve SoundCloud names at all? If it can, then anything on
-// this machine that bypasses the bridge (a child process misconfigured, a
-// future code path using http.Get directly) would leak silently. Reporting it
-// tells the user what their exposure would be, which is what `audit` is for.
+// construction. What remains is a weaker question: does this host have a
+// working local resolver at all? If it does, anything on this machine that
+// bypasses the bridge (a child process misconfigured, a future code path using
+// http.Get directly) would be visible to it. It is asked with a neutral name
+// (probeName), never a SoundCloud one, and the answer is approximate: split
+// DNS can send SoundCloud names to a different resolver, and a hosts-file
+// entry answers them with no query at all (CH-DEBATE-2026-10-03 #7). Kept
+// anyway — dev's call, 2026-10-03: approximate, cheap, and honest about it.
 //
 // SCOPE — read before trusting this:
 //
@@ -41,9 +44,9 @@ import (
 // SoundCloud name. This probe used to resolve soundcloud.com and sndcdn.com,
 // i.e. send on every `audit` the exact plaintext query INSTRUCTIONS.md:128 says
 // must fail the build (found 2026-10-01: review N-4, debate claim 4). A
-// resolver that answers one name sees every name, and a blocked soundcloud.com
-// would still have been seen asking, so a neutral name answers the same
-// question without telling the resolver anything.
+// neutral name still shows whether a local resolver answers, without telling
+// it anything — approximately, since split DNS and hosts files can treat
+// SoundCloud names differently (see the comment at the top of this file).
 var probeName = "example.com"
 
 // dnsProbeTimeout keeps `audit` responsive on a host with no working resolver,

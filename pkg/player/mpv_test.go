@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -582,25 +583,8 @@ func TestEnsureWaitsForADaemonStillStarting(t *testing.T) {
 	endpoint := testEndpoint(t)
 	useStandInMPV(t)
 	booting := standIn(t, "mpv", endpoint)
-	t.Cleanup(func() { _ = reap(endpoint, 0) }) // anything Ensure wrongly started
-
-	up := make(chan net.Listener, 1)
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		ln, err := net.Listen("unix", endpoint)
-		up <- ln
-		for err == nil {
-			var c net.Conn
-			if c, err = ln.Accept(); err == nil {
-				go answerIdle(c)
-			}
-		}
-	}()
-	t.Cleanup(func() {
-		if ln := <-up; ln != nil {
-			ln.Close()
-		}
-	})
+	t.Cleanup(func() { _ = reap(endpoint, 0) })          // anything Ensure wrongly started
+	serveDaemon(t, endpoint, true, 300*time.Millisecond) // one this build spawned
 
 	if err := New(endpoint, fakeNet{}).Ensure(); err != nil {
 		t.Fatalf("Ensure() = %v, want nil once the starting daemon answers", err)
@@ -672,8 +656,10 @@ func TestEnsureSpawnsTheDaemonSafely(t *testing.T) {
 	if env == nil {
 		t.Fatal("the daemon Ensure spawned never reported its environment")
 	}
-	if argv := env[0]; !slices.Contains(strings.Fields(argv), "--no-ytdl") {
-		t.Errorf("mpv was spawned without --no-ytdl: %s", argv)
+	for _, flag := range []string{"--no-ytdl", "--script-opts=" + spawnMarkKey + "=" + spawnGen, "--volume=50"} {
+		if argv := env[0]; !slices.Contains(strings.Fields(argv), flag) {
+			t.Errorf("mpv was spawned without %s: %s", flag, argv)
+		}
 	}
 	kept := false
 	for _, kv := range env[1:] {
@@ -722,6 +708,25 @@ func TestEnqueueRefusesAProxyMpvWouldIgnore(t *testing.T) {
 	}
 }
 
+// TestEnsureReportsAnMpvThatExitsAtOnce: an mpv that dies on startup (a bad
+// build, a missing DLL) used to cost the whole start window and end in a
+// generic "did not become responsive" (CH-DEBATE-2026-10-03 #4). Ensure must
+// notice the exit and say so.
+func TestEnsureReportsAnMpvThatExitsAtOnce(t *testing.T) {
+	endpoint := testEndpoint(t)
+	useStandInMPV(t)
+	t.Setenv("CHAINSMOKE_STAND_IN_EXIT", "1")
+
+	start := time.Now()
+	err := New(endpoint, fakeNet{}).Ensure()
+	if err == nil || !strings.Contains(err.Error(), "exited") {
+		t.Errorf("Ensure() = %v, want an error saying mpv exited", err)
+	}
+	if d := time.Since(start); d > startTimeout/2 {
+		t.Errorf("Ensure took %v to notice an mpv that exited at once", d)
+	}
+}
+
 // testEndpoint is an IPC endpoint no real daemon uses.
 func testEndpoint(t *testing.T) string {
 	if runtime.GOOS == "windows" {
@@ -741,17 +746,87 @@ func useStandInMPV(t *testing.T) {
 	t.Cleanup(func() { startTimeout = old })
 }
 
-// answerIdle plays a daemon on one connection: every request gets a success
-// reply carrying its own request_id, which is all live() asks for.
-func answerIdle(c net.Conn) {
-	defer c.Close()
-	sc := bufio.NewScanner(c)
-	for sc.Scan() {
-		var req struct {
-			ID int `json:"request_id"`
+// serveDaemon plays an mpv daemon on a unix socket at endpoint, from after
+// delay until the test ends. Marked, it answers the spawn checks the way a
+// daemon this build started does; unmarked, the way any other mpv does. It
+// returns the commands it has received so far.
+func serveDaemon(t *testing.T, endpoint string, marked bool, delay time.Duration) func() []string {
+	var mu sync.Mutex
+	var cmds []string
+	up := make(chan net.Listener, 1)
+	go func() {
+		time.Sleep(delay)
+		ln, err := net.Listen("unix", endpoint)
+		up <- ln
+		for err == nil {
+			var c net.Conn
+			if c, err = ln.Accept(); err == nil {
+				go func() {
+					defer c.Close()
+					sc := bufio.NewScanner(c)
+					for sc.Scan() {
+						var req struct {
+							Command []any `json:"command"`
+							ID      int   `json:"request_id"`
+						}
+						_ = json.Unmarshal(sc.Bytes(), &req)
+						mu.Lock()
+						cmds = append(cmds, fmt.Sprint(req.Command...))
+						mu.Unlock()
+						var data any = true
+						if len(req.Command) == 2 && req.Command[0] == "get_property" {
+							switch req.Command[1] {
+							case "script-opts":
+								data = map[string]string{}
+								if marked {
+									data = map[string]string{spawnMarkKey: spawnGen}
+								}
+							case "ytdl":
+								data = !marked
+							}
+						}
+						b, _ := json.Marshal(map[string]any{"data": data, "request_id": req.ID, "error": "success"})
+						_, _ = c.Write(append(b, '\n'))
+					}
+				}()
+			}
 		}
-		_ = json.Unmarshal(sc.Bytes(), &req)
-		fmt.Fprintf(c, `{"data":true,"request_id":%d,"error":"success"}`+"\n", req.ID)
+	}()
+	t.Cleanup(func() {
+		if ln := <-up; ln != nil {
+			ln.Close()
+		}
+	})
+	return func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), cmds...) }
+}
+
+// TestEnsureReusesOnlyADaemonItMarked: Ensure used to reuse any live daemon on
+// the endpoint, and the no_proxy fix only reaches daemons it spawns itself. A
+// daemon from an older build (the dist/ binaries) or one started by hand
+// still carried no_proxy=*, and the reused daemon fetched the signed URL
+// directly (measured 2026-10-03, CH-DEBATE-2026-10-03 #1). A daemon without the
+// spawn mark must be replaced, never trusted. Unix socket only, as above.
+func TestEnsureReusesOnlyADaemonItMarked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named-pipe server needs go-winio; the check is the same code on both targets")
+	}
+	for _, marked := range []bool{true, false} {
+		endpoint := testEndpoint(t)
+		useStandInMPV(t)
+		startTimeout = 300 * time.Millisecond // a stand-in replacement never answers
+		t.Cleanup(func() { _ = reap(endpoint, 0) })
+		received := serveDaemon(t, endpoint, marked, 0)
+		time.Sleep(50 * time.Millisecond) // let it listen
+
+		err := New(endpoint, fakeNet{}).Ensure()
+		quit := slices.Contains(received(), "quit")
+		spawned := len(daemons("--input-ipc-server=" + endpoint))
+		switch {
+		case marked && (err != nil || quit || spawned != 0):
+			t.Errorf("its own daemon: Ensure() = %v, quit sent = %v, spawned %d — want it reused as is", err, quit, spawned)
+		case !marked && (!quit || spawned != 1):
+			t.Errorf("an unmarked daemon: quit sent = %v, spawned %d — want it replaced", quit, spawned)
+		}
 	}
 }
 
@@ -798,6 +873,9 @@ func standIn(t *testing.T, name, endpoint string) <-chan struct{} {
 // pipe does. The minute is a backstop, so a failed test cannot leave one behind.
 func TestMain(m *testing.M) {
 	if os.Getenv("CHAINSMOKE_STAND_IN") == "1" {
+		if os.Getenv("CHAINSMOKE_STAND_IN_EXIT") == "1" {
+			os.Exit(3) // an mpv that dies on startup
+		}
 		if f := os.Getenv("CHAINSMOKE_STAND_IN_ENV"); f != "" { // argv line, then env; written whole, then renamed
 			report := append([]string{strings.Join(os.Args[1:], " ")}, os.Environ()...)
 			_ = os.WriteFile(f+".tmp", []byte(strings.Join(report, "\n")), 0o600)

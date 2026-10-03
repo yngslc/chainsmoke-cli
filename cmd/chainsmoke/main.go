@@ -11,6 +11,7 @@
 //    pkg/scrub/ffmpeg.go    <- ffmpeg +bitexact -> retag -> xattr -> mat2
 //    pkg/store/store.go     <- Store interface, memory + disk backends
 //    cmd/chainsmoke/session.go <- play session: holds the bridge while the queue plays
+//    cmd/chainsmoke/queue.go   <- list playback: play N, next/prev along the results
 //    cmd/chainsmoke/tui.go  <- TUI (Phase 10, not yet wired)
 //
 //  If you find yourself adding a type or an algorithm HERE, it belongs in a
@@ -199,23 +200,49 @@ func commands(app *core.App) []*cli.Command {
 				"URLs are never accepted in argv — the OS process list is world-readable.",
 			Before: banner,
 			Action: func(c *cli.Context) error {
-				if err := app.Net.Up(); err != nil { // chokepoint first
+				// An index (or a URL refused in argv) is checked locally BEFORE
+				// Up(), so a typo never costs a circuit (TASKS.md:405, as likes
+				// and playlist already do). A URL from the prompt is asked for
+				// only AFTER Up(): nobody should paste one to learn Tor is down.
+				arg := c.Args().First()
+				var t core.Track
+				var err error
+				if arg != "" {
+					if t, err = app.ResolveIndexOrStdin(arg); err != nil {
+						return err
+					}
+				}
+				if err := app.Net.Up(); err != nil { // chokepoint before any egress
 					return err
 				}
-				t, err := app.ResolveIndexOrStdin(c.Args().First())
-				if err != nil {
-					return err
+				if arg == "" {
+					if t, err = app.ResolveIndexOrStdin(""); err != nil {
+						return err
+					}
 				}
 				// After the argument, so a typo does not leave a daemon behind.
 				if err := app.Play.Ensure(); err != nil {
 					return err
 				}
-				entries, err := app.Res.Meta(t.Permalink)
-				if err != nil {
-					return core.YtdlpHint(err)
+				q, _ := c.App.Metadata[listKey].(*listQueue) // the session's, if typed at its prompt
+				if q == nil {
+					q = &listQueue{app: app}
 				}
-				if err := app.EnqueueAhead(entries); err != nil {
-					return err
+				if n, ierr := strconv.Atoi(arg); arg != "" && ierr == nil {
+					// A cached result: play it as part of its list, so next and
+					// prev walk the rest (queue.go).
+					if err := q.start(n); err != nil {
+						return err
+					}
+				} else {
+					q.entries = nil // a stdin URL is not from the list
+					entries, err := app.Res.Meta(t.Permalink)
+					if err != nil {
+						return core.YtdlpHint(err)
+					}
+					if err := app.EnqueueAhead(entries); err != nil {
+						return err
+					}
 				}
 				if c.App.Metadata[inSession] == true {
 					return nil // typed at a session prompt, which already holds the bridge
@@ -229,7 +256,7 @@ func commands(app *core.App) []*cli.Command {
 				sig := make(chan os.Signal, 1)
 				signal.Notify(sig, os.Interrupt)
 				defer signal.Stop(sig)
-				playSession(app, in, interactive, sig, time.Second)
+				playSession(app, q, in, interactive, sig, time.Second)
 				return nil
 			},
 		},
@@ -345,7 +372,11 @@ func commands(app *core.App) []*cli.Command {
 				if err := app.Net.Up(); err != nil {
 					return err
 				}
-				return app.Net.Rotate()
+				if err := app.Net.Rotate(); err != nil {
+					return err
+				}
+				fmt.Fprintln(os.Stderr, "chainsmoke: the next stream gets a fresh Tor circuit")
+				return nil
 			},
 		},
 		{
@@ -470,10 +501,10 @@ func main() {
 		// DETECTED system tor is never touched — Down() only kills what we own.
 		//
 		// NOT covered: signals. A running play session traps Ctrl+C and returns
-		// through here (session.go); Ctrl+C or SIGTERM anywhere else — including
-		// play's resolve phase before the session starts — skips this, so a
-		// private tor can still leak that way (T10.9; PHASE10.md Part D says
-		// why a handler cannot simply call Down()).
+		// through here (session.go); Ctrl+C, SIGTERM or a closed terminal
+		// anywhere else skips this. The private tor still goes — its torrc
+		// names this process as owner, so it exits ~12s after we do — but its
+		// DataDirectory stays behind (T10.9; PHASE10.md Part D).
 		After: func(*cli.Context) error {
 			if app.Net != nil {
 				return app.Net.Down()

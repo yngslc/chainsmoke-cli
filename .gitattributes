@@ -1,0 +1,6 @@
+# LF everywhere, on every checkout. With core.autocrlf on Windows, a checkout
+# (or a `git stash pop`) rewrote files as CRLF, and gofmt then reports every Go
+# file it touched as unformatted. Nothing in this repo needs CRLF.
+* text=auto eol=lf
+
+*.exe binary

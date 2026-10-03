@@ -56,7 +56,9 @@ function Build($goos, $goarch, $out) {
     $env:GOARCH = $goarch
     & $GoExe build -trimpath -ldflags $ldflags -o $out .\cmd\chainsmoke
     if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: build failed for $goos/$goarch"; exit 1 }
-    $bytes = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $out)))
+    # UTF-8, not ASCII: Go embeds paths as UTF-8, and ASCII decoding turns a
+    # Cyrillic username into '?' so it never matches (CH-DEBATE-2026-10-03 #5).
+    $bytes = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $out)))
     foreach ($p in $buildPaths) {
         if ($bytes.IndexOf($p, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
             Write-Host "FATAL: $out embeds the build path $p - is -trimpath still set?"; exit 1

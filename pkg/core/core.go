@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -316,7 +317,7 @@ func (a *App) Audit() error {
 	}
 
 	fmt.Fprintf(a.out(), "egress:      %s\n", posture)
-	fmt.Fprintf(a.out(), "proxy:       %s\n", a.Net.ProxyURL())
+	fmt.Fprintf(a.out(), "proxy:       %s\n", shownProxy(a.Net.ProxyURL()))
 	fmt.Fprintf(a.out(), "impersonate: %s\n", describeImpersonate(live.Impersonate))
 
 	if d, ok := a.Store.(StoreDescriber); ok {
@@ -338,6 +339,16 @@ func (a *App) Audit() error {
 		}
 	}
 	return a.Net.SelfTest()
+}
+
+// shownProxy is ProxyURL fit for a terminal: `--proxy http://user:pass@host`
+// is valid, and audit used to print the password. Prose values ("<down>",
+// "DIRECT (no proxy)") pass through untouched.
+func shownProxy(p string) string {
+	if u, err := url.Parse(p); err == nil && u.User != nil {
+		return u.Redacted()
+	}
+	return p
 }
 
 // auditConfig answers "am I anonymized the way I chose to be?" — the question a

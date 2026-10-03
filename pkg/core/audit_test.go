@@ -103,6 +103,20 @@ func TestAuditReportsProbedPosture(t *testing.T) {
 // TestAuditReturnsSelfTestError: audit exits non-zero when the live path is
 // broken. Printing a report and returning nil would make a failing setup look
 // like a passing one to any script that checks $?.
+// TestAuditNeverPrintsProxyCredentials: `--proxy http://user:pass@host` is a
+// valid proxy, and audit printed ProxyURL() verbatim, password included
+// (found 2026-10-03 beside CH-DEBATE-2026-10-03 #8).
+func TestAuditNeverPrintsProxyCredentials(t *testing.T) {
+	isolateConfig(t)
+	out, _ := runAudit(t, &App{Net: &fakeNet{verified: true, proxy: "http://alice:s3cretpw@127.0.0.1:8118"}})
+	if strings.Contains(out, "s3cretpw") {
+		t.Errorf("audit printed the proxy password:\n%s", out)
+	}
+	if !strings.Contains(out, "127.0.0.1:8118") {
+		t.Errorf("audit no longer shows which proxy is in use:\n%s", out)
+	}
+}
+
 func TestAuditReturnsSelfTestError(t *testing.T) {
 	isolateConfig(t)
 	boom := errors.New("egress is DIRECT")

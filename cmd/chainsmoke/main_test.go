@@ -166,12 +166,17 @@ func TestPlayRejectsBadInputBeforeStartingThePlayer(t *testing.T) {
 		"index out of range": {"play", "99999999999999999999"},
 		"no index, no stdin": {"play"},
 	} {
-		app, _, _, p := wiredApp()
+		app, n, _, p := wiredApp()
 		if err := runVerb(app, args...); err == nil {
 			t.Errorf("%s: play succeeded, want an error", name)
 		}
 		if p.ensures != 0 {
 			t.Errorf("%s: Ensure() ran %d times before the argument was rejected", name, p.ensures)
+		}
+		// An argv argument is checked before Up() too: a typo must not cost a
+		// circuit (TASKS.md:405). The stdin URL is read after Up() on purpose.
+		if wantUps := map[bool]int{true: 0, false: 1}[len(args) > 1]; n.ups != wantUps {
+			t.Errorf("%s: Net.Up() ran %d times, want %d", name, n.ups, wantUps)
 		}
 	}
 }

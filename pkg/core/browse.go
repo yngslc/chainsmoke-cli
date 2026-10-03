@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -21,6 +22,9 @@ import (
 // The cache write and the print see the SAME slice, in the same order: if they
 // could diverge, `play 3` would start a track the user never saw on screen.
 func (a *App) Collect(pageURL string, limit int) error {
+	// A whole likes list comes a page at a time over Tor: well over a minute
+	// for a long one, which reads as a hang unless something says otherwise.
+	fmt.Fprintln(os.Stderr, "chainsmoke: fetching the list through Tor — a long one can take a minute or two")
 	tracks, err := a.Res.Meta(pageURL)
 	if err != nil {
 		return YtdlpHint(err)

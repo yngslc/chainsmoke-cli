@@ -113,7 +113,24 @@ urfave's `After()` hook, so a **private tor daemon and its temp
 DataDirectory are orphaned and outlive the process**. T10.9 fixes that for the
 CLI as well as restoring alt-screen/raw mode for the TUI.
 
-**Design constraint found 2026-10-01 (not yet built):** the handler cannot
+**Corrected and partly fixed 2026-10-03 (CH-DEBATE-2026-10-03 #2, measured):**
+the mechanism above was never measured and is wrong in places.
+- **Terminal Ctrl+C:** tor shares the process group/console, so it gets the
+  signal and exits cleanly; so does the mpv daemon. What leaks is the
+  DataDirectory. mpv dying with it stays as is — dev's call, 2026-10-03: no
+  daemon lingering after the window is interrupted.
+- **True orphans:** a closed terminal (SIGHUP — tor treats it as a reload and
+  survives re-parented), `kill`, SIGKILL and crashes.
+- **Fixed with no handler:** the private tor's torrc now names its owner
+  (`__OwningControllerProcess`). Tor exits on its own about 12s after this
+  process dies, by any route (re-measured offline in WSL: 13s).
+- **Still open:** the DataDirectory under %TEMP% on every one of those exits.
+  Either sweep `chainsmoke-tor-*` dirs whose owner pid is dead at the next
+  spawn, or move them somewhere `purge` wipes. Then T10.9's handler only has
+  to restore the terminal, and the race below never arises.
+
+**Design constraint found 2026-10-01 (not yet built; mostly moot since the
+2026-10-03 torrc change above, kept for whoever builds a handler anyway):** the handler cannot
 simply call `Net.Down()`. A signal arrives on its own goroutine while the main
 one may still be in `Up()`. `ensureTor` sets `torCmd`/`torDir` *before* the
 bootstrap wait, and `Bridge` has no lock. `Down()` also nils `b.cb`, which the
@@ -140,8 +157,17 @@ with an `https` origin, CONNECT is used, and a dead, 404, 502 or 200-then-close
 proxy produced zero direct connections. Each new segment is a new connection,
 so it hits the same decision. Two bypasses were found and closed the same day:
 `no_proxy` in mpv's environment, and any proxy value that is not a literal
-`http://` (re-measured before/after on a loopback rig). Still unmeasured: a
-real multi-segment HLS stream through the real bridge, which needs live egress.
+`http://` (re-measured before/after on a loopback rig). ~~Still unmeasured: a
+real multi-segment HLS stream through the real bridge, which needs live egress.~~
+**Updated 2026-10-03 (CH-DEBATE-2026-10-03 #1, #9):**
+- A *reused* daemon, started by an older build or by hand, still bypassed
+  through its inherited `no_proxy`. `Ensure()` now marks what it spawns and
+  replaces anything unmarked.
+- A 6-segment HLS fixture on loopback, with no egress needed, sent every
+  segment through the per-`loadfile` proxy with 0 direct. With the proxy killed
+  mid-stream, nothing reached the origin.
+- Still open: HTTPS segments over CONNECT through the real `ConnectBridge`,
+  which needs a loopback TLS origin and a SOCKS5 stand-in, not the internet.
 
 ### E. Table reconciliation (T10.12) — mostly already satisfied
 

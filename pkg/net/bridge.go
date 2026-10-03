@@ -64,6 +64,7 @@ type Bridge struct {
 	torDir      string    // its scratch DataDirectory, ours to delete
 	socksAddr   string    // the SOCKS listener actually in use
 	torCtrlAddr string    // control port of the tor we spawned ("" = system tor)
+	ctrlFailed  bool      // NEWNYM already failed in this process; do not retry it
 }
 
 var _ core.Net = (*Bridge)(nil)
@@ -180,11 +181,11 @@ func (b *Bridge) Up() error {
 			return err
 		}
 		if err := dialCheck(proxyHostPort(b.override)); err != nil {
-			return fmt.Errorf("--proxy %s not reachable: %w", b.override, err)
+			return fmt.Errorf("--proxy %s not reachable: %w", redactedProxy(b.override), err)
 		}
 		if err := verifyHTTPProxyCONNECT(proxyHostPort(b.override), egressProbeTarget); err != nil {
 			return fmt.Errorf("--proxy %s did not complete a CONNECT to %s: %w",
-				b.override, egressProbeTarget, err)
+				redactedProxy(b.override), egressProbeTarget, err)
 		}
 		// Stored lower-cased: checkProxyScheme accepts HTTP://, but libavformat
 		// honours a proxy only when it starts with exactly "http://" and fetches
@@ -311,13 +312,21 @@ func (b *Bridge) Rotate() error {
 	// circuit was one credential away.
 	fresh := b.cb != nil && b.cb.Reisolate()
 
+	// NEWNYM over the ControlPort is a bonus, not the mechanism: re-isolation
+	// already gave the next stream a fresh circuit, so a missing ControlPort
+	// is nothing to report. It used to print two lines on every retry (dev's
+	// report, 2026-10-03), and once it has failed it is not tried again.
+	if b.ctrlFailed {
+		if fresh {
+			return nil
+		}
+		return errors.New("tor control port unavailable (enable ControlPort for NEWNYM)")
+	}
 	if err := b.newnym(); err != nil {
+		b.ctrlFailed = true
 		if !fresh {
 			return err
 		}
-		fmt.Fprintf(os.Stderr,
-			"chainsmoke: NEWNYM unavailable (%v)\n"+
-				"chainsmoke:         re-isolated instead — the next stream opens a fresh circuit.\n", err)
 	}
 	return nil
 }
@@ -435,6 +444,12 @@ func (b *Bridge) ensureTor() (string, error) {
 	if dialCheck(b.torSocks) == nil {
 		return b.torSocks, nil // system tor
 	}
+	// A non-default --tor-socks names one specific tor (the Tor Browser's,
+	// smoke's dead 127.0.0.1:1). Nothing listening there means fail closed,
+	// not bootstrap a substitute onto the network (CH-DEBATE-2026-10-03 #3).
+	if b.torSocks != torSocksAddr {
+		return "", nil
+	}
 	if _, err := exec.LookPath("tor"); err != nil {
 		return "", nil // nothing listening and nothing to spawn
 	}
@@ -483,16 +498,8 @@ func spawnPrivateTor() (cmd *exec.Cmd, dir, socksAddr, ctrlAddr string, err erro
 		return nil, dir, "", "", err
 	}
 
-	torrc := fmt.Sprintf(""+
-		"SocksPort %d\n"+
-		"ControlPort %d\n"+
-		"CookieAuthentication 1\n"+
-		"DataDirectory %s\n"+
-		"AvoidDiskWrites 1\n",
-		socksPort, ctrlPort, filepath.Join(dir, "data"))
-
 	path := filepath.Join(dir, "torrc")
-	if err := os.WriteFile(path, []byte(torrc), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(privateTorrc(socksPort, ctrlPort, filepath.Join(dir, "data"))), 0o600); err != nil {
 		return nil, dir, "", "", err
 	}
 
@@ -506,6 +513,23 @@ func spawnPrivateTor() (cmd *exec.Cmd, dir, socksAddr, ctrlAddr string, err erro
 	return cmd, dir,
 		fmt.Sprintf("127.0.0.1:%d", socksPort),
 		fmt.Sprintf("127.0.0.1:%d", ctrlPort), nil
+}
+
+// privateTorrc is the config for a throwaway tor. __OwningControllerProcess
+// makes tor exit on its own once this process is gone, however it went: a
+// closed terminal (SIGHUP, which tor treats as a reload and survives), kill,
+// SIGKILL, a crash. Measured 2026-10-03: tor exited 12s after its owner died
+// (CH-DEBATE-2026-10-03 #2). No signal handler covers all of those, and this
+// needs none — so T10.9 has no tor to chase.
+func privateTorrc(socksPort, ctrlPort int, dataDir string) string {
+	return fmt.Sprintf(""+
+		"SocksPort %d\n"+
+		"ControlPort %d\n"+
+		"CookieAuthentication 1\n"+
+		"DataDirectory %s\n"+
+		"AvoidDiskWrites 1\n"+
+		"__OwningControllerProcess %d\n",
+		socksPort, ctrlPort, dataDir, os.Getpid())
 }
 
 // freePort asks the OS for an unused loopback port and immediately releases it.
@@ -943,7 +967,7 @@ func dialCheck(hostport string) error {
 func checkProxyScheme(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
-		return fmt.Errorf("--proxy %q is not a URL (want http://host:port)", raw)
+		return errors.New("--proxy is not a URL (want http://host:port); the value is not repeated, it may hold credentials")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http":
@@ -955,16 +979,28 @@ func checkProxyScheme(raw string) error {
 		return fmt.Errorf("--proxy %s is a TLS (https://) proxy, which mpv/ffmpeg cannot use — "+
 			"libavformat would fetch the stream directly.\n"+
 			"  yt-dlp would tunnel and playback would not — a partial-egress split.\n"+
-			"  Point --proxy at the proxy's plain http:// listener, or drop it and use Tor.", raw)
+			"  Point --proxy at the proxy's plain http:// listener, or drop it and use Tor.", u.Redacted())
 	case "socks5", "socks5h", "socks4", "socks4a":
 		return fmt.Errorf("--proxy %s is a SOCKS proxy, which mpv/ffmpeg cannot use "+
 			"(no SOCKS support in libavformat).\n"+
 			"  yt-dlp would work and playback would not — a partial-egress split.\n"+
 			"  Drop --proxy and let chainsmoke front your SOCKS port with its own CONNECT bridge,\n"+
-			"  or point --proxy at an HTTP proxy that speaks CONNECT.", raw)
+			"  or point --proxy at an HTTP proxy that speaks CONNECT.", u.Redacted())
 	default:
-		return fmt.Errorf("--proxy %s has unsupported scheme %q (want http://)", raw, u.Scheme)
+		return fmt.Errorf("--proxy %s has unsupported scheme %q (want http://)", u.Redacted(), u.Scheme)
 	}
+}
+
+// redactedProxy is a --proxy value fit for a message. A proxy URL can carry
+// credentials (http://user:pass@host), and the refusals used to repeat it
+// verbatim (CH-DEBATE-2026-10-03 #8). Up() only calls this after
+// checkProxyScheme has parsed the value.
+func redactedProxy(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(value not shown)"
+	}
+	return u.Redacted()
 }
 
 // verifyHTTPProxyCONNECT speaks one CONNECT to a user-supplied HTTP proxy. This

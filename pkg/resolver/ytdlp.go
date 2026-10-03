@@ -35,9 +35,17 @@ var ErrToolMissing = errors.New("yt-dlp not found on PATH — install yt-dlp to 
 //   - maxAttempts 3: the failure is the exit you drew, so more dice beat more
 //     patience. Worst case ~51s, better odds than the old 2 x 30s.
 //   - resolveTimeout 45s: a backstop above yt-dlp's own timeout, with room for
-//     a 23s success. If it fires, yt-dlp is wedged rather than slow.
+//     a 23s success. For ONE request, if it fires, yt-dlp is wedged rather
+//     than slow.
+//   - listTimeout 3m: the same backstop for Meta, which LISTS a page. A
+//     user's likes come from SoundCloud's API a page at a time, each a Tor
+//     round-trip, so a 1,700-track listing can need far more than 45s while
+//     bytes never stop moving. The 45s cap killed it mid-fetch on all three
+//     attempts (dev's report, 2026-10-03). A dead circuit is still caught by
+//     socketTimeout within ~15s; this only bounds a hung process.
 const (
 	resolveTimeout = 45 * time.Second
+	listTimeout    = 3 * time.Minute
 	socketTimeout  = "15" // seconds, passed to yt-dlp
 	maxAttempts    = 3
 )
@@ -102,7 +110,7 @@ func (r *YTDLP) Meta(pageURL string) ([]core.Track, error) {
 		return nil, errors.New("empty URL")
 	}
 
-	out, err := r.run("--flat-playlist", "-J", "--", pageURL)
+	out, err := r.runWithin(listTimeout, "--flat-playlist", "-J", "--", pageURL)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +208,10 @@ func (r *YTDLP) Search(term string, limit int) ([]core.Track, error) {
 // Deliberately not retried at all: a stale extractor, a rejected --impersonate,
 // a missing binary, a shut gate. No circuit fixes any of them, and retrying
 // only delays the message that would.
-func (r *YTDLP) run(args ...string) ([]byte, error) {
+func (r *YTDLP) run(args ...string) ([]byte, error) { return r.runWithin(resolveTimeout, args...) }
+
+// runWithin is run with an explicit per-attempt budget (see listTimeout).
+func (r *YTDLP) runWithin(budget time.Duration, args ...string) ([]byte, error) {
 	if err := r.net.Assert(); err != nil { // T0.2: fail closed before any egress
 		return nil, err
 	}
@@ -209,7 +220,7 @@ func (r *YTDLP) run(args ...string) ([]byte, error) {
 	for attempt := 1; ; attempt++ {
 		// A budget per ATTEMPT, not per call: a retry that inherits the
 		// remainder of a spent deadline is not a retry.
-		ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
 		var out []byte
 		started := time.Now()
 		out, err = r.invoke(ctx, args)
@@ -225,12 +236,7 @@ func (r *YTDLP) run(args ...string) ([]byte, error) {
 
 		// Say it out loud. A silent retry makes a stalled circuit look like a
 		// slow program rather than a bad relay.
-		what := "retrying"
-		if rotate {
-			what = "rotating circuit, retrying"
-		}
-		fmt.Fprintf(os.Stderr, "chainsmoke: %v\nchainsmoke:         %s (%d/%d)\n",
-			err, what, attempt+1, maxAttempts)
+		fmt.Fprint(os.Stderr, retryNote(err, rotate, attempt+1, maxAttempts))
 
 		if rotate {
 			if rerr := r.net.Rotate(); rerr != nil {
@@ -239,6 +245,21 @@ func (r *YTDLP) run(args ...string) ([]byte, error) {
 			}
 		}
 	}
+}
+
+// retryNote is the one line printed before a retry. It names what happened and
+// what comes next, never yt-dlp's raw error: that used to fill the screen on
+// every attempt, and if every attempt fails it is returned in full anyway.
+func retryNote(err error, rotate bool, attempt, max int) string {
+	what := "no answer through this Tor circuit"
+	if errors.Is(err, core.ErrRateLimited) {
+		what = "SoundCloud refused this Tor exit"
+	}
+	next := "retrying"
+	if rotate {
+		next = "trying a fresh circuit"
+	}
+	return fmt.Sprintf("chainsmoke: %s — %s (%d/%d)\n", what, next, attempt, max)
 }
 
 // circuitWarmup is the line between "Tor was still building" and "this exit is
@@ -363,7 +384,7 @@ func classify(ctx context.Context, err error, stderr string) error {
 	// what it means over Tor: bytes were not moving. Classifying it that way is
 	// also what lets run() rotate and retry instead of surrendering.
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("%w: yt-dlp timed out after %s", core.ErrEgress, resolveTimeout)
+		return fmt.Errorf("%w: yt-dlp timed out before SoundCloud finished answering", core.ErrEgress)
 	}
 
 	// Lowercase once: yt-dlp capitalizes ("ERROR: Unable to extract ...").

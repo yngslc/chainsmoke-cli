@@ -372,6 +372,34 @@ func stubbed(n *fakeNet, errs ...error) (r *YTDLP, calls *int) {
 	return r, &count
 }
 
+// TestListingsGetAListingBudget: Meta LISTS a page, and a user's likes arrive
+// a page at a time, each a Tor round-trip. Under the 45s cap sized for one
+// search request, a 1,700-track likes listing was killed mid-fetch on all
+// three attempts (dev's report, 2026-10-03). Search and Stream keep 45s; a dead
+// circuit is still caught by --socket-timeout either way.
+func TestListingsGetAListingBudget(t *testing.T) {
+	var budget time.Duration
+	r := New(&fakeNet{}, "")
+	r.invoke = func(ctx context.Context, _ []string) ([]byte, error) {
+		d, _ := ctx.Deadline()
+		budget = time.Until(d)
+		return []byte(`{"_type":"playlist","entries":[{"id":"1","title":"t","webpage_url":"https://soundcloud.com/a/b"}]}`), nil
+	}
+
+	if _, err := r.Meta("https://soundcloud.com/someone/likes"); err != nil {
+		t.Fatal(err)
+	}
+	if budget < listTimeout-time.Second {
+		t.Errorf("Meta ran under a %s budget, want %s — a long likes list cannot finish", budget.Round(time.Second), listTimeout)
+	}
+	if _, err := r.Search("x", 5); err != nil {
+		t.Fatal(err)
+	}
+	if budget > resolveTimeout {
+		t.Errorf("Search ran under %s, want %s — the listing budget leaked into single requests", budget.Round(time.Second), resolveTimeout)
+	}
+}
+
 // TestRetryPlan is the policy itself, checked against the two failure shapes
 // measured live on 2026-08-19 (see run's comment). Pure function, so the
 // 10-second distinction costs the test suite nothing.
@@ -418,6 +446,27 @@ func TestRetryRotatesOnBlockedExit(t *testing.T) {
 	}
 	if *calls != 2 || n.rotates != 1 {
 		t.Errorf("%d attempts / %d rotations, want 2 / 1", *calls, n.rotates)
+	}
+}
+
+// TestRetryNoteIsOneShortLine: a retry used to print yt-dlp's whole error plus a
+// second line, every attempt — on a slow Tor draw, a screenful before anything
+// played (dev's report, 2026-10-03). The full error is still returned if every
+// attempt fails; the note in between only says what is happening.
+func TestRetryNoteIsOneShortLine(t *testing.T) {
+	raw := "ERROR: [soundcloud] Unable to download webpage: Failed to perform, curl: (28) Connection timed out after 15017 milliseconds"
+	for _, tc := range []struct {
+		err    error
+		rotate bool
+	}{
+		{fmt.Errorf("%w: %s", core.ErrEgress, raw), true},
+		{fmt.Errorf("%w: %s", core.ErrEgress, raw), false},
+		{fmt.Errorf("%w: %s", core.ErrRateLimited, raw), true},
+	} {
+		note := retryNote(tc.err, tc.rotate, 2, 3)
+		if strings.Count(note, "\n") != 1 || strings.Contains(note, "curl") || !strings.Contains(note, "(2/3)") {
+			t.Errorf("retryNote(%v, rotate=%v) = %q, want one short line ending in (2/3)", tc.err, tc.rotate, note)
+		}
 	}
 }
 

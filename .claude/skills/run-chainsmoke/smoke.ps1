@@ -57,6 +57,8 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: go build failed (output above).'; 
 # EVERY --allow-direct row needs it too: with a tor listening, Up() verifies a
 # real CONNECT through it to api-v2.soundcloud.com before the verb even fails,
 # so six "offline" rows were each opening a Tor stream (2026-10-01 review, N-5).
+# And since 2026-10-03 a non-default --tor-socks never spawns a private tor,
+# which is what makes $noTor offline on a machine that has tor on PATH too.
 $noTor = @('--tor-socks', '127.0.0.1:1')
 
 # Every audit case below reads and writes a saved config (T7.1). Point
@@ -144,7 +146,10 @@ $cases = @(
     # T1.2: --proxy is actually wired into the bridge now. Port 9 is the
     # discard port: reliably refuses, no network egress, deterministic offline.
     # Before this fix the flag was parsed by urfave/cli and then ignored.
-    @{ Name = 'proxy-wired';   Args = @('--proxy', 'http://127.0.0.1:9', 'play', '1'); Exit = 1; Match = 'not reachable' },
+    # Bare `play` (no index): an index is checked against the store BEFORE Up()
+    # since 2026-10-03, and the sandboxed cache is empty, so `play 1` would stop
+    # at "no cached result" without ever reaching the bridge.
+    @{ Name = 'proxy-wired';   Args = @('--proxy', 'http://127.0.0.1:9', 'play'); Exit = 1; Match = 'not reachable' },
     # T1.5: strconv.Atoi rejects an out-of-range index instead of the old
     # accumulator silently wrapping it to a negative number.
     @{ Name = 'index-overflow'; Args = @($noTor + @('--allow-direct', 'play', '99999999999999999999')); Exit = 1; Match = 'out of range' },
@@ -156,8 +161,9 @@ $cases = @(
     # -- Phase 2 T2.3: fail-closed egress -------------------------------------
     # THE case for T0.2. With no tor and no --allow-direct, an egress verb must
     # REFUSE, not warn-and-continue. If this ever goes green-by-warning again,
-    # the fail-closed invariant has silently regressed.
-    @{ Name = 'failclosed';    Args = @($noTor + @('play', '1')); Exit = 1; Match = 'refusing to run unanonymized' },
+    # the fail-closed invariant has silently regressed. Bare `play` for the
+    # same reason as proxy-wired: Up() comes before the stdin URL.
+    @{ Name = 'failclosed';    Args = @($noTor + @('play')); Exit = 1; Match = 'refusing to run unanonymized' },
     @{ Name = 'failclosed-search'; Args = @($noTor + @('search', 'x')); Exit = 1; Match = 'refusing to run unanonymized' },
 
     # -- Phase 7 T7.1/T7.2: audit + saved config ------------------------------

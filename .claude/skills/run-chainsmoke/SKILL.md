@@ -127,11 +127,12 @@ Verified behavior baseline (what the carcass does today):
 
 `play` today: `net.Up` (system tor on :9050, else a private one, else refuse —
 `--proxy` or `--allow-direct` override) → `Ensure()` spawns the mpv daemon →
-`Meta`/`Stream` resolve through the chokepoint → `EnqueueAhead` queues on the
-daemon with `loadfile` → **then `play` holds** (`cmd/chainsmoke/session.go`):
-on a terminal it becomes a `chainsmoke>` prompt (`np`, `vol 40`, `next`,
-`search …`, `play N`; `q`/Ctrl+D/Ctrl+C stops), otherwise it waits for the
-queue to drain. See the "play holds the Tor path" gotcha for why. A real
+`play N` plays result N from the cached list and preloads N+1 (`queue.go`; a
+stdin URL still goes `Meta` → `EnqueueAhead`) → **then `play` holds**
+(`cmd/chainsmoke/session.go`): on a terminal it becomes a `chainsmoke>` prompt
+that prints every verb it accepts, with `next`/`prev` walking the whole list
+(`q`/Ctrl+D/Ctrl+C stops), otherwise it waits for the queue to drain, still
+preloading one ahead. See the "play holds the Tor path" gotcha for why. A real
 end-to-end play needs a live SoundCloud URL and makes a network request, so it
 is not part of the offline smoke baseline — verified live 2026-09-28 instead:
 `time-pos` ran 0 → 31.7s in real time with the daemon muted.
@@ -152,7 +153,7 @@ fails closed unless `--allow-direct` is passed.
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # 149 passing: core 50, net 32, resolver 21, player 21, store 13, cmd 12 (+2 unix-only, skipped on Windows)
+go test ./...   # 167 passing: core 51, net 36, resolver 23, player 22, store 13, cmd 22 (+3 unix-only, skipped on Windows; WSL -race runs all 170)
 ```
 
 **The integration suite is separate and opt-in** (T9.2). Five tests behind
@@ -226,8 +227,12 @@ prove help, `--version` and TAB never print the art.
 - **A slow `search`/`play` is the retry policy, not a hang.** Over Tor the exit
   you draw decides everything: yt-dlp is given a 15s socket timeout and up to 3
   attempts, rotating the circuit between the slow ones, so a bad draw can take
-  ~65s before it gives up. `chainsmoke: ... rotating circuit, retrying (2/3)` on
-  stderr is the policy working. Measured 2026-08-19 over 6 fresh circuits
+  ~65s before it gives up. `chainsmoke: no answer through this Tor circuit —
+  trying a fresh circuit (2/3)` on stderr is the policy working: one line per
+  retry, the full yt-dlp error only if every attempt fails (2026-10-03). Listings
+  (`likes`, `playlist`) get 3 minutes per attempt, not 45s: a 1,700-track likes
+  list comes a page at a time over Tor, and the 45s cap killed it mid-fetch on
+  every attempt (2026-10-03, `TestListingsGetAListingBudget`). Measured 2026-08-19 over 6 fresh circuits
   (`pkg/resolver/ytdlp.go:29-31`): one completed in 22.9s, every other one
   stalled. Treat it as "most circuits fail SoundCloud", not a precise rate
   (n=6; this line said "1 in 3" until 2026-10-01).
@@ -382,6 +387,53 @@ prove help, `--version` and TAB never print the art.
   fix on a loopback rig (fake origin plus fake proxy, real mpv on a scratch pipe):
   three BYPASS rows became clean. Re-run such a rig if you touch the spawn or
   `Enqueue`.
+- **`Ensure()` trusts only a daemon it marked (2026-10-03).** The `no_proxy`
+  fix reaches only daemons this build spawns. A live daemon started by an
+  older chainsmoke (the 08-24 `dist/` binaries) or by hand still bypassed on
+  reuse, measured before/after on the same rig. So `Ensure()` spawns with
+  `--script-opts=chainsmoke-spawn=<spawnGen>` (in argv, so a still-booting
+  daemon has it too) and, before reusing a live daemon, reads back that key
+  and `ytdl=false`. Anything else is replaced, with a one-line notice on
+  stderr. **Bump `spawnGen` whenever the spawn's safety changes**, so older
+  daemons get replaced instead of trusted. `TestEnsureReusesOnlyADaemonItMarked`.
+  It also now notices an mpv that dies on startup (`mpv exited while
+  starting`) instead of waiting out the 10s window. That window replaced 3s
+  after the first `daemon start` of 2026-09-28 hit the 3s limit while mpv went
+  on to answer about a second later. A warm start is about 90ms.
+- **A non-default `--tor-socks` never spawns a private tor (2026-10-03).**
+  Nothing listening there means fail closed. Before, it fell through to
+  spawning `tor` from PATH, which bootstraps onto the network. With any tor on
+  PATH, that turned every smoke `$noTor` row into real egress (a fake `tor.exe`
+  made one row take 46s). The private tor's torrc also names this process as
+  its owner (`__OwningControllerProcess`), so it exits by itself about 12s
+  after chainsmoke dies by any route. Its DataDirectory still stays behind
+  (T10.9).
+- **`play` checks an argv index or URL before `Up()`, and prompts for a stdin
+  URL only after it (2026-10-03).** A typo costs no circuit (TASKS.md:405), and
+  nobody pastes a URL just to learn Tor is down. That is why smoke's
+  `proxy-wired` and `failclosed` rows run a bare `play`: with an index and an
+  empty cache, they would stop before `Up()`.
+- **The cached results play like a playlist, one track ahead (2026-10-03).**
+  `play N` (from search, likes or playlist) stops whatever was queued, plays N,
+  and preloads N+1 with no `Meta` round-trip. At the prompt, `next`/`prev` walk
+  the list (`queue.go`), and a tick tops up the preload when mpv advances by
+  itself. Never more than one ahead: signed URLs expire, and each resolve is a
+  Tor round-trip. Before this, `next` after `play N` failed with
+  `playlist-next: error running command`, because only N was ever queued. A
+  one-shot `chainsmoke next` from another window is still plain mpv.
+  The prompt also has its own `shuffle [on|off]` (the rest of the list in
+  random order, each track once, from the very next track) and
+  `repeat one|all|off`. One is mpv's `loop-file`; all wraps the list, and
+  reshuffles in shuffle. The session's end clears repeat, because the daemon
+  outlives it. Every track change is announced as `▶ N. title · next: M. title`,
+  including one mpv makes by itself when a song ends. Before 2026-10-03 that
+  was silent, and a `next` meant to start playback skipped a song.
+- **New daemons start at volume 50** (`--volume=50`); a reused one keeps
+  whatever `vol` last set.
+- **Rotation is quiet.** Re-isolating on the SOCKS port is what gives the next
+  stream a fresh circuit; NEWNYM on ControlPort 9051 is a silent bonus, tried
+  once per process (`TestRotateIsQuietWhenReisolationWorks`). On a tor with no
+  ControlPort (this box) it used to print two lines on every retry.
 - **`Net.Up()` is once per process.** A play session runs several verbs, each
   calling `Up()`; a second pass would start another bridge (and maybe another
   private tor) that `Down()` never closes. `TestUpIsIdempotent` pins it.

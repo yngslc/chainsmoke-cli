@@ -52,30 +52,47 @@ func New(sock string, n core.Net) *MPV { return &MPV{sock: sock, net: n} }
 // status verb can report it without reaching into the struct.
 func (p *MPV) SocketPath() string { return p.sock }
 
-// startTimeout is how long Ensure waits for a daemon to answer. It was 3s, and
-// a cold start measured longer than that on 2026-09-28: Ensure reported
-// failure while that mpv went on booting.
+// startTimeout is how long Ensure waits for a daemon to answer. It was 3s:
+// the first `daemon start` of 2026-09-28 hit that limit while mpv went on to
+// answer about a second later (a warm start is ~90ms). Ensure also stops
+// waiting the moment the mpv it started exits, so only a hung one costs this.
 var startTimeout = 10 * time.Second
+
+// The spawn mark: Ensure puts it in mpv's argv and reads it back over IPC
+// before trusting a live daemon (see ours). Bump spawnGen whenever the spawn's
+// safety properties change, so daemons from older builds get replaced.
+const (
+	spawnMarkKey = "chainsmoke-spawn"
+	spawnGen     = "1"
+)
 
 // Ensure starts mpv's persistent IPC daemon if it is not already live.
 func (p *MPV) Ensure() error {
 	if _, err := exec.LookPath("mpv"); err != nil {
 		return ErrToolMissing
 	}
-	if p.live() {
-		return nil
-	}
-
 	// An mpv already started on this endpoint that does not answer yet is
 	// most likely still booting: one an earlier Ensure gave up on, or one
 	// another process just spawned. A second would never get the pipe and
 	// would idle as a stray (see Down), so this one gets the window first.
-	// Still silent after it, it is a stray or wedged, not slow, and it must
-	// not make every later call wait: clear it and start fresh.
-	if len(daemons("--input-ipc-server="+p.sock)) > 0 {
-		if p.waitLive(startTimeout) {
-			return nil
+	live := p.live()
+	if !live && len(daemons("--input-ipc-server="+p.sock)) > 0 {
+		live = p.waitLive(startTimeout, nil)
+	}
+	switch {
+	case live && p.ours():
+		return nil
+	case live:
+		// Spawned by an older build (the dist/ binaries) or by hand: its
+		// environment is unknown, and an inherited no_proxy sent a reused
+		// daemon's streams around the proxy (measured 2026-10-03). Replace it.
+		fmt.Fprintln(os.Stderr, "chainsmoke: replacing an mpv daemon this build did not start — its environment could route streams around the proxy")
+		if err := p.Down(); err != nil {
+			return err
 		}
+	default:
+		// Still silent after the window: a stray or wedged, not slow, and it
+		// must not make every later call wait. Clear it and start fresh.
 		if err := reap(p.sock, 0); err != nil {
 			return err
 		}
@@ -105,9 +122,16 @@ func (p *MPV) Ensure() error {
 	//   --gapless-audio     this is a music queue, not a video player
 	//   --cache-on-disk=no  already the default; stated because "stream bytes
 	//                       never touch the disk" is a promise, not a preference
+	//   --script-opts=...   the spawn mark, read back by ours() before reuse.
+	//                       In argv rather than set over IPC afterwards, so a
+	//                       daemon still booting when Ensure gave up has it too.
+	//   --volume=50         a new daemon starts at half volume, not mpv's 100
+	//                       (dev's call, 2026-10-03). A reused daemon keeps
+	//                       whatever `vol` last set.
 	cmd := exec.Command("mpv",
 		"--idle", "--no-video", "--no-config", "--no-ytdl",
-		"--gapless-audio", "--cache-on-disk=no",
+		"--gapless-audio", "--cache-on-disk=no", "--volume=50",
+		"--script-opts="+spawnMarkKey+"="+spawnGen,
 		"--input-ipc-server="+p.sock)
 	// The user's environment, minus no_proxy: libavformat honours it even for
 	// the proxy each loadfile carries, so no_proxy=* (or a pattern matching the
@@ -118,12 +142,33 @@ func (p *MPV) Ensure() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start mpv: %w", err)
 	}
-	go func() { _ = cmd.Wait() }()
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
 
-	if p.waitLive(startTimeout) {
+	if p.waitLive(startTimeout, exited) {
 		return nil
 	}
-	return fmt.Errorf("mpv IPC endpoint %s did not become responsive", p.sock)
+	select {
+	case <-exited:
+		return fmt.Errorf("mpv exited while starting (%v) — run `mpv --idle --no-config` to see why", cmd.ProcessState)
+	default:
+		return fmt.Errorf("mpv IPC endpoint %s did not become responsive", p.sock)
+	}
+}
+
+// ours reports whether the live daemon is one this build spawned: it carries
+// the spawn mark and has the ytdl hook off (both measured readable over IPC on
+// mpv 0.41). Anything else has an environment Ensure cannot see.
+func (p *MPV) ours() bool {
+	opts, err := p.Command("get_property", "script-opts")
+	if err != nil {
+		return false
+	}
+	if m, _ := opts.(map[string]any); m[spawnMarkKey] != spawnGen {
+		return false
+	}
+	ytdl, err := p.Command("get_property", "ytdl")
+	return err == nil && ytdl == false
 }
 
 // withoutNoProxy returns env without no_proxy in either spelling, which on
@@ -138,11 +183,17 @@ func withoutNoProxy(env []string) []string {
 	return out
 }
 
-// waitLive polls the liveness probe until it answers or d runs out.
-func (p *MPV) waitLive(d time.Duration) bool {
+// waitLive polls the liveness probe until it answers, d runs out, or exited
+// closes (the process it waits for is gone; nil means not watched).
+func (p *MPV) waitLive(d time.Duration, exited <-chan struct{}) bool {
 	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
 		if p.live() {
 			return true
+		}
+		select {
+		case <-exited:
+			return false
+		default:
 		}
 	}
 	return false

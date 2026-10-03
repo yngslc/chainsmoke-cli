@@ -2,8 +2,11 @@ package net
 
 import (
 	"bufio"
+	"io"
 	"net"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -202,6 +205,78 @@ func TestCheckProxySchemeRejectsSOCKS(t *testing.T) {
 	}
 	if err := checkProxyScheme("127.0.0.1:8118"); err == nil {
 		t.Error("a bare host:port has no scheme and should be refused")
+	}
+}
+
+// TestRotateIsQuietWhenReisolationWorks: re-isolating on the SOCKS port always
+// works and is what gives the next stream a fresh circuit; NEWNYM needs tor's
+// ControlPort, which most system tors (and this dev box) leave off. Rotate used
+// to try the control port on every retry and print two lines each time it
+// failed (dev's report, 2026-10-03). Now NEWNYM is a silent bonus, tried once
+// per process.
+func TestRotateIsQuietWhenReisolationWorks(t *testing.T) {
+	ctrl, err := net.Listen("tcp", "127.0.0.1:0") // a control port that refuses auth
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+	var dials int32
+	go func() {
+		for {
+			c, err := ctrl.Accept()
+			if err != nil {
+				return
+			}
+			atomic.AddInt32(&dials, 1)
+			c.Close()
+		}
+	}()
+	cb, err := StartConnectBridge("127.0.0.1:1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cb.Close()
+	b := &Bridge{cb: cb, torCtrlAddr: ctrl.Addr().String()}
+
+	r, w, _ := os.Pipe()
+	stderr := os.Stderr
+	os.Stderr = w
+	err1, err2 := b.Rotate(), b.Rotate()
+	os.Stderr = stderr
+	w.Close()
+	printed, _ := io.ReadAll(r)
+
+	if err1 != nil || err2 != nil {
+		t.Errorf("Rotate() = %v, %v — re-isolation worked, so rotating did too", err1, err2)
+	}
+	if len(printed) != 0 {
+		t.Errorf("Rotate printed %q, want nothing", printed)
+	}
+	if n := atomic.LoadInt32(&dials); n != 1 {
+		t.Errorf("the control port was dialled %d times over two rotations, want 1", n)
+	}
+}
+
+// TestProxyErrorsNeverEchoCredentials: a --proxy URL can carry a password, and
+// every refusal used to repeat the value verbatim, putting it on the terminal
+// (measured 2026-10-03, CH-DEBATE-2026-10-03 #8).
+func TestProxyErrorsNeverEchoCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"https://alice:s3cretpw@127.0.0.1:1",
+		"socks5://alice:s3cretpw@127.0.0.1:1",
+		"ftp://alice:s3cretpw@127.0.0.1:1",
+		"http//alice:s3cretpw@127.0.0.1:1", // not a URL at all
+	} {
+		if err := checkProxyScheme(raw); err == nil || strings.Contains(err.Error(), "s3cretpw") {
+			t.Errorf("checkProxyScheme(%q) = %v, want a refusal without the password", raw, err)
+		}
+	}
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		t.Setenv(k, "")
+	}
+	if err := New("http://alice:s3cretpw@127.0.0.1:1", false, "127.0.0.1:1").Up(); err == nil ||
+		strings.Contains(err.Error(), "s3cretpw") {
+		t.Errorf("Up() with an unreachable --proxy = %v, want a refusal without the password", err)
 	}
 }
 
