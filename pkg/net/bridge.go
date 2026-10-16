@@ -645,7 +645,7 @@ func (b *ConnectBridge) handle(client net.Conn) {
 	}
 	// CONNECT only. An absolute-form GET means a child is about to push
 	// PLAINTEXT through us — refuse loudly rather than proxy it, so a leak
-	// shows up as a visible failure instead of as quiet traffic.
+	// shows up as a visible failure instead of as quiet traffic.8u
 	if req.Method != http.MethodConnect {
 		b.ledger.refuse() // T7.2: a child tried to push plaintext through us
 		_, _ = io.WriteString(client,

@@ -512,7 +512,9 @@ already deployed from what actually had to be built.
   non-TTY/`--no-tui` cases next.
   **done**
 
-## Phase 10 — TUI (the default surface)
+## Phase 10 — TUI (the default surface) 
+//05.10.2026 - Phase 10 HAS BEEN DROPPED DOWN FOR THE EARLIER RELEASE OF CLI VERSION OF CHAINSMOKE.
+respectfully, decision of both dev and claude - TUI is an independent chunk of code, thus, building it inside of this project will do much more problems overtime, especially problems with privacy.
 
 Decided 2026-08-14. Bare `chainsmoke` opens a **TUI**; ~~`-h`/`--help` prints the
 ASCII banner + command table; explicit verbs stay one-shot and quiet~~ explicit
