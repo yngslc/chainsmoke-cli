@@ -43,6 +43,16 @@ corresponding expectation in
      never the source of truth. It may cache in memory for rendering, but one-shot
      `play N` and an open TUI must always resolve against the same result set.
      **dev's conclusion: approved, fixed**
+  *(Amended 2026-10-19, factual — 2026-10-05 review, R7: `play` no longer exits
+  once it has queued. mpv streams through the CONNECT bridge inside the `play`
+  process, so that process stays up for the whole play session
+  (`cmd/chainsmoke/session.go`): a prompt on a terminal, a wait for the queue
+  otherwise. Within a session it does hold state in memory — the list being
+  walked (`queue.go`) and a background preload goroutine. What still holds:
+  nothing survives from one invocation to the next, the runtime store is the
+  only result cache, and mpv is the only process that outlives a session.
+  Consequence 4 is superseded: N+1 is resolved in the background inside the
+  session, not synchronously before exit.)*
 - **T0.2 — Define fail-closed egress semantics.** Write down the contract:
   no Resolver/Player call may run unless `Net.Up()` has *verified* the
   bridge accepts CONNECTs. Decide enforcement (resolver constructed only
@@ -232,6 +242,8 @@ a new bug, which is what made the freeze safe.
 - **T5.4** Preload-ahead per the T0.1 decision (daemon queue, or synchronous
   enqueue-next, or mpv event hook). The current goroutine is dead code.
     **done**
+  *(2026-10-19: now one track resolved in the background inside the play
+  session — see T0.1's amendment.)*
 - **T5.5** Transport verbs: np/toggle/seek/vol/next/prev/stop on the real
   client; `daemon status`.
     **done**

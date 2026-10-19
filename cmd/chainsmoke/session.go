@@ -77,6 +77,16 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 		}
 	}()
 
+	// The scanner above is the ONLY reader of the session's input. A bare
+	// play/likes/playlist asks for its URL or handle on the next line; it used
+	// to read stdin itself, racing the scanner — the scanner won, the verb got
+	// nothing, and the line then ran as a command (2026-10-05 review, R3). Now
+	// a verb reads from the same lines channel. That needs no lock: while a
+	// verb reads, this loop is blocked inside repl.Run and is not reading.
+	prev := app.Stdin
+	app.Stdin = &sessionInput{lines: lines}
+	defer func() { app.Stdin = prev }()
+
 	fmt.Fprintln(os.Stderr, sessionHint(commands(app)))
 	fmt.Fprint(os.Stderr, "chainsmoke> ")
 	tick := time.NewTicker(poll)
@@ -92,6 +102,12 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 			if i, moved := q.follow(); moved {
 				fmt.Fprintln(os.Stderr)
 				q.announce(i)
+				fmt.Fprint(os.Stderr, "chainsmoke> ")
+			}
+		case p := <-q.loading: // nil, and never ready, when nothing is resolving
+			if err := q.landed(p); err != nil {
+				fmt.Fprintln(os.Stderr)
+				fmt.Fprintln(os.Stderr, "chainsmoke:", err)
 				fmt.Fprint(os.Stderr, "chainsmoke> ")
 			}
 		case line, ok := <-lines:
@@ -143,6 +159,30 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 	}
 }
 
+// sessionInput is the session's input as an io.Reader, one typed line at a
+// time, for a verb that reads stdin while running at the prompt.
+type sessionInput struct {
+	lines <-chan string
+	buf   []byte
+}
+
+func (s *sessionInput) Read(p []byte) (int, error) {
+	if len(s.buf) == 0 {
+		line, ok := <-s.lines
+		if !ok {
+			return 0, io.EOF
+		}
+		s.buf = append([]byte(line), '\n')
+	}
+	n := copy(p, s.buf)
+	s.buf = s.buf[n:]
+	return n, nil
+}
+
+// Prompting tells core.readLine a person is typing here, so it still prints
+// its "URL: " / "user handle: " prompt.
+func (*sessionInput) Prompting() bool { return true }
+
 // notAtThePrompt are the verbs the hint leaves out: daemon and purge would
 // pull the player out from under the session, completion prints a shell
 // script, and get is still a stub (pkg/scrub).
@@ -191,7 +231,8 @@ func setMode(q *listQueue, args []string) error {
 }
 
 // waitForQueue holds the bridge until mpv has nothing left to play. It reports
-// whether it was interrupted rather than drained.
+// whether it was interrupted rather than drained. A track still resolving is
+// something left to play: mpv may sit idle for a moment waiting on it.
 func waitForQueue(p core.Player, q *listQueue, sig <-chan os.Signal, poll time.Duration) (interrupted bool) {
 	busy := false
 	for waited := time.Duration(0); ; waited += poll {
@@ -205,12 +246,16 @@ func waitForQueue(p core.Player, q *listQueue, sig <-chan os.Signal, poll time.D
 			if i, moved := q.follow(); moved { // keep the list going, one track ahead
 				q.announce(i)
 			}
-		} else if busy || waited >= queueStartGrace {
+		} else if q.loading == nil && (busy || waited >= queueStartGrace) {
 			return false // drained — or it never started
 		}
 		select {
 		case <-sig:
 			return true
+		case pl := <-q.loading:
+			if err := q.landed(pl); err != nil {
+				fmt.Fprintln(os.Stderr, "chainsmoke:", err)
+			}
 		case <-time.After(poll):
 		}
 	}

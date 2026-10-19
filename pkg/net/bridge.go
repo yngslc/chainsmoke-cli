@@ -65,6 +65,10 @@ type Bridge struct {
 	socksAddr   string    // the SOCKS listener actually in use
 	torCtrlAddr string    // control port of the tor we spawned ("" = system tor)
 	ctrlFailed  bool      // NEWNYM already failed in this process; do not retry it
+
+	// rotateMu serializes Rotate: a play session's background preload retries
+	// (and so rotates) while a verb at the prompt may rotate too.
+	rotateMu sync.Mutex
 }
 
 var _ core.Net = (*Bridge)(nil)
@@ -305,6 +309,9 @@ const newnymCooldown = 10 * time.Second
 //   - Success here means "the next stream keys a new circuit", not "you have a
 //     different exit". Tor picks exits at random; it may well pick the same one.
 func (b *Bridge) Rotate() error {
+	b.rotateMu.Lock()
+	defer b.rotateMu.Unlock()
+
 	// Re-isolate FIRST, and unconditionally. It is the half that always works:
 	// no ControlPort, no auth, no cooperation from a tor we do not own. A
 	// system tor with ControlPort disabled — the common case, and what this dev
@@ -370,9 +377,10 @@ func (b *Bridge) ctrlAddr() string {
 	return torCtrlAddr
 }
 
-// newnymStamp is where the last rotation time is recorded. chainsmoke processes
-// are short-lived (decision T0.1a), so in-memory tracking would never observe a
-// second call — the cooldown has to be visible across invocations to be useful.
+// newnymStamp is where the last rotation time is recorded. A rotation can come
+// from any chainsmoke process — `chainsmoke rotate` in another window, a retry
+// inside a play session — so in-memory tracking would miss most of them: the
+// cooldown has to be visible across invocations to be useful.
 func newnymStamp() string { return filepath.Join(core.RuntimeDir(), "last-newnym") }
 
 func sinceLastNewnym() (time.Duration, bool) {
@@ -483,7 +491,8 @@ func (b *Bridge) ensureTor() (string, error) {
 // ephemeral SocksPort, and a cookie-authenticated ControlPort so Rotate() works
 // against it (the first draft omitted ControlPort, which left NEWNYM dead).
 func spawnPrivateTor() (cmd *exec.Cmd, dir, socksAddr, ctrlAddr string, err error) {
-	dir, err = os.MkdirTemp("", "chainsmoke-tor-")
+	sweepStaleTorDirs(os.TempDir())
+	dir, err = os.MkdirTemp("", fmt.Sprintf("%s%d-*", torDirPrefix, os.Getpid()))
 	if err != nil {
 		return nil, "", "", "", err
 	}
@@ -513,6 +522,43 @@ func spawnPrivateTor() (cmd *exec.Cmd, dir, socksAddr, ctrlAddr string, err erro
 	return cmd, dir,
 		fmt.Sprintf("127.0.0.1:%d", socksPort),
 		fmt.Sprintf("127.0.0.1:%d", ctrlPort), nil
+}
+
+// torDirPrefix starts a private tor's scratch dir name; the pid of the
+// chainsmoke that owns it follows, so a later run can tell a leftover from a
+// dir in use.
+const torDirPrefix = "chainsmoke-tor-p"
+
+// sweepStaleTorDirs deletes the scratch dirs of private tors whose chainsmoke
+// is gone. Down deletes its own, but a process that never reached Down — a
+// closed terminal, Ctrl+C while Up() was still bootstrapping, a kill — left its
+// tor's DataDirectory (keys, auth cookie, cached consensus) in the temp dir
+// for good (2026-10-05 review, R10). Only a dir whose owner is confirmed dead
+// goes: a reused pid keeps a stale dir one run longer, it never costs a live
+// one. Dirs named before the pid was in the name are left alone.
+func sweepStaleTorDirs(tmp string) {
+	matches, _ := filepath.Glob(filepath.Join(tmp, torDirPrefix+"*"))
+	for _, dir := range matches {
+		if pid, ok := torDirOwner(filepath.Base(dir)); ok && pid != os.Getpid() && !processAlive(pid) {
+			// Best effort: a tor still exiting (it follows its owner within
+			// ~12s) can hold a file a moment longer; the next sweep finishes.
+			_ = os.RemoveAll(dir)
+		}
+	}
+}
+
+// torDirOwner reads the owner's pid out of a scratch dir's name.
+func torDirOwner(name string) (int, bool) {
+	rest, ok := strings.CutPrefix(name, torDirPrefix)
+	if !ok {
+		return 0, false
+	}
+	digits, _, ok := strings.Cut(rest, "-")
+	if !ok {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(digits)
+	return pid, err == nil && pid > 0
 }
 
 // privateTorrc is the config for a throwaway tor. __OwningControllerProcess
@@ -699,9 +745,14 @@ func (b *ConnectBridge) handle(client net.Conn) {
 
 // Close stops accepting and waits for in-flight tunnels.
 //
-// KNOWN LIMITATION: a live audio stream keeps this blocked. Before ship, track
-// open conns and kill them here — `chainsmoke stop`/`purge` want the tunnels
-// severed, not drained.
+// KNOWN LIMITATION: a live audio stream keeps this blocked. Measured 2026-10-19
+// on a loopback rig (real mpv, this bridge, a TLS origin dripping audio, a
+// SOCKS5 stand-in): after the `stop` a play session sends on q, Ctrl+C or end
+// of input, Close returns in 23–48ms, whether the upstream closes on EOF the
+// way tor does or only half-closes. With no stop it stays blocked for as long
+// as mpv streams (8s+ there) and returns 47ms after one. Every way out of a
+// session stops mpv first, so what is left is a session whose stop could not
+// reach mpv: its process then waits for the track to end.
 func (b *ConnectBridge) Close() error {
 	var err error
 	b.once.Do(func() { err = b.ln.Close() })

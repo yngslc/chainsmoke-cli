@@ -29,6 +29,12 @@ func (p *sessionPlayer) Command(args ...any) (any, error) {
 	if p.gone {
 		return nil, errors.New("mpv IPC unreachable")
 	}
+	switch fmt.Sprintf("%v", args) { // what play N's switch asks (queue.go)
+	case "[get_property playlist-count]":
+		return float64(p.enqueued), nil
+	case "[get_property playlist-pos]":
+		return float64(p.enqueued - 1), nil
+	}
 	if len(args) == 2 && args[1] == "idle-active" && len(p.idle) > 0 {
 		v := p.idle[0]
 		if len(p.idle) > 1 {
@@ -74,10 +80,10 @@ func TestPlaySessionPrompt(t *testing.T) {
 	if p.enqueued != 1 {
 		t.Errorf("`play 1` at the prompt enqueued %d tracks, want 1", p.enqueued)
 	}
-	// Two stops: `play 1` at the prompt replaces the queue with the list from
-	// result 1 (queue.go, 2026-10-03), and q ends playback.
-	if n := p.count("[stop]"); n != 2 {
-		t.Errorf("sent stop %d times, want 2 (play 1 replacing the queue, then q): %v", n, p.sent)
+	// One stop, from q. `play 1` at the prompt switches without stopping:
+	// nothing changes until the new track is in hand (queue.go, review R5).
+	if n := p.count("[stop]"); n != 1 {
+		t.Errorf("sent stop %d times, want exactly 1 (at q): %v", n, p.sent)
 	}
 	if last := p.sent[len(p.sent)-1]; last != "[stop]" {
 		t.Errorf("last command = %s, want the stop from q", last)

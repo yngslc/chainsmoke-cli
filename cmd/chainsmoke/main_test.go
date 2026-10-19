@@ -67,6 +67,7 @@ func (p *recordingPlayer) Down() error                  { return nil }
 type nopStore struct{}
 
 func (nopStore) SaveResults([]core.Track) error { return nil }
+func (nopStore) Results() ([]core.Track, error) { return []core.Track{{Permalink: "p"}}, nil }
 func (nopStore) Result(int) (core.Track, error) { return core.Track{Permalink: "p"}, nil }
 func (nopStore) Purge() error                   { return nil }
 

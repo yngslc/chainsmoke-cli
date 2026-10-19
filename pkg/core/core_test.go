@@ -3,7 +3,6 @@ package core
 import (
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"testing"
 )
@@ -31,6 +30,7 @@ type fakeStore struct {
 }
 
 func (s *fakeStore) SaveResults([]Track) error { return nil }
+func (s *fakeStore) Results() ([]Track, error) { return nil, nil }
 func (s *fakeStore) Result(int) (Track, error) { return Track{}, nil }
 func (s *fakeStore) Purge() error              { s.log.note("store.Purge"); return s.purgeErr }
 
@@ -80,115 +80,6 @@ func TestPurgeReportsStoreFailure(t *testing.T) {
 
 	if err := app.Purge(); err == nil {
 		t.Fatal("Purge = nil, want the store's error surfaced")
-	}
-}
-
-// fakeResolver hands back a stream URL per permalink; an empty entry means
-// "this one fails to resolve".
-type fakeResolver struct{ streams map[string]string }
-
-func (r fakeResolver) Meta(string) ([]Track, error)        { return nil, nil }
-func (r fakeResolver) Search(string, int) ([]Track, error) { return nil, nil }
-func (r fakeResolver) Stream(permalink string) (string, error) {
-	if u := r.streams[permalink]; u != "" {
-		return u, nil
-	}
-	return "", errors.New("could not resolve")
-}
-
-// queueingPlayer records what actually reached mpv, and refuses any URL listed
-// as dead — the shape ErrDeadStream arrives in from a failed preflight.
-type queueingPlayer struct {
-	fakePlayer
-	dead   map[string]bool
-	queued []string
-}
-
-func (p *queueingPlayer) Enqueue(url, _ string) error {
-	if p.dead[url] {
-		return errors.New("dead stream")
-	}
-	p.queued = append(p.queued, url)
-	return nil
-}
-
-func tracks(names ...string) []Track {
-	var ts []Track
-	for _, n := range names {
-		ts = append(ts, Track{Title: n, Permalink: "https://soundcloud.com/a/" + n})
-	}
-	return ts
-}
-
-// TestEnqueueAheadSkipsNotAborts is T1.14 applied to Phase 5: a track that will
-// not resolve, and a track whose stream is already dead, must each cost only
-// themselves. The queue is what the user asked for; one bad entry is not a
-// reason to hand it back empty.
-func TestEnqueueAheadSkipsNotAborts(t *testing.T) {
-	res := fakeResolver{streams: map[string]string{
-		"https://soundcloud.com/a/two":   "https://cdn/two",
-		"https://soundcloud.com/a/three": "https://cdn/three",
-	}} // "one" resolves to nothing
-	play := &queueingPlayer{fakePlayer: fakePlayer{log: &log{}}}
-	app := &App{Res: res, Play: play, Out: io.Discard}
-
-	if err := app.EnqueueAhead(tracks("one", "two", "three")); err != nil {
-		t.Fatalf("EnqueueAhead() = %v, want nil — two tracks were queueable", err)
-	}
-	if len(play.queued) != 2 {
-		t.Fatalf("queued %v, want the two that resolved", play.queued)
-	}
-}
-
-// TestEnqueueAheadStopsAtPreloadAhead: resolving the whole set would cost a Tor
-// round-trip per track and hand mpv URLs that expire before playback reaches
-// them (T5.4).
-func TestEnqueueAheadStopsAtPreloadAhead(t *testing.T) {
-	streams := map[string]string{}
-	for _, n := range []string{"a", "b", "c", "d", "e"} {
-		streams["https://soundcloud.com/a/"+n] = "https://cdn/" + n
-	}
-	play := &queueingPlayer{fakePlayer: fakePlayer{log: &log{}}}
-	app := &App{Res: fakeResolver{streams: streams}, Play: play, Out: io.Discard}
-
-	if err := app.EnqueueAhead(tracks("a", "b", "c", "d", "e")); err != nil {
-		t.Fatalf("EnqueueAhead() = %v", err)
-	}
-	if len(play.queued) != preloadAhead {
-		t.Errorf("queued %d tracks, want %d", len(play.queued), preloadAhead)
-	}
-}
-
-// TestEnqueueAheadScrubsTheTitleItPrints: the ▶ line is third-party text on a
-// terminal, like the results table, and gets the same scrub. An ESC in a title
-// must not repaint the screen, and a newline must not forge a second line.
-func TestEnqueueAheadScrubsTheTitleItPrints(t *testing.T) {
-	hostile := Track{Title: "red \x1b[31mALERT\x1b[0m\n▶ forged", Permalink: "https://soundcloud.com/a/x"}
-	var out strings.Builder
-	app := &App{
-		Res:  fakeResolver{streams: map[string]string{hostile.Permalink: "https://cdn/x"}},
-		Play: &queueingPlayer{fakePlayer: fakePlayer{log: &log{}}}, Out: &out,
-	}
-
-	if err := app.EnqueueAhead([]Track{hostile}); err != nil {
-		t.Fatalf("EnqueueAhead() = %v", err)
-	}
-	if strings.ContainsRune(out.String(), 0x1b) || strings.Count(out.String(), "\n") != 1 {
-		t.Errorf("the ▶ line printed the title raw: %q", out.String())
-	}
-}
-
-// TestEnqueueAheadFailsWhenNothingQueues: skip-not-abort is not "never fail".
-// If every track is dead the user must hear about it, not get silence.
-func TestEnqueueAheadFailsWhenNothingQueues(t *testing.T) {
-	play := &queueingPlayer{fakePlayer: fakePlayer{log: &log{}}, dead: map[string]bool{"https://cdn/x": true}}
-	app := &App{
-		Res:  fakeResolver{streams: map[string]string{"https://soundcloud.com/a/x": "https://cdn/x"}},
-		Play: play, Out: io.Discard,
-	}
-
-	if err := app.EnqueueAhead(tracks("x")); err == nil {
-		t.Fatal("EnqueueAhead() = nil with every track dead, want an error")
 	}
 }
 
@@ -254,6 +145,7 @@ type indexStore struct {
 }
 
 func (s *indexStore) SaveResults([]Track) error { return nil }
+func (s *indexStore) Results() ([]Track, error) { return nil, s.err }
 func (s *indexStore) Purge() error              { return nil }
 func (s *indexStore) Result(n int) (Track, error) {
 	s.asked = n
@@ -271,6 +163,7 @@ func TestResolveIndexOrStdinRoutes(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		arg       string
+		typed     bool // arg was typed at the session prompt, not argv
 		stdin     string
 		wantIndex int    // 0 = the store must not be consulted
 		wantPerma string // "" = expect an error
@@ -286,6 +179,12 @@ func TestResolveIndexOrStdinRoutes(t *testing.T) {
 			wantErr: "not accepted in argv"},
 		{name: "overflow is an index error, not a URL error", arg: "99999999999999999999",
 			wantErr: "out of range"},
+		{name: "url typed at the session prompt is taken as a URL", arg: "https://soundcloud.com/a/typed",
+			typed: true, wantPerma: "https://soundcloud.com/a/typed"},
+		{name: "an index typed at the prompt is still an index", arg: "2", typed: true, wantIndex: 2,
+			wantPerma: "https://soundcloud.com/a/cached"},
+		{name: "overflow typed at the prompt is still an index error", arg: "99999999999999999999",
+			typed: true, wantErr: "out of range"},
 		{name: "no arg reads one line from stdin", stdin: "https://soundcloud.com/a/piped\n",
 			wantPerma: "https://soundcloud.com/a/piped"},
 		{name: "stdin is trimmed", stdin: "  https://soundcloud.com/a/pad  \n",
@@ -297,7 +196,7 @@ func TestResolveIndexOrStdinRoutes(t *testing.T) {
 			st := &indexStore{}
 			app := &App{Store: st, Stdin: strings.NewReader(tc.stdin)}
 
-			got, err := app.ResolveIndexOrStdin(tc.arg)
+			got, err := app.ResolveIndexOrStdin(tc.arg, tc.typed)
 
 			if tc.wantErr != "" {
 				if err == nil {
@@ -328,7 +227,7 @@ func TestResolveIndexOrStdinRoutes(t *testing.T) {
 func TestResolveIndexOrStdinRefusalNamesTheExposure(t *testing.T) {
 	app := &App{Store: &indexStore{}, Stdin: strings.NewReader("")}
 
-	_, err := app.ResolveIndexOrStdin("https://soundcloud.com/artist/secret-track")
+	_, err := app.ResolveIndexOrStdin("https://soundcloud.com/artist/secret-track", false)
 	if err == nil {
 		t.Fatal("a URL in argv was accepted")
 	}
@@ -347,7 +246,7 @@ func TestResolveIndexOrStdinDoesNotConsultTheStoreForAURL(t *testing.T) {
 	st := &indexStore{err: errors.New("no cached result #0")}
 	app := &App{Store: st, Stdin: strings.NewReader("")}
 
-	_, err := app.ResolveIndexOrStdin("https://soundcloud.com/a/b")
+	_, err := app.ResolveIndexOrStdin("https://soundcloud.com/a/b", false)
 	if err == nil || !strings.Contains(err.Error(), "not accepted in argv") {
 		t.Fatalf("error = %v, want the argv refusal", err)
 	}
@@ -362,7 +261,7 @@ func TestResolveIndexOrStdinPropagatesStoreErrors(t *testing.T) {
 	miss := errors.New("no cached result #7 — run `chainsmoke search <term>` first")
 	app := &App{Store: &indexStore{err: miss}, Stdin: strings.NewReader("")}
 
-	if _, err := app.ResolveIndexOrStdin("7"); !errors.Is(err, miss) {
+	if _, err := app.ResolveIndexOrStdin("7", false); !errors.Is(err, miss) {
 		t.Errorf("ResolveIndexOrStdin = %v, want the store's error", err)
 	}
 }

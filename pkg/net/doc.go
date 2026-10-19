@@ -38,13 +38,29 @@
 //
 // # What is not covered here
 //
-//   - Child-process DNS. yt-dlp, mpv and ffmpeg have their own resolvers and
-//     never consult Go's. They are routed only by inheriting http_proxy, which
-//     for HLS segment fetches is an assumption, not a verified fact. That is
-//     TASKS.md T7.3 and it is still open: if libavformat ever ignores the proxy
-//     for a segment, audio would fetch direct while metadata went through Tor,
-//     and nothing in this package would notice. Treat that as the largest
-//     remaining hole.
+//   - Child-process egress, and with it child-process DNS. yt-dlp, mpv and
+//     ffmpeg have their own resolvers and never consult Go's; what keeps them
+//     on the bridge is the proxy each one is handed. yt-dlp gets an explicit
+//     --proxy from the live Net handle and a minimal environment
+//     (resolver.minimalEnv), so ambient proxy variables never pick its route.
+//     mpv gets the proxy with every loadfile (stream-lavf-o=http_proxy=…, in
+//     player.Enqueue), which reaches a reused daemon too, and its environment
+//     loses no_proxy. Measured rather than assumed (TASKS.md T7.3, T10.9): on a
+//     loopback fixture (2026-10-03) an HLS playlist and all six segments went
+//     through that per-loadfile proxy with zero direct connections, and a
+//     dead, dying or misbehaving proxy failed closed. Still not measured: HTTPS
+//     segments over CONNECT through the real ConnectBridge, end to end. If
+//     libavformat ever fetched a segment direct there, nothing in this package
+//     would notice.
+//   - Other local processes, for as long as a play session lasts. The
+//     ConnectBridge listens on 127.0.0.1 with no authentication, and a play
+//     session keeps it open until q (a one-shot verb holds it for seconds).
+//     For that long any process on this machine, under any user, that finds
+//     the port can tunnel through it — on this session's Tor circuits, so its
+//     traffic shares chainsmoke's exits. It gets nothing chainsmoke could not
+//     do itself: CONNECT only, no plaintext relay (T7.2). Per-session proxy
+//     credentials would close this; for now it is documented, not fixed
+//     (dev's call, 2026-10-19 — 2026-10-05 review, R8).
 //   - Traffic analysis. Tor does not hide that you are using Tor from your ISP,
 //     and packet timing/volume of an audio stream is distinctive.
 //   - The SoundCloud account itself. Anonymous client_id access is unauthenticated,

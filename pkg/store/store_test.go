@@ -138,6 +138,22 @@ func TestPrivateOverridesRemember(t *testing.T) {
 	}
 }
 
+// TestResultsIsTheWholeSet: the play session snapshots its list with Results()
+// (cmd/chainsmoke/queue.go), so it must return exactly the saved set, in
+// order, from disk and from --private's memory alike.
+func TestResultsIsTheWholeSet(t *testing.T) {
+	want := []core.Track{{Title: "one", Permalink: "p1"}, {Title: "two", Permalink: "p2"}}
+	for name, s := range map[string]*Store{"disk": {dir: t.TempDir()}, "private": {}} {
+		if err := s.SaveResults(want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Results()
+		if err != nil || len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+			t.Errorf("%s: Results() = %v, %v, want %v", name, got, err, want)
+		}
+	}
+}
+
 // TestPurgeWipesBothStores is T4.4: purge is not "purge whichever store this
 // process happens to be using". A user who ran --remember yesterday and purges
 // today without the flag must still lose the persisted set.

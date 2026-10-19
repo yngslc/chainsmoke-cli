@@ -138,6 +138,7 @@ type recordingStore struct {
 }
 
 func (s *recordingStore) SaveResults(ts []Track) error { s.saved = ts; return s.err }
+func (s *recordingStore) Results() ([]Track, error)    { return s.saved, s.err }
 func (s *recordingStore) Result(int) (Track, error)    { return Track{}, nil }
 func (s *recordingStore) Purge() error                 { return nil }
 

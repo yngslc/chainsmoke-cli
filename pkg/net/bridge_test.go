@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -218,6 +219,42 @@ func TestPrivateTorDiesWithItsOwner(t *testing.T) {
 	want := fmt.Sprintf("__OwningControllerProcess %d\n", os.Getpid())
 	if rc := privateTorrc(9999, 9998, "data"); !strings.Contains(rc, want) {
 		t.Errorf("the private tor's torrc does not name its owner:\n%s", rc)
+	}
+}
+
+// TestStaleTorDirsAreSwept: tor exits once its owner is gone, but its
+// DataDirectory stayed in the temp dir whenever the owner died before Down()
+// (2026-10-05 review, R10). The next spawn deletes a dir whose owner is dead —
+// and only that: a live owner's, this process's own, and names it cannot read
+// are kept.
+func TestStaleTorDirsAreSwept(t *testing.T) {
+	exited := exec.Command(os.Args[0], "-test.run=^$") // runs no tests, exits
+	if err := exited.Run(); err != nil {
+		t.Fatal(err)
+	}
+	dead := exited.ProcessState.Pid()
+	if processAlive(dead) || !processAlive(os.Getpid()) {
+		t.Fatalf("processAlive: exited pid %d alive = %v, this process alive = %v", dead, processAlive(dead), processAlive(os.Getpid()))
+	}
+
+	tmp := t.TempDir()
+	dirs := map[string]bool{ // name -> swept
+		fmt.Sprintf("%s%d-123", torDirPrefix, dead):         true,
+		fmt.Sprintf("%s%d-456", torDirPrefix, os.Getpid()):  false,
+		fmt.Sprintf("%s%d-789", torDirPrefix, os.Getppid()): false, // `go test`, alive
+		"chainsmoke-tor-1234567":                            false, // named before the pid was: the digits are random
+		"chainsmoke-tor-pjunk-1":                            false,
+	}
+	for name := range dirs {
+		if err := os.MkdirAll(filepath.Join(tmp, name, "data"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweepStaleTorDirs(tmp)
+	for name, swept := range dirs {
+		if _, err := os.Stat(filepath.Join(tmp, name)); os.IsNotExist(err) != swept {
+			t.Errorf("%s: swept = %v, want %v", name, os.IsNotExist(err), swept)
+		}
 	}
 }
 

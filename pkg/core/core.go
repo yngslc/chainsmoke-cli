@@ -105,6 +105,7 @@ type Scrubber interface {
 type Store interface {
 	SaveResults([]Track) error // cache the last numbered result set
 	Result(n int) (Track, error)
+	Results() ([]Track, error) // the whole cached set, in order
 	Purge() error
 }
 
@@ -153,9 +154,12 @@ func (a *App) out() io.Writer {
 
 // ResolveIndexOrStdin implements the no-URL-in-argv contract:
 //   - if arg is an integer N, look it up in the cached result set
-//   - if arg is anything else, refuse it (argv is world-readable)
+//   - if arg is anything else, refuse it (argv is world-readable) — unless
+//     typed is set: then arg is a line typed at the play session's prompt,
+//     which never reaches argv or the shell's history, and is taken as a URL
+//     exactly like a line read from stdin (2026-10-05 review, R4)
 //   - if arg is empty, read exactly one URL line from stdin
-func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
+func (a *App) ResolveIndexOrStdin(arg string, typed bool) (Track, error) {
 	if arg != "" {
 		// strconv.Atoi rather than a homemade loop: unlike the old accumulator
 		// it errors on overflow instead of silently wrapping to a negative
@@ -168,6 +172,9 @@ func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
 		}
 		if errors.Is(err, strconv.ErrRange) {
 			return Track{}, fmt.Errorf("result index %s is out of range", arg)
+		}
+		if typed {
+			return Track{Permalink: arg}, nil
 		}
 		// A non-integer argv is almost always a URL. Refuse it rather than
 		// silently falling through to a stdin read: argv is visible to other
@@ -205,7 +212,10 @@ func (a *App) ResolveIndexOrStdin(arg string) (Track, error) {
 //
 // The prompt goes to stderr so `chainsmoke play | ...` keeps a clean stdout.
 func (a *App) readLine(prompt string) (string, error) {
-	if a.Stdin == nil && StdinIsTerminal() {
+	// A Stdin that is itself a prompt being typed into (the play session's,
+	// cmd/chainsmoke/session.go) still wants the question asked.
+	p, typed := a.Stdin.(interface{ Prompting() bool })
+	if (a.Stdin == nil && StdinIsTerminal()) || (typed && p.Prompting()) {
 		fmt.Fprint(os.Stderr, prompt)
 	}
 	line, err := bufio.NewReader(a.stdin()).ReadString('\n')
@@ -215,59 +225,6 @@ func (a *App) readLine(prompt string) (string, error) {
 // StdinIsTerminal reports whether stdin is an interactive console rather than a
 // pipe, a file, or a null device (isTerminal in term_*.go).
 func StdinIsTerminal() bool { return isTerminal(os.Stdin) }
-
-// preloadAhead is how many tracks are resolved and queued before this process
-// exits: the one that plays, plus one waiting behind it. Not the whole
-// playlist, because SoundCloud's signed URLs expire — resolving track 40 now
-// would hand mpv a URL that is dead long before playback reaches it, and it
-// would cost 40 Tor round-trips to do so (TASKS.md T5.4).
-const preloadAhead = 2
-
-// EnqueueAhead resolves and queues up to preloadAhead tracks, synchronously.
-//
-// Synchronous by decision T0.1(a): under the "mpv is the only daemon" model the
-// chainsmoke process is short-lived, so a goroutine would be killed the moment
-// main() returns. (The bash prototype's `&` at script.sh:237 forks a surviving
-// process; a goroutine does not. The idiom was ported, its semantics were not.)
-//
-// Skip-not-abort (T1.14): one dead track must cost only itself. A stream that
-// will not resolve, or a URL the CDN has already expired, is reported and
-// stepped over — the queue is abandoned only when NOTHING could be queued.
-func (a *App) EnqueueAhead(entries []Track) error {
-	if len(entries) == 0 {
-		return errors.New("nothing resolved")
-	}
-
-	queued := 0
-	for _, t := range entries {
-		if queued == preloadAhead {
-			break
-		}
-		url, err := a.Res.Stream(t.Permalink)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "chainsmoke: skipping %q: %v\n", t.Title, YtdlpHint(err))
-			continue
-		}
-		if err := a.Play.Enqueue(url, t.Title); err != nil {
-			fmt.Fprintf(os.Stderr, "chainsmoke: skipping %q: %v\n", t.Title, err)
-			continue
-		}
-		queued++
-		// Playback starts in the daemon and outlives this process, so without
-		// a line here `play` would exit instantly and silently — which reads as
-		// "nothing happened" rather than "it is playing".
-		fmt.Fprintf(a.out(), "▶ %s\n", Clean(t.Title)) // third-party text, like the table
-	}
-
-	if queued == 0 {
-		return fmt.Errorf("none of the %d resolved tracks could be queued", len(entries))
-	}
-	if len(entries) > queued {
-		fmt.Fprintf(a.out(), "  (%d more in this set — run `chainsmoke next` when this pair ends)\n",
-			len(entries)-queued)
-	}
-	return nil
-}
 
 // DNSAuditor is optionally implemented by a Net that can report what the local
 // resolver is able to observe (T2.5). Optional because it is a property of the

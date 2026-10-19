@@ -1,7 +1,8 @@
-// Package player owns mpv. Under decision T0.1(a) mpv is the ONLY long-lived
-// process in the system: chainsmoke invocations are short-lived and own no
-// state between runs, so anything that must outlive a command lives in mpv or
-// in the runtime store — never in a goroutine.
+// Package player owns mpv. Under decision T0.1(a) mpv is the ONLY process that
+// outlives a chainsmoke invocation. A `play` stays up for its session, since it
+// carries the bridge mpv streams through, but no invocation owns state between
+// runs: anything that must outlive a command lives in mpv or in the runtime
+// store — never in a goroutine.
 package player
 
 import (
@@ -355,7 +356,7 @@ const preflightTimeout = 10 * time.Second
 // The preflight is load-bearing, not belt-and-braces. Measured against mpv 0.41:
 // `loadfile` answers `{"error":"success"}` for a URL pointing at a dead port and
 // only fails LATER, as an async event with no request_id. So the HEAD is the one
-// synchronous signal a short-lived process can act on, and without it
+// synchronous signal chainsmoke can act on, and without it
 // skip-not-abort (T1.14) would have nothing to decide from — every track would
 // "succeed" and the queue would silently fill with dead entries.
 //

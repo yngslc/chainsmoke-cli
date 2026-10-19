@@ -99,6 +99,11 @@ func (s *Store) SaveResults(ts []core.Track) error {
 	return nil
 }
 
+// Results returns the whole last saved set in one read. The play session
+// snapshots its list with it: a loop of Result(n) re-reads and re-parses the
+// file every call, measured at 5.7s for 1,700 likes against 3ms for this.
+func (s *Store) Results() ([]core.Track, error) { return s.load() }
+
 // Result returns the 1-indexed entry from the last saved set. In private mode
 // it reads the in-process slice, which on a fresh `chainsmoke play N` is empty
 // — that is the point of the flag, not a bug to work around.

@@ -127,12 +127,13 @@ Verified behavior baseline (what the carcass does today):
 
 `play` today: `net.Up` (system tor on :9050, else a private one, else refuse —
 `--proxy` or `--allow-direct` override) → `Ensure()` spawns the mpv daemon →
-`play N` plays result N from the cached list and preloads N+1 (`queue.go`; a
-stdin URL still goes `Meta` → `EnqueueAhead`) → **then `play` holds**
+`play N` plays result N from a snapshot of the cached list and preloads N+1
+in the background (`queue.go`; a stdin URL goes `Meta` → `startList`, so a
+set is a list too — 2026-10-19, review R2) → **then `play` holds**
 (`cmd/chainsmoke/session.go`): on a terminal it becomes a `chainsmoke>` prompt
 that prints every verb it accepts, with `next`/`prev` walking the whole list
-(`q`/Ctrl+D/Ctrl+C stops), otherwise it waits for the queue to drain, still
-preloading one ahead. See the "play holds the Tor path" gotcha for why. A real
+(`q`/Ctrl+D/Ctrl+C stops), otherwise it waits for the queue to drain — and
+for a preload still resolving — still preloading one ahead. See the "play holds the Tor path" gotcha for why. A real
 end-to-end play needs a live SoundCloud URL and makes a network request, so it
 is not part of the offline smoke baseline — verified live 2026-09-28 instead:
 `time-pos` ran 0 → 31.7s in real time with the daemon muted.
@@ -153,7 +154,7 @@ fails closed unless `--allow-direct` is passed.
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # 167 passing: core 51, net 36, resolver 23, player 22, store 13, cmd 22 (+3 unix-only, skipped on Windows; WSL -race runs all 170)
+go test ./...   # 173 passing: core 47, net 37, resolver 23, player 22, store 14, cmd 30 (+3 unix-only, skipped on Windows; WSL -race runs all 176, 0 races, 2026-10-19)
 ```
 
 **The integration suite is separate and opt-in** (T9.2). Five tests behind
@@ -406,16 +407,21 @@ prove help, `--version` and TAB never print the art.
   PATH, that turned every smoke `$noTor` row into real egress (a fake `tor.exe`
   made one row take 46s). The private tor's torrc also names this process as
   its owner (`__OwningControllerProcess`), so it exits by itself about 12s
-  after chainsmoke dies by any route. Its DataDirectory still stays behind
-  (T10.9).
+  after chainsmoke dies by any route. Its DataDirectory used to stay behind
+  for good (T10.9). Since 2026-10-19 (review R10) the dir is named
+  `chainsmoke-tor-p<owner pid>-*`, and the next private-tor spawn deletes any
+  dir whose owner is confirmed dead (`processAlive`, per OS). A live owner, a
+  pid it cannot check, and old pid-less names are all left alone
+  (`TestStaleTorDirsAreSwept`). It sweeps only when it spawns, so a box on
+  system tor never runs it, and has nothing to sweep either.
 - **`play` checks an argv index or URL before `Up()`, and prompts for a stdin
   URL only after it (2026-10-03).** A typo costs no circuit (TASKS.md:405), and
   nobody pastes a URL just to learn Tor is down. That is why smoke's
   `proxy-wired` and `failclosed` rows run a bare `play`: with an index and an
   empty cache, they would stop before `Up()`.
 - **The cached results play like a playlist, one track ahead (2026-10-03).**
-  `play N` (from search, likes or playlist) stops whatever was queued, plays N,
-  and preloads N+1 with no `Meta` round-trip. At the prompt, `next`/`prev` walk
+  `play N` (from search, likes or playlist) plays N in place of whatever was
+  queued, and preloads N+1 with no `Meta` round-trip. At the prompt, `next`/`prev` walk
   the list (`queue.go`), and a tick tops up the preload when mpv advances by
   itself. Never more than one ahead: signed URLs expire, and each resolve is a
   Tor round-trip. Before this, `next` after `play N` failed with
@@ -428,12 +434,68 @@ prove help, `--version` and TAB never print the art.
   outlives it. Every track change is announced as `▶ N. title · next: M. title`,
   including one mpv makes by itself when a song ends. Before 2026-10-03 that
   was silent, and a `next` meant to start playback skipped a song.
+  **The list is a snapshot (2026-10-17, review R1).** `play N` copies the
+  result cache once, with `Store.Results()`: one read, where a `Result(n)` loop
+  took 5.7s for 1,700 likes. next/prev/shuffle/preload walk only that copy,
+  so a `search`/`likes`/`playlist` typed at the prompt, or run in another
+  window, no longer splices its results into the list being played; the
+  next `play N` picks them up. Pinned by `TestListPlaybackIgnoresALaterSearch`.
+  **Nothing changes until N is in hand (2026-10-19, review R5).** `playAt`
+  resolves N and passes the preflight first. Only then does it switch, by
+  appending N, `playlist-play-index` to it, then `playlist-clear`; on mpv 0.41
+  that leaves exactly N, playing (measured offline with lavfi sources). It
+  used to send `stop` first, so a DRM track or a bad circuit left silence.
+  **The preload runs in the background (2026-10-19, review R6).** It is a
+  goroutine that only calls `Res.Stream` and hands the URL back over
+  `q.loading`. The prompt's select and `waitForQueue` receive it (`landed`),
+  so mpv and the queue are still touched from the session goroutine alone,
+  and the IPC client stays single-threaded. `next` on the last queued entry
+  waits for the very track asked for (`settle`). `landed` drops a result if
+  mpv's playlist changed size meanwhile (a `stop`), so it never starts
+  playback nobody asked for. A dead track is skipped with `chainsmoke:
+  skipping N. title: …`, at most 3 in a row. A stdin set goes through
+  `startList`, which skips a dead first track the same way (T1.14). Still
+  synchronous: `play N` typed at the prompt resolves N itself, so Ctrl+C
+  waits for that one resolve.
+- **The prompt is the only reader of its input (2026-10-17, review R3/R4).**
+  Bare `play`, `likes` or `playlist` at the prompt ask on the next line, and
+  get it: `app.Stdin` is the session's own line feed (`sessionInput`) while the
+  prompt runs. Before, those verbs read stdin themselves, raced the prompt's
+  scanner, lost, and the URL then ran as a command (`No help topic for
+  'https://…'`). And `play <url>` typed at the prompt plays the URL: a typed
+  line never reaches argv or shell history, so `ResolveIndexOrStdin(arg,
+  typed)` takes it as stdin would. Real argv is still refused.
+  `likes`/`playlist` still refuse a URL even at the prompt, by the
+  handle-only rule above, and that refusal's "already reached argv" wording
+  is wrong there.
 - **New daemons start at volume 50** (`--volume=50`); a reused one keeps
   whatever `vol` last set.
+- **A play session keeps an unauthenticated bridge open until q (2026-10-05
+  review, R8; dev's call 2026-10-19: document, not fix).** Any local process
+  that finds the loopback port can tunnel on the session's circuits, CONNECT
+  only. This is written up in `pkg/net/doc.go`, the INSTRUCTIONS.md Caveats
+  and the README. Per-session proxy credentials are the fix if it is ever
+  taken on. `ConnectBridge.Close()` waits for tunnels, and that wait was
+  measured 2026-10-19 on a loopback rig: 23–48ms after the `stop` that every
+  session exit sends; blocked for as long as mpv streams without one.
+- **Release files (2026-10-19, review R11).** `README.md`, `LICENSE` (MIT,
+  yngslc) and `NOTICE`, which reproduces in full the licenses of tornago (the
+  derived code in `pkg/net`) and of the four modules in the binary: urfave/cli,
+  go-md2man, blackfriday (BSD-2) and smetrics. Those texts were copied from
+  the module cache, so if a dependency changes, regenerate them from there
+  rather than by hand. `get` is `Hidden` in help until download + scrub
+  lands; it still runs (smoke's `get-stdin`).
 - **Rotation is quiet.** Re-isolating on the SOCKS port is what gives the next
   stream a fresh circuit; NEWNYM on ControlPort 9051 is a silent bonus, tried
   once per process (`TestRotateIsQuietWhenReisolationWorks`). On a tor with no
   ControlPort (this box) it used to print two lines on every retry.
+  `Rotate` holds `rotateMu`, because a background preload's retry and a
+  verb at the prompt can now rotate at the same time. **A one-shot `chainsmoke
+  rotate` from another window re-isolates its own throwaway bridge, not the
+  session's.** Without a ControlPort it does nothing for what is playing, yet
+  it still prints "the next stream gets a fresh Tor circuit". Typed at the
+  session prompt it works, because it runs in the process that holds the
+  bridge. Found 2026-10-19, not fixed.
 - **`Net.Up()` is once per process.** A play session runs several verbs, each
   calling `Up()`; a second pass would start another bridge (and maybe another
   private tor) that `Down()` never closes. `TestUpIsIdempotent` pins it.

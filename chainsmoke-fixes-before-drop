@@ -1,0 +1,41 @@
+Verification (fresh run against clean HEAD 175a252)
+check	result
+go vet ./...	clean
+go test ./... (Windows)	167 pass, 3 skip, 0 fail
+go test ./... -race (WSL)	170 pass, 0 fail, 0 data races
+smoke.ps1	40/40
+leftovers	none — no mpv/tor processes left running
+No leak, no chokepoint bypass, http_proxy intact. No CRITICAL findings. The real defects are all in the newest feature (session-mode playback), which it reproduced live in a throwaway rig rather than just reading code.
+
+The CLI-vs-TUI call
+Ship the CLI now. Build the TUI later, in this same repo — not a separate project.
+
+Why one repo: the whole architecture is one chokepoint, one Store, one Net. A second codebase would fork the security-critical parts and you'd have to re-learn every proxy-bypass lesson (no_proxy, non-literal http://, reused daemons) a second time.
+Why the CLI is close: the session prompt already is a mini interactive player — search/likes/playlist, play N, next/prev, shuffle/repeat, auto-advance announcements, np/vol/toggle/audit/rotate, nothing touching argv or shell history. What's missing is a short, contained list (below), none of it in pkg/net.
+Is the session prompt's code redundant with a future TUI? No — complementary. It already de-risked the hard parts (holding the bridge open, the queue-as-cursor model, track-change detection, egress-ledger data for a status bar). What it can't do yet: non-blocking resolves, scrollable long lists, an event-driven IPC client. The recommended move — pull listQueue out of package main into pkg/ as a model that returns values/events instead of printing — fixes the worst CLI bug and becomes the TUI's foundation at the same time.
+Fixes, sorted by severity
+HIGH
+
+R1 — the playing list isn't snapshotted. search/likes/playlist typed at the prompt (or run in another window) silently splice a different result set into what's currently playing, mid-session. Reproduced live. This is the one to fix first.
+MEDIUM
+
+R2 — playing a set URL from stdin queues 2 tracks, then tells you to run next, which fails the same way 175a252 just fixed for play N.
+R3/R4 — bare play, likes, or playlist typed at the session prompt race the prompt's own input reader for stdin and lose the URL; a URL typed at the prompt is then wrongly refused as "already in argv."
+R5 — play N stops the current track before resolving the new one, so a failed resolve leaves silence instead of keeping the old track going.
+R6 — the prompt blocks on every resolve (up to ~45s per attempt); Ctrl+C doesn't register until the resolve finishes.
+R7/R8 — docs (T0.1, TASKS.md) still describe invocations as short-lived; play is now a long-lived session owner holding an unauthenticated local proxy for hours. Needs a dated decision, not just code.
+R9/R10/R12 — stale doc claims (pkg/net/doc.go), signal handler installed too late (leaves tor's temp dir behind on Ctrl+C outside a session), and three commits of session/queue/shuffle work with no TASKS.md entries.
+R11 — release hygiene for a public CLI: no README/LICENSE/notices, no git tag, get listed in --help but always fails.
+LOW — a handful of small drift items (stale comments, rotate overclaiming effect, C1 control chars still passing Clean(), a dead tor-startup check, repeat off not always clearing loop-playlist, preload unpausing when it shouldn't).
+
+What it recommends doing first, either way
+Fix R1 (snapshot the list) and R5 (resolve-before-stop) — small, contained, in cmd/chainsmoke only.
+Fix R3/R4 (stdin race at the prompt) and R2 (set-URL-from-stdin hint).
+Write the dated dev's-conclusion amending T0.1 and INSTRUCTIONS.md:84 — pick (a)-now/(b)-later explicitly in the docs, not just in conversation.
+For the public CLI release specifically: README, LICENSE, hide get from --help, decide R8 (session-long local proxy exposure).
+Nothing has been changed in the repo — this was read-only. Want me to start on R1 and R5?
+
+
+
+Agent "Chainsmoke status review, CLI-vs-TUI" finished
+

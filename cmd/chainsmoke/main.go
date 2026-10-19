@@ -208,7 +208,7 @@ func commands(app *core.App) []*cli.Command {
 				var t core.Track
 				var err error
 				if arg != "" {
-					if t, err = app.ResolveIndexOrStdin(arg); err != nil {
+					if t, err = app.ResolveIndexOrStdin(arg, c.App.Metadata[inSession] == true); err != nil {
 						return err
 					}
 				}
@@ -216,7 +216,7 @@ func commands(app *core.App) []*cli.Command {
 					return err
 				}
 				if arg == "" {
-					if t, err = app.ResolveIndexOrStdin(""); err != nil {
+					if t, err = app.ResolveIndexOrStdin("", false); err != nil {
 						return err
 					}
 				}
@@ -235,12 +235,13 @@ func commands(app *core.App) []*cli.Command {
 						return err
 					}
 				} else {
-					q.entries = nil // a stdin URL is not from the list
+					// A URL: a track, or a set (an album, a playlist) to walk
+					// like any list (2026-10-05 review, R2).
 					entries, err := app.Res.Meta(t.Permalink)
 					if err != nil {
 						return core.YtdlpHint(err)
 					}
-					if err := app.EnqueueAhead(entries); err != nil {
+					if err := q.startList(entries); err != nil {
 						return err
 					}
 				}
@@ -261,8 +262,11 @@ func commands(app *core.App) []*cli.Command {
 			},
 		},
 		{
-			Name:      "get",
-			Aliases:   []string{"dl"},
+			Name:    "get",
+			Aliases: []string{"dl"},
+			// Hidden until download + scrub lands (TASKS.md "Deferred"): it
+			// still runs, and still answers "not implemented".
+			Hidden:    true,
 			Usage:     "Download + scrub cached result N (or stdin URL)",
 			ArgsUsage: "[N]",
 			Flags: []cli.Flag{
@@ -274,7 +278,7 @@ func commands(app *core.App) []*cli.Command {
 				if err := app.Net.Up(); err != nil {
 					return err
 				}
-				t, err := app.ResolveIndexOrStdin(c.Args().First())
+				t, err := app.ResolveIndexOrStdin(c.Args().First(), false)
 				if err != nil {
 					return err
 				}
@@ -503,8 +507,9 @@ func main() {
 		// NOT covered: signals. A running play session traps Ctrl+C and returns
 		// through here (session.go); Ctrl+C, SIGTERM or a closed terminal
 		// anywhere else skips this. The private tor still goes — its torrc
-		// names this process as owner, so it exits ~12s after we do — but its
-		// DataDirectory stays behind (T10.9; PHASE10.md Part D).
+		// names this process as owner, so it exits ~12s after we do — and its
+		// DataDirectory goes at the next private-tor spawn, which sweeps the
+		// dirs of owners that are gone (T10.9; 2026-10-05 review, R10).
 		After: func(*cli.Context) error {
 			if app.Net != nil {
 				return app.Net.Down()
