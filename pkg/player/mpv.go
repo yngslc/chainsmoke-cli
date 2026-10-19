@@ -405,13 +405,11 @@ func (p *MPV) Enqueue(streamURL, title string) error {
 	if len(opts) > 0 {
 		args = append(args, -1, opts)
 	}
-	if _, err := p.Command(args...); err != nil {
-		return err
-	}
-	// The daemon keeps pause state between invocations, so a session someone
-	// paused yesterday would swallow today's `play` silently. Unpausing is the
-	// difference between "queued" and "audible".
-	_, err := p.Command("set_property", "pause", false)
+	// No unpause here: a background preload queues through Enqueue too, and an
+	// unpause would undo the user's `pause` the moment it landed (2026-10-19
+	// review, CQ-1). Starting a track the user asked for unpauses
+	// (cmd/chainsmoke/queue.go, playAt).
+	_, err := p.Command(args...)
 	return err
 }
 
@@ -461,7 +459,10 @@ func (p *MPV) preflight(streamURL string) error {
 // explicitly and never left as ProxyFromEnvironment: ambient http_proxy must
 // not get a vote in where a chainsmoke request goes.
 func (p *MPV) httpClient() (*http.Client, error) {
-	tr := &http.Transport{Proxy: nil}
+	// No keep-alive: the client is used for one request and dropped, and an
+	// idle connection it kept would hold a tunnel through the bridge, and a
+	// Tor stream, open until the CDN closed it (CH-DEBATE 2026-10-19, D-4).
+	tr := &http.Transport{Proxy: nil, DisableKeepAlives: true}
 
 	// ProxyURL returns prose ("<down>", "DIRECT (no proxy)") when there is no
 	// proxy, so test for a real URL rather than for emptiness — the same rule

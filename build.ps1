@@ -50,7 +50,8 @@ $ldflags = "-s -w -X main.BuildVersion=$Version"
 $buildPaths = @((Get-Location).Path, $env:USERPROFILE) | ForEach-Object { $_ -replace '\\', '/' }
 
 function Build($goos, $goarch, $out) {
-    Write-Host ("building {0,-14} -> {1}" -f "$goos/$goarch", $out)
+    $target = if ($goos) { "$goos/$goarch" } else { 'this host' }
+    Write-Host ("building {0,-14} -> {1}" -f $target, $out)
     $env:CGO_ENABLED = '0'
     $env:GOOS = $goos
     $env:GOARCH = $goarch

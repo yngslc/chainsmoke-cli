@@ -1,5 +1,11 @@
 # Phase 10 — TUI (the default surface)
 
+> **Dropped from this project on 2026-10-05** (TASKS.md, Phase 10 — dev's and
+> claude's joint call): chainsmoke ships as a CLI, and the TUI becomes an
+> independent project. This plan is kept as history and as research for that
+> project. It describes the tree as it was: `EnqueueAhead`, named below, was
+> removed on 2026-10-19 (background preload in `cmd/chainsmoke/queue.go`).
+
 ## Context
 
 Bare `chainsmoke` should open a TUI; explicit verbs stay one-shot and quiet

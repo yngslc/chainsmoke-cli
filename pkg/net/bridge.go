@@ -53,6 +53,7 @@ const (
 type Bridge struct {
 	override    string         // --proxy value, if the user supplied one
 	allowDirect bool           // --allow-direct: opt in to unanonymized egress
+	private     bool           // --private: this run writes nothing to disk
 	torSocks    string         // where Tor's SOCKS listener is expected
 	proxy       string         // egress proxy URL once Up() succeeds ("" until then)
 	direct      bool           // true when nothing was reachable and we fell back
@@ -88,11 +89,14 @@ var ErrEgressNotVerified = errors.New("egress not verified — no network call m
 //	            because a test needs to be able to point at a port that is
 //	            definitively dead — otherwise the fail-closed cases only pass on
 //	            machines that happen to have no Tor.
-func New(override string, allowDirect bool, torSocks string) *Bridge {
+//	private     --private: keep the NEWNYM stamp (newnymStamp) off disk too.
+//	            The Store is not the only thing that writes, and --private
+//	            promises the run stores nothing.
+func New(override string, allowDirect bool, torSocks string, private bool) *Bridge {
 	if torSocks == "" {
 		torSocks = torSocksAddr
 	}
-	return &Bridge{override: override, allowDirect: allowDirect, torSocks: torSocks}
+	return &Bridge{override: override, allowDirect: allowDirect, torSocks: torSocks, private: private}
 }
 
 // Assert is the gate every egressing call must pass. It answers a POLICY
@@ -206,7 +210,7 @@ func (b *Bridge) Up() error {
 	// Gate 2 — a Tor SOCKS listener must exist: system tor, else one we spawn.
 	socksAddr, err := b.ensureTor()
 	if err != nil {
-		return b.fallback(fmt.Sprintf("tor could not be started: %v", err))
+		return b.fallback(err.Error())
 	}
 	if socksAddr == "" {
 		return b.fallback(fmt.Sprintf("no Tor SOCKS listener on %s", b.torSocks))
@@ -352,11 +356,20 @@ func (b *Bridge) newnym() error {
 		return err
 	}
 
-	since, recent := sinceLastNewnym()
+	// The stamp is a file, and its mtime records when you rotated: --private
+	// neither reads nor writes it, and so gets no coalescing warning
+	// (CH-DEBATE 2026-10-19, D-6).
+	var since time.Duration
+	var recent bool
+	if !b.private {
+		since, recent = sinceLastNewnym()
+	}
 	if err := c.NewNym(); err != nil {
 		return err
 	}
-	markNewnym()
+	if !b.private {
+		markNewnym()
+	}
 
 	if recent {
 		fmt.Fprintf(os.Stderr,
@@ -443,31 +456,44 @@ func (b *Bridge) ProxyURL() string {
 // ensureTor returns the SOCKS address to use, preferring a system tor and
 // spawning a private one only if none is listening. An empty address with a nil
 // error means "no tor and none could be started" — the caller decides whether
-// that is fatal (it is, unless --allow-direct).
+// that is fatal (it is, unless --allow-direct). An error is the reason no tor
+// is usable, worded for the user.
 //
 // Only the TCP listener is waited for here. Bootstrap is NOT checked: that is
 // waitUsable's job, and doing it there means the same code path covers a system
 // tor that is still warming up.
 func (b *Bridge) ensureTor() (string, error) {
-	if dialCheck(b.torSocks) == nil {
+	// Listening is not enough. Anything can hold the port — ssh -D (9050 is
+	// proxychains' default), a v2ray or shadowsocks client, a stale tunnel —
+	// and it would carry every request while audit reported TOR. Measured with
+	// a SOCKS stand-in that answered and dialled nothing (CH-DEBATE 2026-10-19,
+	// D-1).
+	listening := dialCheck(b.torSocks) == nil
+	if listening && isTorSocks(b.torSocks) {
 		return b.torSocks, nil // system tor
 	}
+	var notTor error
+	if listening {
+		notTor = fmt.Errorf("%s accepts connections but is not a Tor SocksPort", b.torSocks)
+	}
 	// A non-default --tor-socks names one specific tor (the Tor Browser's,
-	// smoke's dead 127.0.0.1:1). Nothing listening there means fail closed,
-	// not bootstrap a substitute onto the network (CH-DEBATE-2026-10-03 #3).
+	// smoke's dead 127.0.0.1:1). Nothing usable there means fail closed, not
+	// bootstrap a substitute onto the network (CH-DEBATE-2026-10-03 #3).
 	if b.torSocks != torSocksAddr {
-		return "", nil
+		return "", notTor
 	}
 	if _, err := exec.LookPath("tor"); err != nil {
-		return "", nil // nothing listening and nothing to spawn
+		return "", notTor // nothing usable listening and nothing to spawn
 	}
 
+	// Nothing listens on the default port, or something that is not tor does:
+	// either way a private tor, on ports of its own.
 	cmd, dir, socksAddr, ctrlAddr, err := spawnPrivateTor()
 	if err != nil {
 		if dir != "" {
 			_ = os.RemoveAll(dir)
 		}
-		return "", err
+		return "", fmt.Errorf("tor could not be started: %w", err)
 	}
 	b.torCmd, b.torDir, b.torCtrlAddr = cmd, dir, ctrlAddr
 
@@ -480,11 +506,34 @@ func (b *Bridge) ensureTor() (string, error) {
 			return socksAddr, nil
 		}
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			return "", fmt.Errorf("private tor exited during startup (%s)", cmd.ProcessState)
+			return "", fmt.Errorf("tor could not be started: private tor exited during startup (%s)", cmd.ProcessState)
 		}
 		time.Sleep(bootstrapPoll)
 	}
-	return "", fmt.Errorf("private tor did not open %s within %s", socksAddr, bootstrapBudget)
+	return "", fmt.Errorf("tor could not be started: private tor did not open %s within %s", socksAddr, bootstrapBudget)
+}
+
+// isTorSocks reports whether addr is a Tor SocksPort, without anything leaving
+// the machine. Spoken to in HTTP, tor answers from its own SOCKS parser — no
+// circuit, no egress — with "HTTP/1.0 501 Tor is not an HTTP Proxy" (measured
+// 2026-10-19 on this box's tor). Tor kept that status line on purpose when it
+// reworded the page in 2017 (tor bug 23678), so tools that rely on it would
+// not break. Arti's page (WRONG_PROTOCOL_PAYLOAD) says the same; that one is
+// read from its docs, not measured. ssh -D and other SOCKS servers hang up or
+// answer something else. The cost: tor logs one "Socks version 71 not
+// recognized" line per check.
+func isTorSocks(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(dialTimeout))
+	if _, err := io.WriteString(c, "GET / HTTP/1.0\r\n\r\n"); err != nil {
+		return false
+	}
+	reply, _ := io.ReadAll(io.LimitReader(c, 512))
+	return strings.Contains(strings.ToLower(string(reply)), "not an http proxy")
 }
 
 // spawnPrivateTor starts a throwaway tor with its own DataDirectory, an
@@ -533,9 +582,12 @@ const torDirPrefix = "chainsmoke-tor-p"
 // is gone. Down deletes its own, but a process that never reached Down — a
 // closed terminal, Ctrl+C while Up() was still bootstrapping, a kill — left its
 // tor's DataDirectory (keys, auth cookie, cached consensus) in the temp dir
-// for good (2026-10-05 review, R10). Only a dir whose owner is confirmed dead
-// goes: a reused pid keeps a stale dir one run longer, it never costs a live
-// one. Dirs named before the pid was in the name are left alone.
+// for good (2026-10-05 review, R10). Only a dir whose owning chainsmoke is
+// confirmed gone is deleted: a reused pid keeps a stale dir one run longer, it
+// never costs the dir of a running chainsmoke. Its tor can outlive it by ~12s
+// (privateTorrc), so a sweep inside that window deletes under a tor that is
+// about to exit anyway. Dirs named before the pid was in the name are left
+// alone.
 func sweepStaleTorDirs(tmp string) {
 	matches, _ := filepath.Glob(filepath.Join(tmp, torDirPrefix+"*"))
 	for _, dir := range matches {
@@ -605,6 +657,11 @@ type ConnectBridge struct {
 	dialer *socks5Dialer
 	wg     sync.WaitGroup
 	once   sync.Once
+
+	// ctx lives as long as the bridge. Close cancels it, which severs every
+	// tunnel and every dial still in flight (see Close).
+	ctx  context.Context
+	stop context.CancelFunc
 }
 
 // StartConnectBridge listens on an ephemeral loopback port and serves CONNECT.
@@ -617,10 +674,13 @@ func StartConnectBridge(torSocksAddr string, isolate bool) (*ConnectBridge, erro
 	if err != nil {
 		return nil, fmt.Errorf("connect bridge: listen: %w", err)
 	}
+	ctx, stop := context.WithCancel(context.Background())
 	b := &ConnectBridge{
 		ln:     ln,
 		dialer: &socks5Dialer{addr: torSocksAddr, timeout: tunnelTimeout},
 		ledger: newLedger(),
+		ctx:    ctx,
+		stop:   stop,
 	}
 	if isolate {
 		b.dialer.user = "chainsmoke"
@@ -682,6 +742,8 @@ func (b *ConnectBridge) serve() {
 
 func (b *ConnectBridge) handle(client net.Conn) {
 	defer client.Close()
+	severed := context.AfterFunc(b.ctx, func() { _ = client.Close() }) // Close() was called
+	defer severed()
 	_ = client.SetReadDeadline(time.Now().Add(tunnelTimeout))
 
 	br := bufio.NewReader(client)
@@ -691,7 +753,7 @@ func (b *ConnectBridge) handle(client net.Conn) {
 	}
 	// CONNECT only. An absolute-form GET means a child is about to push
 	// PLAINTEXT through us — refuse loudly rather than proxy it, so a leak
-	// shows up as a visible failure instead of as quiet traffic.8u
+	// shows up as a visible failure instead of as quiet traffic.
 	if req.Method != http.MethodConnect {
 		b.ledger.refuse() // T7.2: a child tried to push plaintext through us
 		_, _ = io.WriteString(client,
@@ -704,9 +766,21 @@ func (b *ConnectBridge) handle(client net.Conn) {
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		target = net.JoinHostPort(target, "443")
 	}
+	// Port 443 only. Everything chainsmoke fetches — the API, the CDN, every
+	// HLS segment — is HTTPS on 443, and plain http:// is refused above. Any
+	// other port is someone using this unauthenticated listener as a relay:
+	// SMTP on 25, IRC, plaintext HTTP inside a tunnel on 80. A play session
+	// keeps it open for as long as it lasts (pkg/net/doc.go), so those are
+	// refused (CH-DEBATE 2026-10-19, D-3).
+	if _, port, _ := net.SplitHostPort(target); port != "443" {
+		b.ledger.refuse()
+		_, _ = io.WriteString(client,
+			"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return
+	}
 	b.ledger.connect(target) // T7.2: every tunnel this process opened
 
-	ctx, cancel := context.WithTimeout(context.Background(), tunnelTimeout)
+	ctx, cancel := context.WithTimeout(b.ctx, tunnelTimeout)
 	upstream, err := b.dialer.DialContext(ctx, "tcp", target)
 	cancel()
 	if err != nil {
@@ -725,37 +799,33 @@ func (b *ConnectBridge) handle(client net.Conn) {
 	// past the header into the bufio buffer, and a client that sends optimistic
 	// data would otherwise lose its TLS ClientHello and hang.
 	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(upstream, br)
-		if tc, ok := upstream.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(client, upstream)
-		if tc, ok := client.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
+	go func() { _, _ = io.Copy(upstream, br); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
+
+	// The first direction to end ends the tunnel. Waiting for both relied on
+	// the SOCKS peer closing its side once ours was half-closed, and a peer
+	// that never did held the tunnel, and Close() behind it, open for good: on
+	// a rig with such a peer, a play whose preflight had failed stayed alive,
+	// printing nothing, for nine minutes (CH-DEBATE 2026-10-19, D-4). Nothing
+	// chainsmoke carries uses half-close, and Tor streams have none to lose.
 	<-done
+	_ = client.Close()
+	_ = upstream.Close()
 	<-done
 }
 
-// Close stops accepting and waits for in-flight tunnels.
-//
-// KNOWN LIMITATION: a live audio stream keeps this blocked. Measured 2026-10-19
-// on a loopback rig (real mpv, this bridge, a TLS origin dripping audio, a
-// SOCKS5 stand-in): after the `stop` a play session sends on q, Ctrl+C or end
-// of input, Close returns in 23–48ms, whether the upstream closes on EOF the
-// way tor does or only half-closes. With no stop it stays blocked for as long
-// as mpv streams (8s+ there) and returns 47ms after one. Every way out of a
-// session stops mpv first, so what is left is a session whose stop could not
-// reach mpv: its process then waits for the track to end.
+// Close stops accepting and severs every tunnel, then waits for their
+// goroutines, which return at once. It used to wait for tunnels to end by
+// themselves, so a live audio stream (a session whose `stop` never reached
+// mpv) or a silent exit held the process open; and this runs from main's After
+// on every exit path. Severed, not drained: the process is going away, and
+// the bridge every tunnel needs goes with it.
 func (b *ConnectBridge) Close() error {
 	var err error
-	b.once.Do(func() { err = b.ln.Close() })
+	b.once.Do(func() {
+		b.stop()
+		err = b.ln.Close()
+	})
 	b.wg.Wait()
 	return err
 }

@@ -166,8 +166,8 @@ func TestAuthenticateNullAuth(t *testing.T) {
 // TestUnescapeCString: a Windows cookie path arrives with doubled backslashes.
 // Leaving them in place means the cookie file is never found.
 func TestUnescapeCString(t *testing.T) {
-	got := unescapeCString(`C:\\Users\\der3t\\tor\\control_auth_cookie`)
-	want := `C:\Users\der3t\tor\control_auth_cookie`
+	got := unescapeCString(`C:\\Users\\someone\\tor\\control_auth_cookie`)
+	want := `C:\Users\someone\tor\control_auth_cookie`
 	if got != want {
 		t.Errorf("unescapeCString = %q, want %q", got, want)
 	}
@@ -257,6 +257,28 @@ func TestRotateIsQuietWhenReisolationWorks(t *testing.T) {
 	}
 }
 
+// TestPrivateWritesNoNewnymStamp: --private promises the run writes nothing,
+// and the NEWNYM stamp is a file whose mtime records when you rotated. It was
+// written anyway, from pkg/net, out of sight of the Store's own --private test
+// (CH-DEBATE 2026-10-19, D-6). Without --private it is written, which shows
+// this test would see it.
+func TestPrivateWritesNoNewnymStamp(t *testing.T) {
+	ctrl := fakeControl(t, map[string]string{
+		"PROTOCOLINFO": "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=NULL\r\n250 OK\r\n",
+	})
+	for _, private := range []bool{true, false} {
+		t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+		b := &Bridge{private: private, torCtrlAddr: ctrl}
+		if err := b.newnym(); err != nil {
+			t.Fatalf("private=%v: newnym() = %v", private, err)
+		}
+		_, err := os.Stat(newnymStamp())
+		if written := err == nil; written == private {
+			t.Errorf("private=%v: stamp written = %v", private, written)
+		}
+	}
+}
+
 // TestProxyErrorsNeverEchoCredentials: a --proxy URL can carry a password, and
 // every refusal used to repeat the value verbatim, putting it on the terminal
 // (measured 2026-10-03, CH-DEBATE-2026-10-03 #8).
@@ -274,7 +296,7 @@ func TestProxyErrorsNeverEchoCredentials(t *testing.T) {
 	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
 		t.Setenv(k, "")
 	}
-	if err := New("http://alice:s3cretpw@127.0.0.1:1", false, "127.0.0.1:1").Up(); err == nil ||
+	if err := New("http://alice:s3cretpw@127.0.0.1:1", false, "127.0.0.1:1", false).Up(); err == nil ||
 		strings.Contains(err.Error(), "s3cretpw") {
 		t.Errorf("Up() with an unreachable --proxy = %v, want a refusal without the password", err)
 	}
@@ -290,7 +312,7 @@ func TestOverrideIsStoredWithALowercaseScheme(t *testing.T) {
 		t.Setenv(k, "") // Up() exports the proxy; give the test process its own values back
 	}
 	addr := connectStub(t, "HTTP/1.1 200 Connection established\r\n\r\n")
-	b := New("HTTP://"+addr, false, "127.0.0.1:1")
+	b := New("HTTP://"+addr, false, "127.0.0.1:1", false)
 	if err := b.Up(); err != nil {
 		t.Fatalf("Up() = %v", err)
 	}

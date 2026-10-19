@@ -275,10 +275,202 @@ func TestNamedTorSocksNeverSpawnsATor(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	err := New("", false, "127.0.0.1:1").Up()
+	err := New("", false, "127.0.0.1:1", false).Up()
 	if err == nil || strings.Contains(err.Error(), "tor could not be started") ||
 		!strings.Contains(err.Error(), "no Tor SOCKS listener") {
 		t.Errorf("Up() with --tor-socks 127.0.0.1:1 = %v, want a fail-closed refusal that never tried to spawn tor", err)
+	}
+}
+
+// listenWith answers every connection with reply, after reading what the client
+// sent, and hangs up. An empty reply is a server that just hangs up.
+func listenWith(t *testing.T, reply string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(time.Second))
+				_, _ = c.Read(make([]byte, 64))
+				_, _ = io.WriteString(c, reply)
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// torHTTPReply is how a real tor SocksPort answers HTTP — the start of it, as
+// measured 2026-10-19 on this box's tor.
+const torHTTPReply = "HTTP/1.0 501 Tor is not an HTTP Proxy\r\nContent-Type: text/html; charset=iso-8859-1\r\n\r\n<html>"
+
+// TestIsTorSocksKnowsTorFromOtherListeners: something listening on the tor
+// port used to be all the proof of tor there was, so ssh -D, a v2ray client or
+// a stale tunnel on 9050 carried every request while audit said TOR
+// (CH-DEBATE 2026-10-19, D-1). Tor identifies itself, locally, when spoken to
+// in HTTP; the others hang up or answer something else.
+func TestIsTorSocksKnowsTorFromOtherListeners(t *testing.T) {
+	for _, tc := range []struct {
+		name, addr string
+		want       bool
+	}{
+		{"tor", listenWith(t, torHTTPReply), true},
+		{"a SOCKS-only server, like ssh -D, hanging up", listenWith(t, ""), false},
+		{"an HTTP proxy, like a v2ray mixed port", listenWith(t, "HTTP/1.1 400 Bad Request\r\n\r\n"), false},
+	} {
+		if got := isTorSocks(tc.addr); got != tc.want {
+			t.Errorf("%s: isTorSocks = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestUpRefusesASocksListenerThatIsNotTor: fail closed, and say why — "no
+// listener" would send the user looking for a tor that is not the problem.
+func TestUpRefusesASocksListenerThatIsNotTor(t *testing.T) {
+	err := New("", false, listenWith(t, ""), false).Up()
+	if err == nil || !strings.Contains(err.Error(), "is not a Tor SocksPort") ||
+		!strings.Contains(err.Error(), "refusing") {
+		t.Errorf("Up() through a listener that is not tor = %v, want a fail-closed refusal naming it", err)
+	}
+}
+
+// TestBridgeCarriesPort443Only: a play session holds the bridge open,
+// unauthenticated, until q, and it used to tunnel to any port for anyone —
+// SMTP, IRC, plaintext HTTP inside the tunnel (CH-DEBATE 2026-10-19, D-3,
+// measured on the real bridge). Everything chainsmoke fetches is on 443.
+func TestBridgeCarriesPort443Only(t *testing.T) {
+	cb, err := StartConnectBridge(newFakeSocks(t, false).addr(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cb.Close()
+
+	for _, target := range []string{"smtp.example.com:25", "irc.example.com:6667", "evil.example.com:80"} {
+		if got := connectVia(t, cb, "CONNECT "+target+" HTTP/1.1\r\nHost: "+target+"\r\n\r\n"); got != http.StatusForbidden {
+			t.Errorf("CONNECT %s = %d, want %d", target, got, http.StatusForbidden)
+		}
+	}
+	if got := connectVia(t, cb, "CONNECT api-v2.soundcloud.com:443 HTTP/1.1\r\nHost: api-v2.soundcloud.com:443\r\n\r\n"); got != http.StatusOK {
+		t.Errorf("CONNECT to 443 = %d, want 200", got)
+	}
+	if got := connectVia(t, cb, "CONNECT api-v2.soundcloud.com HTTP/1.1\r\nHost: api-v2.soundcloud.com\r\n\r\n"); got != http.StatusOK {
+		t.Errorf("CONNECT with no port (443) = %d, want 200", got)
+	}
+	if l := cb.ledger.snapshot(); l.Refused != 3 || len(l.Targets) != 1 {
+		t.Errorf("ledger: %d refused, targets %v — want 3 refused and only the 443 target", l.Refused, l.Targets)
+	}
+}
+
+// deafSocks grants every CONNECT and then never closes its side, not even
+// after ours is gone: the peer that waiting on both directions of a tunnel
+// depended on never meeting. It lets go when the test ends.
+func deafSocks(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quit := make(chan struct{})
+	t.Cleanup(func() { close(quit); _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 262)
+				if _, err := io.ReadFull(c, buf[:2]); err != nil { // greeting
+					return
+				}
+				if _, err := io.ReadFull(c, buf[:buf[1]]); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte{0x05, 0x00})
+				if _, err := io.ReadFull(c, buf[:5]); err != nil { // CONNECT, ATYP=0x03
+					return
+				}
+				if _, err := io.ReadFull(c, buf[:int(buf[4])+2]); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+				_, _ = io.Copy(io.Discard, c) // reads to the end...
+				<-quit                        // ...and still never closes
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestTunnelEndsAtTheFirstEOF: once the client is done — mpv stopped, a
+// preflight timed out — the tunnel ends, whatever the peer does. It used to
+// wait for both directions, and against a peer that never closed it never
+// ended (CH-DEBATE 2026-10-19, D-4).
+func TestTunnelEndsAtTheFirstEOF(t *testing.T) {
+	cb, err := StartConnectBridge(deafSocks(t), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cb.Close()
+
+	ours, theirs := net.Pipe()
+	returned := make(chan struct{})
+	go func() { cb.handle(theirs); close(returned) }()
+	if _, err := io.WriteString(ours, "CONNECT cdn.example.net:443 HTTP/1.1\r\nHost: cdn.example.net:443\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := bufio.NewReader(ours).ReadString('\n'); err != nil || !strings.Contains(line, "200") {
+		t.Fatalf("CONNECT answered %q, %v", line, err)
+	}
+	_ = ours.Close()
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the tunnel outlived its client, waiting on a peer that never closes")
+	}
+}
+
+// TestCloseSeversLiveTunnels: Close runs on every exit path, from main's
+// After. It used to wait for tunnels to end on their own, so a stream still
+// playing — a session whose stop never reached mpv — held the process open.
+func TestCloseSeversLiveTunnels(t *testing.T) {
+	cb, err := StartConnectBridge(deafSocks(t), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.Dial("tcp", strings.TrimPrefix(cb.ProxyURL(), "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, "CONNECT cdn.example.net:443 HTTP/1.1\r\nHost: cdn.example.net:443\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(c)
+	if line, err := br.ReadString('\n'); err != nil || !strings.Contains(line, "200") {
+		t.Fatalf("CONNECT answered %q, %v", line, err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- cb.Close() }() // the client is still connected
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() waited on a live tunnel instead of severing it")
+	}
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		t.Errorf("the client was not cut off when the bridge closed: %v", err)
 	}
 }
 

@@ -5,6 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -575,4 +580,111 @@ func TestNotFoundIsNotRetried(t *testing.T) {
 	if retry, rotate := retryPlan(blocked, 20*time.Second); !retry || !rotate {
 		t.Errorf("retryPlan(403) = retry:%v rotate:%v, want both true", retry, rotate)
 	}
+}
+
+// TestTargetsReachYtdlpOnStdinNotArgv: every resolve put its target in
+// yt-dlp's argv, which any local user can read — the README promised track
+// URLs never reach a command line, and this was the line they reached
+// (2026-10-19 review, A-1; CH-DEBATE 2026-10-19, D-2). Each call shape must
+// end in the "-- <target>" tail that execOnce moves onto stdin.
+func TestTargetsReachYtdlpOnStdinNotArgv(t *testing.T) {
+	r := New(&fakeNet{}, "")
+	var got [][]string
+	r.invoke = func(_ context.Context, args []string) ([]byte, error) {
+		got = append(got, args)
+		if slices.Contains(args, "-g") {
+			return []byte("https://cdn.example/signed\n"), nil
+		}
+		return []byte(`{"_type":"playlist","entries":[{"id":"1","title":"t","webpage_url":"https://soundcloud.com/a/b"}]}`), nil
+	}
+	targets := []string{"https://soundcloud.com/someone/likes", "https://soundcloud.com/a/private-track", "scsearch5:some term"}
+	if _, err := r.Meta(targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Stream(targets[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Search("some term", 5); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, args := range got {
+		rest, stdin, err := targetOnStdin(args)
+		if err != nil {
+			t.Fatalf("call %d %v: %v", i, args, err)
+		}
+		if stdin != targets[i]+"\n" {
+			t.Errorf("call %d: stdin = %q, want %q", i, stdin, targets[i]+"\n")
+		}
+		if slices.Contains(rest, targets[i]) || !slices.Equal(rest[len(rest)-2:], []string{"--batch-file", "-"}) {
+			t.Errorf("call %d: argv %v still carries the target, or does not read it from stdin", i, rest)
+		}
+	}
+
+	if _, _, err := targetOnStdin([]string{"-J", "--", "scsearch5:a\nhttps://elsewhere"}); err == nil {
+		t.Error("a target with a newline went through — a batch file would read it as two")
+	}
+}
+
+// TestStdinBannerIsNotTheReason: with --batch-file -, yt-dlp opens stderr
+// with "Reading URLs from STDIN…". firstLine must still find the real line.
+func TestStdinBannerIsNotTheReason(t *testing.T) {
+	stderr := "Reading URLs from STDIN - EOF (Ctrl+Z) to end:\nsomething went wrong\n"
+	if got := firstLine(withoutStdinBanner(stderr)); got != "something went wrong" {
+		t.Errorf("firstLine = %q, want the line after the banner", got)
+	}
+}
+
+// TestExecOnceKeepsTheTargetOutOfArgv runs the real exec path against a
+// stand-in yt-dlp — a copy of this test binary (TestMain) — the way the
+// debater measured the leak: what did the child's argv carry?
+func TestExecOnceKeepsTheTargetOutOfArgv(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, name := t.TempDir(), "yt-dlp"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	const permalink = "https://soundcloud.com/a/private-track"
+	got, err := New(&fakeNet{proxy: "http://127.0.0.1:1"}, "").Stream(permalink)
+	if err != nil || got != "https://cdn.example/signed" {
+		t.Fatalf("Stream through the stand-in = %q, %v", got, err)
+	}
+	report, err := os.ReadFile(filepath.Join(dir, "report"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv, stdin, _ := strings.Cut(string(report), "\n")
+	if strings.Contains(argv, "private-track") {
+		t.Errorf("yt-dlp's argv carried the permalink: %s", argv)
+	}
+	if stdin != permalink+"\n" {
+		t.Errorf("yt-dlp's stdin = %q, want the permalink", stdin)
+	}
+}
+
+// TestMain doubles as the stand-in yt-dlp for TestExecOnceKeepsTheTargetOutOfArgv.
+// It knows itself by its name, not by an environment variable: minimalEnv
+// hands yt-dlp nothing it does not list. It writes its argv and its stdin
+// beside itself, and prints a stream URL as `yt-dlp -g` would.
+func TestMain(m *testing.M) {
+	if exe, err := os.Executable(); err == nil && strings.HasPrefix(filepath.Base(exe), "yt-dlp") {
+		in, _ := io.ReadAll(os.Stdin)
+		report := strings.Join(os.Args[1:], " ") + "\n" + string(in)
+		_ = os.WriteFile(filepath.Join(filepath.Dir(exe), "report"), []byte(report), 0o600)
+		fmt.Println("https://cdn.example/signed")
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
 }

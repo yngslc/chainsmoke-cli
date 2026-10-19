@@ -116,7 +116,12 @@ func (q *listQueue) playAt(list []core.Track, n int) error {
 
 // switchToLast makes the entry just appended the one playing and drops the
 // rest of mpv's playlist. Measured on mpv 0.41: after playlist-play-index,
-// playlist-clear keeps exactly the new entry, and it plays.
+// playlist-clear keeps exactly the new entry, and it plays — unless the
+// daemon is paused: it keeps pause state between sessions, so one paused
+// yesterday would swallow today's `play` silently. So it unpauses too. Only
+// here, where the user asked for this track: a background preload that
+// unpaused undid the user's `pause` the moment it landed (2026-10-19 review,
+// CQ-1).
 func (q *listQueue) switchToLast() error {
 	v, err := q.app.Play.Command("get_property", "playlist-count")
 	count, ok := v.(float64)
@@ -129,7 +134,10 @@ func (q *listQueue) switchToLast() error {
 			return err
 		}
 	}
-	_, err = q.app.Play.Command("playlist-clear")
+	if _, err := q.app.Play.Command("playlist-clear"); err != nil {
+		return err
+	}
+	_, err = q.app.Play.Command("set_property", "pause", false)
 	return err
 }
 

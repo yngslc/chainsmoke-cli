@@ -33,7 +33,7 @@ type Config struct {
 	// so a later audit can say "this worked as TOR when you saved it, and you
 	// are DIRECT now" rather than merely "a field changed".
 	SavedAt      time.Time `json:"saved_at"`
-	SavedPosture string    `json:"saved_posture"` // "TOR" or "DIRECT"
+	SavedPosture string    `json:"saved_posture"` // "TOR", "PROXY" or "DIRECT"
 }
 
 // configFile is the on-disk name. JSON rather than the TOML in INSTRUCTIONS.md
@@ -87,7 +87,10 @@ func LoadConfig() (cfg Config, exists bool, err error) {
 func SaveConfig(cfg Config, verified bool) error {
 	cfg.SavedAt = time.Now().UTC()
 	cfg.SavedPosture = "DIRECT"
-	if verified {
+	switch {
+	case verified && cfg.Proxy != "":
+		cfg.SavedPosture = "PROXY" // verified, but not proven to be Tor (Audit)
+	case verified:
 		cfg.SavedPosture = "TOR"
 	}
 

@@ -304,26 +304,71 @@ func (r *YTDLP) execOnce(ctx context.Context, args []string) ([]byte, error) {
 		base = append(base, "--impersonate", r.impersonate)
 	}
 
+	args, target, err := targetOnStdin(args)
+	if err != nil {
+		return nil, err
+	}
+
 	// exec.CommandContext takes an explicit []string, so no value of permalink,
 	// search term or impersonate can change the argument count — the
 	// word-splitting bug class shellcheck flagged three times in script.sh
 	// cannot exist here.
 	cmd := exec.CommandContext(ctx, "yt-dlp", append(base, args...)...)
 	cmd.Env = minimalEnv()
+	cmd.Stdin = strings.NewReader(target)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 
-	if err := cmd.Run(); err != nil {
-		return nil, classify(ctx, err, stderr.String())
+	runErr := cmd.Run()
+	errText := withoutStdinBanner(stderr.String())
+	if runErr != nil {
+		return nil, classify(ctx, runErr, errText)
 	}
 	if stdout.Len() == 0 {
-		if why := firstLine(stderr.String()); why != "" {
+		if why := firstLine(errText); why != "" {
 			return nil, fmt.Errorf("yt-dlp exited 0 but produced no output: %s", why)
 		}
 		return nil, errors.New("yt-dlp exited 0 but produced no output")
 	}
 	return stdout.Bytes(), nil
+}
+
+// targetOnStdin moves the target — a page URL, a permalink, or
+// scsearchN:<term>, always last and after "--" — out of yt-dlp's argv and onto
+// its stdin, as a one-line batch file (--batch-file -). A child's argv is as
+// readable as ours: /proc/<pid>/cmdline is world-readable on Linux, so every
+// resolve published which track was about to play, for as long as it ran
+// (2026-10-19 review, A-1; CH-DEBATE 2026-10-19, D-2, measured with a stand-in
+// yt-dlp). Measured the same day against a loopback origin: -J and -g print
+// byte-identical output either way. A batch file also never reads its input
+// as a flag, which is what the "--" was for.
+func targetOnStdin(args []string) (rest []string, stdin string, err error) {
+	n := len(args)
+	if n < 2 || args[n-2] != "--" {
+		return nil, "", errors.New("internal: yt-dlp call without a `-- <target>` tail")
+	}
+	target := args[n-1]
+	if strings.ContainsAny(target, "\r\n") {
+		return nil, "", errors.New("yt-dlp input spans more than one line") // a batch file would read two
+	}
+	return append(args[:n-2:n-2], "--batch-file", "-"), target + "\n", nil
+}
+
+// stdinBanner starts the line yt-dlp writes to stderr whenever it reads a
+// batch file from stdin ("Reading URLs from STDIN - EOF (Ctrl+Z) to end:").
+const stdinBanner = "Reading URLs from STDIN"
+
+// withoutStdinBanner drops that line, which is noise: firstLine would offer it
+// as the reason a silent failure failed.
+func withoutStdinBanner(stderr string) string {
+	var b strings.Builder
+	for _, ln := range strings.SplitAfter(stderr, "\n") {
+		if !strings.HasPrefix(ln, stdinBanner) {
+			b.WriteString(ln)
+		}
+	}
+	return b.String()
 }
 
 // minimalEnv hands yt-dlp an explicit environment instead of inheriting ours.

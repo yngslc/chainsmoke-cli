@@ -118,20 +118,23 @@ func cleanHandle(s, what string) (string, error) {
 }
 
 // rejectIfURL turns "I pasted the whole URL" into the invariant-#3 message
-// rather than a puzzling character complaint, and does it for the same reason
-// ResolveIndexOrStdin does: by the time we see it, argv already has it.
+// rather than a puzzling character complaint. The same check runs on an
+// argument, a piped line and a line typed at the session prompt, so the
+// message says which of those exposed it: it used to tell all three that the
+// URL "already reached" the process list (2026-10-19 review, Fix 6). It does
+// not echo the URL back.
 func rejectIfURL(s, what string) error {
 	low := strings.ToLower(s)
 	if !strings.Contains(low, "://") && !strings.HasPrefix(low, "soundcloud.com") && !strings.HasPrefix(low, "www.") {
 		return nil
 	}
 	return fmt.Errorf(
-		"URLs are not accepted in argv — the OS process list is world-readable,\n"+
-			"and this one already reached it. Treat %q as exposed.\n\n"+
-			"  chainsmoke likes ghostinnafurcoat            # the handle alone is enough\n"+
-			"  chainsmoke playlist ghostinnafurcoat/chill   # <user>/<set>\n"+
-			"  chainsmoke likes < handle.txt                # for scripts",
-		s)
+		"likes and playlist take a handle, not a URL (URLs are not accepted in argv).\n" +
+			"Passed as an argument, a URL is in the OS process list, which is world-readable:\n" +
+			"treat that one as exposed. Typed at the prompt or piped in, it is not.\n\n" +
+			"  chainsmoke likes ghostinnafurcoat            # the handle alone is enough\n" +
+			"  chainsmoke playlist ghostinnafurcoat/chill   # <user>/<set>\n" +
+			"  chainsmoke likes < handle.txt                # for scripts")
 }
 
 // HandleOrStdin is the likes/playlist counterpart to ResolveIndexOrStdin: take

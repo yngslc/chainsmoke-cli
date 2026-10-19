@@ -95,7 +95,7 @@ and output against the current baseline:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .claude\skills\run-chainsmoke\smoke.ps1
-# → PASS x40, "smoke: all 40 cases pass", exit 0
+# → PASS x41, "smoke: all 41 cases pass", exit 0
 ```
 
 **When you implement a subsystem, flip the corresponding expectations in the
@@ -106,7 +106,7 @@ Verified behavior baseline (what the carcass does today):
 | invocation | exit | behavior |
 |---|---|---|
 | `.\chainsmoke.exe --help` | 0 | full command/flag table |
-| `.\chainsmoke.exe` (bare, piped) | 0 | the same command table — smoke's `bare-pipe`. T10.1 routes a bare TTY run to the TUI; this row must not change |
+| `.\chainsmoke.exe` (bare, piped) | 0 | the same command table — smoke's `bare-pipe`. Permanent now: the TUI that would have taken a bare TTY run left this project (2026-10-05) |
 | `.\chainsmoke.exe --version` | 0 | `chainsmoke version development` |
 | `.\chainsmoke.exe search kendrick` | 0/1 | real scsearch through the chokepoint (T3.3) — needs egress; fails closed without it. Prints the T8.1 table on a TTY, TSV down a pipe |
 | `.\chainsmoke.exe likes <user>` | 0/1 | `/likes` page through Meta (T8.2); handle validated BEFORE `Net.Up()`, so a typo costs no circuit |
@@ -120,7 +120,7 @@ Verified behavior baseline (what the carcass does today):
 | `"https://soundcloud.com/artist/track" \| .\chainsmoke.exe get` | 1 | stdin URL is read (no-URLs-in-argv contract), then dies in the scrubber stub |
 | `.\chainsmoke.exe purge` | 0 | really wipes both stores now (T4.4): runtime + state dirs, with the player taken down first |
 | `.\chainsmoke.exe stop` | 0 | mpv `stop`: clears the queue and ends playback, daemon stays up (T5.5). Killing the daemon is `daemon stop`, which sends `quit` |
-| `.\chainsmoke.exe audit` | 1 | probes, never prints config (T7.1). Reports posture (TOR / DIRECT / DOWN), proxy, impersonate, store mode + cached count, drift against the saved config, the egress ledger (T7.2), and local DNS. Exit 1 whenever the setup is not healthy |
+| `.\chainsmoke.exe audit` | 1 | probes, never prints config (T7.1). Reports posture (TOR / PROXY / DIRECT / DOWN), proxy, impersonate, store mode + cached count, drift against the saved config, the egress ledger (T7.2), and local DNS. Exit 1 whenever the setup is not healthy |
 | `.\chainsmoke.exe audit --save` | 0/1 | records this run's egress settings with the posture the probe PROVED. Exit still tracks the audit, not the save — with Tor up it is 0, on a DIRECT run it saves, warns, and exits 1 |
 | `.\chainsmoke.exe seek` / `vol 900` | 1 | arity/range rejected before mpv ever sees the argument |
 | `.\chainsmoke.exe bogus` | 3 | `No help topic for 'bogus'` |
@@ -154,7 +154,7 @@ fails closed unless `--allow-direct` is passed.
 
 ```powershell
 go vet ./...    # clean, exit 0
-go test ./...   # 173 passing: core 47, net 37, resolver 23, player 22, store 14, cmd 30 (+3 unix-only, skipped on Windows; WSL -race runs all 176, 0 races, 2026-10-19)
+go test ./...   # 186 passing: core 47, net 43, resolver 26, player 22, store 14, cmd 34 (+3 unix-only, skipped on Windows; WSL -race runs all 189, 0 races, 2026-10-20)
 ```
 
 **The integration suite is separate and opt-in** (T9.2). Five tests behind
@@ -237,14 +237,18 @@ prove help, `--version` and TAB never print the art.
   (`pkg/resolver/ytdlp.go:29-31`): one completed in 22.9s, every other one
   stalled. Treat it as "most circuits fail SoundCloud", not a precise rate
   (n=6; this line said "1 in 3" until 2026-10-01).
-- **`rotate` now brings egress up first.** Without a live bridge there is
-  nothing to re-isolate, and on a system tor with no ControlPort (this box) the
-  verb used to fail outright. It now exits 0 and says which half it managed.
+- **`rotate` re-isolates only at the session prompt (2026-10-19).** There it
+  re-isolates the session's own bridge (plus NEWNYM when tor has a
+  ControlPort). On its own it used to bring up a bridge of its own, re-isolate
+  that and exit 0, saying the next stream had a fresh circuit while nothing
+  playing changed (review A-3). Now it sends NEWNYM only, with no `Up()`, and
+  on a tor with no ControlPort (this box) it exits 1 pointing at the prompt.
+  `TestRotateOnItsOwnBuildsNoBridge`.
 - **The IPC client is real, and it is synchronous (T5.2).** One connection,
   `request_id` correlation, async events discarded — see `pkg/player/mpv.go`.
-  It is NOT safe for concurrent use and does not need to be under T0.1(a). The
-  TUI's event-while-idle client (T10.7) is a second implementation behind the
-  same `Command` seam, not a change to this one.
+  It is NOT safe for concurrent use, so only the session goroutine touches it:
+  a background preload resolves, and hands the URL back to be queued there
+  (`queue.go`, `landed`).
 - **`daemon start` leaves mpv running, and `stop` deliberately does not kill
   it.** `stop` is mpv's own `stop` (queue cleared, session kept); `daemon stop`
   is what sends `quit` (T5.5). **Until 2026-09-28 `daemon stop` and `purge` were
@@ -271,10 +275,13 @@ prove help, `--version` and TAB never print the art.
   when the thing it diagnoses is broken is useless. It prints the report and
   then returns the failure, so the exit code is unchanged — do not "fix" the
   non-zero exit by making the report a success.
-- **Posture has THREE states, not two.** `TOR` (verified), `DIRECT` (permitted
-  by `--allow-direct`, unanonymized), and `DOWN` (nothing permitted to leave —
-  `Assert()` fails). Collapsing the last two tells a user their traffic is
-  leaking when it is in fact being refused.
+- **Posture has FOUR states.** `TOR` (verified, through a listener that
+  identified as tor), `PROXY` (verified through `--proxy` — something answered,
+  not proven Tor), `DIRECT` (permitted by `--allow-direct`, unanonymized), and
+  `DOWN` (nothing permitted to leave — `Assert()` fails). Collapsing DIRECT and
+  DOWN tells a user their traffic is leaking when it is in fact being refused;
+  calling PROXY `TOR` told a user they were on Tor through a proxy that dialled
+  nothing (CH-DEBATE 2026-10-19, D-1). `audit --save` records `PROXY` too.
 - **`audit --save` writes to the real config dir, so tests must sandbox it.**
   `%APPDATA%\chainsmoke\config.json` (or `$XDG_CONFIG_HOME`). smoke.ps1 points
   `XDG_CONFIG_HOME` at a temp sandbox it wipes at startup — without that, the
@@ -346,7 +353,10 @@ prove help, `--version` and TAB never print the art.
   never saw), a tab would wreck the TSV, an ESC would repaint the terminal.
   `core.Clean()` in `pkg/core/table.go` handles it; `TestCleanRejectsHostileTitles`
   is the guard. Since 2026-10-01 it also covers the two other places a title
-  reaches the terminal, the `▶` line and `np` (09/09 review, CQ-4).
+  reaches the terminal, the `▶` line and `np` (09/09 review, CQ-4). Since
+  2026-10-19 it also drops the C1 controls (0x9b is CSI in one character),
+  bidi embeddings, overrides and isolates, and turns NEL, U+2028 and U+2029
+  into spaces. LRM/RLM marks stay, because right-to-left titles need them.
 - **`likes`/`playlist` take a HANDLE, never a URL**, and that is the deliberate
   line: a handle is the same exposure as `search <term>`, a track URL is not
   (invariant #3). `cleanHandle`'s allowlist is also the reason the URL handed to
@@ -466,36 +476,70 @@ prove help, `--version` and TAB never print the art.
   line never reaches argv or shell history, so `ResolveIndexOrStdin(arg,
   typed)` takes it as stdin would. Real argv is still refused.
   `likes`/`playlist` still refuse a URL even at the prompt, by the
-  handle-only rule above, and that refusal's "already reached argv" wording
-  is wrong there.
+  handle-only rule above; since 2026-10-19 the refusal says only an argument
+  is exposed, and no longer echoes the URL back.
 - **New daemons start at volume 50** (`--volume=50`); a reused one keeps
   whatever `vol` last set.
 - **A play session keeps an unauthenticated bridge open until q (2026-10-05
   review, R8; dev's call 2026-10-19: document, not fix).** Any local process
-  that finds the loopback port can tunnel on the session's circuits, CONNECT
-  only. This is written up in `pkg/net/doc.go`, the INSTRUCTIONS.md Caveats
-  and the README. Per-session proxy credentials are the fix if it is ever
-  taken on. `ConnectBridge.Close()` waits for tunnels, and that wait was
-  measured 2026-10-19 on a loopback rig: 23–48ms after the `stop` that every
-  session exit sends; blocked for as long as mpv streams without one.
+  can tunnel through the loopback port, on the session's own circuit and exit
+  (every tunnel carries the same isolation credentials). It is written up in
+  `pkg/net/doc.go`, the INSTRUCTIONS.md Caveats and the README. Per-session
+  proxy credentials are the fix if it is ever taken on. **Port 443 only since
+  2026-10-19** (CH-DEBATE D-3, `TestBridgeCarriesPort443Only`): before, it
+  tunnelled SMTP, IRC and plaintext HTTP for anyone. A host allowlist was
+  weighed and left out: it would silence playback the day SoundCloud moves to
+  a new domain, as it did to soundcloud.cloud.
+- **A tunnel ends at its first EOF, and `ConnectBridge.Close()` severs
+  (2026-10-19, CH-DEBATE D-4).** `handle()` used to wait for both directions,
+  relying on the SOCKS peer to close after our half-close; a peer that never
+  did kept the tunnel and `Close()` open for good (a rig `play` sat silent for
+  nine minutes). `Close()`, which main's `After` runs on every exit path, used
+  to drain tunnels; it now cancels the bridge's context, which closes every
+  client and stops every dial. The preflight transport has keep-alive off, so
+  each preflight's tunnel ends with its request. `TestTunnelEndsAtTheFirstEOF`,
+  `TestCloseSeversLiveTunnels`.
+- **Gate 2 checks the listener is tor (2026-10-19, CH-DEBATE D-1).** A TCP
+  connect used to be the whole test, so `ssh -D`, a v2ray client or a stale
+  tunnel on 9050 got every request, and audit said TOR. `isTorSocks` sends
+  `GET /` to the SOCKS port: tor answers `HTTP/1.0 501 Tor is not an HTTP
+  Proxy` from its own parser, no circuit (measured on this box's tor). Anything
+  else on a named `--tor-socks` fails closed; on the default port, with tor on
+  PATH, a private tor is spawned instead. Each check costs one line in tor's
+  log ("Socks version 71 not recognized"). Arti is untested.
+- **yt-dlp reads its target on stdin (2026-10-19, CH-DEBATE D-2).** Every call
+  ends in `-- <target>`, and `execOnce` turns that tail into `--batch-file -`,
+  because a child's argv is as readable as ours. Measured: `-J` and `-g` print
+  identical output either way. yt-dlp then opens stderr with "Reading URLs from
+  STDIN…", which `withoutStdinBanner` drops before `classify`. A new call
+  without the tail fails loudly rather than leak. `TestExecOnceKeepsTheTargetOutOfArgv`
+  runs a stand-in yt-dlp, which knows itself by its file name, because
+  `minimalEnv` strips any variable a test could set.
+- **`--private` writes no NEWNYM stamp (2026-10-19, CH-DEBATE D-6).** The stamp
+  (`last-newnym` in the runtime dir) is written by `pkg/net`, out of the
+  Store's sight; its mtime records when you rotated. `TestPrivateWritesNoNewnymStamp`.
+- **Only a track the user asked for unpauses (2026-10-19, review CQ-1).**
+  `Enqueue` used to unpause, and a background preload goes through `Enqueue`:
+  a `pause` came undone the moment it landed. The unpause is in `switchToLast`
+  now.
+- **The prompt refuses `notAtThePrompt` verbs (2026-10-19).** The list only
+  filtered the hint, so `purge` at the prompt wiped both stores mid-session.
+  Aliases are mapped first (`dl` is `get`).
 - **Release files (2026-10-19, review R11).** `README.md`, `LICENSE` (MIT,
   yngslc) and `NOTICE`, which reproduces in full the licenses of tornago (the
   derived code in `pkg/net`) and of the four modules in the binary: urfave/cli,
   go-md2man, blackfriday (BSD-2) and smetrics. Those texts were copied from
   the module cache, so if a dependency changes, regenerate them from there
   rather than by hand. `get` is `Hidden` in help until download + scrub
-  lands; it still runs (smoke's `get-stdin`).
+  lands; it still runs (smoke's `get-stdin`), and help must not list it
+  (smoke's `help-no-get`).
 - **Rotation is quiet.** Re-isolating on the SOCKS port is what gives the next
   stream a fresh circuit; NEWNYM on ControlPort 9051 is a silent bonus, tried
   once per process (`TestRotateIsQuietWhenReisolationWorks`). On a tor with no
   ControlPort (this box) it used to print two lines on every retry.
   `Rotate` holds `rotateMu`, because a background preload's retry and a
-  verb at the prompt can now rotate at the same time. **A one-shot `chainsmoke
-  rotate` from another window re-isolates its own throwaway bridge, not the
-  session's.** Without a ControlPort it does nothing for what is playing, yet
-  it still prints "the next stream gets a fresh Tor circuit". Typed at the
-  session prompt it works, because it runs in the process that holds the
-  bridge. Found 2026-10-19, not fixed.
+  verb at the prompt can now rotate at the same time. The `rotate` verb on
+  its own sends NEWNYM only (see the `rotate` gotcha above).
 - **`Net.Up()` is once per process.** A play session runs several verbs, each
   calling `Up()`; a second pass would start another bridge (and maybe another
   private tor) that `Down()` never closes. `TestUpIsIdempotent` pins it.
@@ -505,7 +549,8 @@ prove help, `--version` and TAB never print the art.
   already returns the right endpoint per platform, and `pkg/player` abstracts
   the dial as T10.7 asked: `net.Dial("unix", ...)` on POSIX, `os.OpenFile` on
   the named pipe. Stdlib only — no go-winio — but a blocked read there cannot
-  be interrupted by `Close()`, which is the TUI's problem, not the CLI's.
+  be interrupted by `Close()`. The CLI never blocks on a read that way; an
+  event-reading client (the TUI's, now its own project) would.
 
 ## TASKS
 - this is a check-up prompt:

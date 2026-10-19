@@ -317,15 +317,14 @@ func TestEnqueueSendsLoadfile(t *testing.T) {
 		t.Fatal("Enqueue() blocked — it must hand the track to the daemon and return")
 	}
 
-	if len(sent) != 2 {
-		t.Fatalf("sent %d commands, want loadfile + unpause: %v", len(sent), sent)
+	// loadfile only. Enqueue used to unpause too, and a background preload
+	// queues through it: a `pause` came undone the moment one landed (2026-10-19
+	// review, CQ-1). The track a user starts is unpaused by the queue instead.
+	if len(sent) != 1 {
+		t.Fatalf("sent %d commands, want loadfile only: %v", len(sent), sent)
 	}
 	if !strings.Contains(sent[0], `"loadfile"`) || !strings.Contains(sent[0], `"append-play"`) {
 		t.Errorf("first command = %s, want loadfile ... append-play", sent[0])
-	}
-	// Sticky pause from an earlier session would swallow this track silently.
-	if !strings.Contains(sent[1], `"pause"`) {
-		t.Errorf("second command = %s, want the unpause", sent[1])
 	}
 }
 

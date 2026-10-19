@@ -132,6 +132,18 @@ func TestCleanRejectsHostileTitles(t *testing.T) {
 	if strings.ContainsRune(esc, 0x1b) {
 		t.Errorf("ESC survived into the output — a title can repaint the terminal:\n%q", esc)
 	}
+
+	// Past ASCII (2026-10-19 review, CQ-5): CSI's one-character form, a bidi
+	// override that reorders the row, and Unicode's own line separator.
+	for _, hostile := range []string{"a\u009b31mred", "song ‮kcart‬", "one two", "one\u0085two"} {
+		got := Clean(hostile)
+		if strings.ContainsAny(got, "\u009b‮‬ \u0085") {
+			t.Errorf("Clean(%q) = %q, a control survived", hostile, got)
+		}
+	}
+	if got := Clean("שלום‏ world"); !strings.ContainsRune(got, 0x200f) {
+		t.Errorf("Clean dropped an RLM mark, which right-to-left titles need: %q", got)
+	}
 }
 
 // TestRenderTSVIsStable: a pipe gets the same four fields every time, whatever

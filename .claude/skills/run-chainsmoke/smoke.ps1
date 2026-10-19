@@ -86,6 +86,10 @@ $cases = @(
     # TestBannerClassification's job, not this harness's: a pipe cannot tell.
     @{ Name = 'version';      Args = @('--version');         Exit = 0; Match = 'chainsmoke version'; NotMatch = '=====' },
     @{ Name = 'help';         Args = @('--help');            Exit = 0; Match = 'privacy-focused SoundCloud CLI'; NotMatch = '=====' },
+    # `get` is Hidden until download + scrub lands: help must not offer a verb
+    # that cannot succeed (2026-10-19 review, Fix 10). get-stdin below proves
+    # it still runs.
+    @{ Name = 'help-no-get';  Args = @('--help');            Exit = 0; Match = 'COMMANDS:'; NotMatch = 'get, dl' },
     # Bare invocation down a pipe: today the command table. T10.1/T10.2 route a
     # bare TTY run to the TUI but must keep THIS (help, exit 0, no hang), so the
     # case exists before they land and they flip nothing (09/09 review, A-5).

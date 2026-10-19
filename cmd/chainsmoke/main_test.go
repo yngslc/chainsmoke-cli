@@ -27,16 +27,17 @@ import (
 // recordingNet counts Up() and can refuse it, which is how the fail-closed
 // ordering below gets proven rather than assumed.
 type recordingNet struct {
-	ups    int
-	upErr  error
-	downs  int
-	proxy  string
-	assert error
+	ups       int
+	upErr     error
+	downs     int
+	proxy     string
+	assert    error
+	rotateErr error
 }
 
 func (n *recordingNet) Up() error        { n.ups++; return n.upErr }
 func (n *recordingNet) Down() error      { n.downs++; return nil }
-func (n *recordingNet) Rotate() error    { return nil }
+func (n *recordingNet) Rotate() error    { return n.rotateErr }
 func (n *recordingNet) SelfTest() error  { return nil }
 func (n *recordingNet) ProxyURL() string { return n.proxy }
 func (n *recordingNet) Assert() error    { return n.assert }
@@ -389,3 +390,28 @@ func isolateStoreDirs(t *testing.T) (runtimeDir, stateDir string) {
 // keep the store import honest: wire() returns core.Store, and this asserts the
 // concrete package still satisfies the describing interface the audit relies on.
 var _ core.Store = store.New(false, true)
+
+// TestRotateOnItsOwnBuildsNoBridge: a one-shot `chainsmoke rotate` used to
+// bring up a bridge of its own, re-isolate it and exit — changing nothing for
+// the session that was playing, while printing that the next stream had a
+// fresh circuit (2026-10-19 review, A-3). On its own it sends NEWNYM only, and
+// when that fails it says where rotating does work. At the prompt it rotates
+// the session's own bridge.
+func TestRotateOnItsOwnBuildsNoBridge(t *testing.T) {
+	app, n, _, _ := wiredApp()
+	n.rotateErr = errors.New("connection refused")
+	err := runVerb(app, "rotate")
+	if n.ups != 0 {
+		t.Errorf("rotate on its own brought egress up %d times — a bridge no stream will use", n.ups)
+	}
+	if err == nil || !strings.Contains(err.Error(), "type `rotate` there") {
+		t.Errorf("rotate with no ControlPort = %v, want the failure, pointing at the session prompt", err)
+	}
+
+	app, n, _, _ = wiredApp()
+	cliApp := &cli.App{Name: "chainsmoke", Commands: commands(app),
+		Metadata: map[string]any{inSession: true}, Writer: io.Discard, ErrWriter: io.Discard}
+	if err := cliApp.Run([]string{"chainsmoke", "rotate"}); err != nil || n.ups != 1 {
+		t.Errorf("rotate at the prompt = %v with %d Up() calls, want nil and the session's bridge", err, n.ups)
+	}
+}

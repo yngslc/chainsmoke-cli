@@ -67,18 +67,23 @@ func TestAuditReportsProbedPosture(t *testing.T) {
 	isolateConfig(t)
 
 	cases := []struct {
-		name string
-		net  *fakeNet
-		want string
-		deny string
+		name   string
+		net    *fakeNet
+		egress Config
+		want   string
+		deny   string
 	}{
-		{"verified tor", &fakeNet{verified: true, proxy: "http://127.0.0.1:1080"}, "egress:      TOR", "DIRECT"},
-		{"permitted direct", &fakeNet{}, "egress:      DIRECT", "DOWN"},
-		{"egress down", &fakeNet{assertErr: errors.New("fail-closed")}, "egress:      DOWN", "DIRECT"},
+		{"verified tor", &fakeNet{verified: true, proxy: "http://127.0.0.1:1080"}, Config{}, "egress:      TOR", "DIRECT"},
+		// A CONNECT through --proxy proves something answered, not that it was
+		// Tor: a proxy that dialled nothing printed TOR ✓ (CH-DEBATE
+		// 2026-10-19, D-1).
+		{"verified --proxy", &fakeNet{verified: true, proxy: "http://127.0.0.1:8080"}, Config{Proxy: "http://127.0.0.1:8080"}, "egress:      PROXY", "TOR"},
+		{"permitted direct", &fakeNet{}, Config{}, "egress:      DIRECT", "DOWN"},
+		{"egress down", &fakeNet{assertErr: errors.New("fail-closed")}, Config{}, "egress:      DOWN", "DIRECT"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out, _ := runAudit(t, &App{Net: tc.net})
+			out, _ := runAudit(t, &App{Net: tc.net, Egress: tc.egress})
 			if !strings.Contains(out, tc.want) {
 				t.Errorf("posture line missing %q:\n%s", tc.want, out)
 			}
@@ -233,7 +238,7 @@ func TestAuditLedgerFlagsUnexpectedHosts(t *testing.T) {
 	for _, want := range []string{
 		"telemetry.example.com:443",
 		"UNEXPECTED",
-		"2 plaintext attempt(s) refused",
+		"2 request(s) refused by the bridge",
 		"1 tunnel(s) failed",
 		"cannot see traffic that bypassed it",
 	} {

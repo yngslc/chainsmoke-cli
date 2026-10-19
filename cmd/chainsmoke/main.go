@@ -12,7 +12,8 @@
 //    pkg/store/store.go     <- Store interface, memory + disk backends
 //    cmd/chainsmoke/session.go <- play session: holds the bridge while the queue plays
 //    cmd/chainsmoke/queue.go   <- list playback: play N, next/prev along the results
-//    cmd/chainsmoke/tui.go  <- TUI (Phase 10, not yet wired)
+//    cmd/chainsmoke/tui.go  <- empty: the TUI left this project for its own
+//                              (TASKS.md Phase 10, 2026-10-05)
 //
 //  If you find yourself adding a type or an algorithm HERE, it belongs in a
 //  package. The rule that keeps this file honest: main.go may construct things
@@ -68,7 +69,7 @@ var BuildVersion = "development"
 // argv token, so `chainsmoke search -- --remember` silently flipped the store to
 // disk, breaking ephemeral-by-default.
 func wire(app *core.App, remember, private bool, proxy, impersonate string, allowDirect bool, torSocks string) {
-	n := csnet.New(proxy, allowDirect, torSocks)
+	n := csnet.New(proxy, allowDirect, torSocks, private)
 	app.Net = n
 	app.Res = resolver.New(n, impersonate)
 	app.Play = player.New(core.SocketPath(), n)
@@ -367,16 +368,27 @@ func commands(app *core.App) []*cli.Command {
 
 		// --- privacy / lifecycle -----------------------------------------------
 		{
-			Name: "rotate", Usage: "New Tor circuit (NEWNYM, or re-isolated SOCKS credentials)",
-			Action: func(*cli.Context) error {
-				// Up() first, for the same reason audit does it: without a live
-				// bridge there is nothing to re-isolate, so a tor with no
-				// ControlPort made this verb fail outright even though a fresh
-				// circuit was one credential away.
-				if err := app.Net.Up(); err != nil {
-					return err
+			Name: "rotate", Usage: "New Tor circuit (re-isolated SOCKS credentials at the session prompt, NEWNYM otherwise)",
+			Action: func(c *cli.Context) error {
+				// At a session prompt it re-isolates the session's own bridge,
+				// which every stream of the session goes through (NEWNYM too, if
+				// tor has a ControlPort). On its own, `chainsmoke rotate` from
+				// another window has no such bridge: it used to build one with
+				// Up(), re-isolate that and exit — changing nothing for what was
+				// playing, yet saying the next stream had a fresh circuit
+				// (2026-10-19 review, A-3). Only NEWNYM reaches past this
+				// process, so on its own that is all it tries.
+				inSession := c.App.Metadata[inSession] == true
+				if inSession {
+					if err := app.Net.Up(); err != nil { // already up: a no-op
+						return err
+					}
 				}
 				if err := app.Net.Rotate(); err != nil {
+					if !inSession {
+						return fmt.Errorf("NEWNYM failed (%v). Without a tor ControlPort, a playing session's "+
+							"circuit can only be changed from its own prompt: type `rotate` there", err)
+					}
 					return err
 				}
 				fmt.Fprintln(os.Stderr, "chainsmoke: the next stream gets a fresh Tor circuit")
@@ -484,7 +496,7 @@ func main() {
 
 	cliApp := &cli.App{
 		Name:                 "chainsmoke",
-		Usage:                "A privacy-focused SoundCloud CLI (play, search, get) over Tor",
+		Usage:                "A privacy-focused SoundCloud CLI over Tor: search, likes, playlists, playback",
 		Version:              BuildVersion,
 		EnableBashCompletion: true,
 		Flags:                globalFlags(),

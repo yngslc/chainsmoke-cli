@@ -378,6 +378,45 @@ func TestPreloadSkipsATrackThatWillNotResolve(t *testing.T) {
 	}
 }
 
+// TestALandedPreloadNeverRestartsAStoppedPlayer: a `stop` — typed at the
+// prompt, or run in another window — clears mpv's playlist while the next
+// track is still resolving. Queuing that track when it lands would start
+// playback nobody asked for, so landed() drops it. That check had no test:
+// deleting it left the suite green (CH-DEBATE 2026-10-19, D-5).
+func TestALandedPreloadNeverRestartsAStoppedPlayer(t *testing.T) {
+	app, p, r := listApp(3)
+	release := make(chan struct{})
+	r.gate = map[string]chan struct{}{"https://soundcloud.com/a/t2": release}
+	q := &listQueue{app: app}
+	if err := q.start(1); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = p.Command("stop") // while t2 is still resolving
+	close(release)
+	q.settle()
+
+	if p.playing() != "(idle)" || len(p.list) != 0 {
+		t.Errorf("after stop, the landed preload queued %v (playing %s)", p.list, p.playing())
+	}
+}
+
+// TestStartingATrackUnpausesTheDaemon: the daemon keeps pause state between
+// sessions, so `play` unpauses — once, for the track asked for. It used to be
+// Enqueue that unpaused, and a background preload queues through Enqueue too:
+// a `pause` came undone the moment one landed (2026-10-19 review, CQ-1).
+func TestStartingATrackUnpausesTheDaemon(t *testing.T) {
+	app, p, _ := listApp(3)
+	q := &listQueue{app: app}
+	if err := q.start(1); err != nil {
+		t.Fatal(err)
+	}
+	q.settle() // t2 lands in the background
+	if n := strings.Count(strings.Join(p.sent, "\n"), "[set_property pause false]"); n != 1 {
+		t.Errorf("unpaused %d times, want once — for the track asked for: %v", n, p.sent)
+	}
+}
+
 // TestAnnounceScrubsHostileTitles: titles are third-party text on a terminal —
 // an ESC repaints it, a newline forges a line (the other rule EnqueueAhead
 // pinned).
@@ -545,6 +584,33 @@ func TestPlayIndexPlaysFromTheList(t *testing.T) {
 	}
 	if metas, _ := r.counts(); metas != 0 || len(p.list) == 0 || p.list[0] != "t2" {
 		t.Errorf("play 2: %d Meta calls, playlist %v — want 0, starting with t2", metas, p.list)
+	}
+}
+
+// purgeStore remembers whether it was purged.
+type purgeStore struct {
+	listStore
+	purged bool
+}
+
+func (s *purgeStore) Purge() error { s.purged = true; return nil }
+
+// TestPromptRefusesVerbsThatEndTheSession: purge and daemon would pull the
+// player out from under the session, so the hint left them out — and the
+// prompt ran them anyway (2026-10-19 review, Fix 17). An alias (dl for get)
+// must not get around it.
+func TestPromptRefusesVerbsThatEndTheSession(t *testing.T) {
+	app, _, _ := listApp(3)
+	st, n := &purgeStore{listStore: listStore{3}}, &recordingNet{}
+	app.Store, app.Net = st, n
+	in := strings.NewReader("purge\ndl 1\ncompletion bash\nq\n")
+	playSession(app, &listQueue{app: app}, in, true, make(chan os.Signal), time.Millisecond)
+
+	if st.purged {
+		t.Error("`purge` at the prompt wiped the stores mid-session")
+	}
+	if n.ups != 0 {
+		t.Errorf("`dl 1` at the prompt ran get (%d Up() calls)", n.ups)
 	}
 }
 

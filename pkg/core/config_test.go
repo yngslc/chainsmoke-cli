@@ -66,6 +66,15 @@ func TestSaveConfigRoundTrip(t *testing.T) {
 	if got.SavedPosture != "TOR" {
 		t.Errorf("SavedPosture = %q, want TOR when the probe verified", got.SavedPosture)
 	}
+
+	// Through --proxy, verified means something answered, not Tor.
+	want.Proxy = "http://127.0.0.1:8080"
+	if err := SaveConfig(want, true); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if got, _, _ := LoadConfig(); got.SavedPosture != "PROXY" {
+		t.Errorf("SavedPosture = %q through --proxy, want PROXY", got.SavedPosture)
+	}
 	if got.SavedAt.IsZero() {
 		t.Error("SavedAt is zero; audit has nothing to date the config by")
 	}

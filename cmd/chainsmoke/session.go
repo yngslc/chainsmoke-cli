@@ -136,6 +136,11 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 				} else {
 					fmt.Fprintln(os.Stderr, "chainsmoke:", q.modes())
 				}
+			case notAtThePrompt[verbName(commands(app), args[0])]:
+				// Left out of the hint, and refused too: the prompt used to run
+				// them anyway, so `purge` wiped both stores and took the player
+				// down mid-session (2026-10-19 review, Fix 17).
+				fmt.Fprintf(os.Stderr, "chainsmoke: `%s` does not run at the prompt — q first, then run it on its own\n", args[0])
 			default:
 				// A fresh App per line: urfave mutates its command table while
 				// it runs, and nothing guarantees an App survives a second Run.
@@ -183,10 +188,21 @@ func (s *sessionInput) Read(p []byte) (int, error) {
 // its "URL: " / "user handle: " prompt.
 func (*sessionInput) Prompting() bool { return true }
 
-// notAtThePrompt are the verbs the hint leaves out: daemon and purge would
-// pull the player out from under the session, completion prints a shell
-// script, and get is still a stub (pkg/scrub).
+// notAtThePrompt are the verbs the prompt neither offers nor runs: daemon and
+// purge would pull the player out from under the session, completion prints a
+// shell script, and get is still a stub (pkg/scrub).
 var notAtThePrompt = map[string]bool{"daemon": true, "purge": true, "completion": true, "get": true}
+
+// verbName maps an alias to its command's name (dl -> get), so no alias steps
+// around notAtThePrompt.
+func verbName(cmds []*cli.Command, verb string) string {
+	for _, c := range cmds {
+		if c.HasName(verb) {
+			return c.Name
+		}
+	}
+	return verb
+}
 
 // sessionHint lists what the prompt accepts, built from the command table so a
 // verb added later shows up by itself, with q last.

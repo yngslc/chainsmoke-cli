@@ -54,7 +54,7 @@ func requireTor(t *testing.T) string {
 func TestIntegrationEgressChain(t *testing.T) {
 	addr := requireTor(t)
 
-	b := New("", false, addr)
+	b := New("", false, addr, false)
 	if err := b.Up(); err != nil {
 		t.Fatalf("Up() against live Tor: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestIntegrationRemoteDNS(t *testing.T) {
 func TestIntegrationRotateChangesCircuit(t *testing.T) {
 	addr := requireTor(t)
 
-	b := New("", false, addr)
+	b := New("", false, addr, false)
 	if err := b.Up(); err != nil {
 		t.Fatalf("Up(): %v", err)
 	}

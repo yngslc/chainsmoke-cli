@@ -246,14 +246,25 @@ func StdoutIsTerminal() bool { return isTerminal(os.Stdout) }
 // Track titles are attacker-influenced text from a third party: a tab would
 // wreck the TSV form, a newline would forge an extra row, and an ANSI escape
 // would let a title repaint the terminal. None of them belong in a cell.
+//
+// The same goes past ASCII (2026-10-19 review, CQ-5): NEL and Unicode's own
+// line and paragraph separators break lines like \n; the C1 controls include
+// 0x9b, CSI's one-character form, which some terminals obey like ESC [; and
+// the bidi embeddings, overrides and isolates reorder what is drawn around
+// them, so a title could make its row read like another. Plain LRM/RLM marks
+// stay: right-to-left titles use them, and they reorder nothing on their own.
 func Clean(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
 		switch {
-		case r == '\t', r == '\n', r == '\r':
+		case r == '\t', r == '\n', r == '\r', r == 0x85, r == 0x2028, r == 0x2029:
 			b.WriteByte(' ')
 		case r < 0x20 || r == 0x7f: // control chars, ESC included
+			continue
+		case r >= 0x80 && r <= 0x9f: // C1 controls
+			continue
+		case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069: // bidi embeddings, overrides, isolates
 			continue
 		default:
 			b.WriteRune(r)

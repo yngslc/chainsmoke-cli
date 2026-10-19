@@ -36,13 +36,25 @@
 // prove the next one will succeed, that the exit is honest, or that the circuit
 // has not since been rebuilt.
 //
+// Nor, by itself, that the chain is Tor. A SOCKS server that answered and
+// dialled nothing was verified, and audit printed TOR ✓ for it (CH-DEBATE
+// 2026-10-19, D-1). So the built-in path also asks the listener to identify
+// itself first (isTorSocks): tor answers HTTP on its SOCKS port with a fixed
+// page, locally. That is a fingerprint, not a proof — it catches ssh -D or a
+// proxy client on the tor port, not a local program built to imitate tor.
+// Through --proxy, Verified means a CONNECT completed through the user's
+// proxy, whatever that is, and Audit reports PROXY rather than TOR.
+//
 // # What is not covered here
 //
 //   - Child-process egress, and with it child-process DNS. yt-dlp, mpv and
 //     ffmpeg have their own resolvers and never consult Go's; what keeps them
 //     on the bridge is the proxy each one is handed. yt-dlp gets an explicit
 //     --proxy from the live Net handle and a minimal environment
-//     (resolver.minimalEnv), so ambient proxy variables never pick its route.
+//     (resolver.minimalEnv), so ambient proxy variables never pick its route;
+//     its target arrives on stdin, not in its argv, which any local user can
+//     read (2026-10-19). The --proxy value, the bridge's loopback address, is
+//     still in its argv: a port any local process can find anyway.
 //     mpv gets the proxy with every loadfile (stream-lavf-o=http_proxy=…, in
 //     player.Enqueue), which reaches a reused daemon too, and its environment
 //     loses no_proxy. Measured rather than assumed (TASKS.md T7.3, T10.9): on a
@@ -54,12 +66,20 @@
 //     would notice.
 //   - Other local processes, for as long as a play session lasts. The
 //     ConnectBridge listens on 127.0.0.1 with no authentication, and a play
-//     session keeps it open until q (a one-shot verb holds it for seconds).
-//     For that long any process on this machine, under any user, that finds
-//     the port can tunnel through it — on this session's Tor circuits, so its
-//     traffic shares chainsmoke's exits. It gets nothing chainsmoke could not
-//     do itself: CONNECT only, no plaintext relay (T7.2). Per-session proxy
-//     credentials would close this; for now it is documented, not fixed
+//     session keeps it open until q; a one-shot verb holds it for as long as it
+//     runs, which for a large likes listing is minutes (resolver.listTimeout,
+//     up to three attempts). For that long any process on this machine, under
+//     any user, can tunnel through it, and finding the port takes a loopback
+//     scan. Every tunnel carries the same isolation credentials, so its
+//     traffic rides this session's circuit and shares its exit — the merge
+//     isolation exists to prevent. Since 2026-10-19 it can tunnel HTTPS on 443
+//     only: no SMTP relay, no IRC, no plaintext inside a tunnel (measured on
+//     the real bridge before that: all of them went through; CH-DEBATE
+//     2026-10-19, D-3), and no plaintext relay at all (T7.2). A host allowlist
+//     would narrow it to SoundCloud, at the price of breaking playback the day
+//     SoundCloud moves to a domain not on it — as its December 2025 migration
+//     moved audio to soundcloud.cloud (core.expectedSuffixes). Per-session
+//     proxy credentials would close it; for now that is documented, not fixed
 //     (dev's call, 2026-10-19 — 2026-10-05 review, R8).
 //   - Traffic analysis. Tor does not hide that you are using Tor from your ISP,
 //     and packet timing/volume of an audio stream is distinctive.

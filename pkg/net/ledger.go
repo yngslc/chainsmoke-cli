@@ -34,8 +34,9 @@ func (l *ledger) connect(target string) {
 	l.targets[target]++
 }
 
-// refuse records a non-CONNECT request — a child that tried to push plaintext
-// through the bridge and was rejected.
+// refuse records a request the bridge would not carry: a non-CONNECT (a child
+// that tried to push plaintext through it), or a CONNECT to a port other than
+// 443 (something using it as a relay).
 func (l *ledger) refuse() {
 	l.mu.Lock()
 	defer l.mu.Unlock()

@@ -265,8 +265,16 @@ func (a *App) Audit() error {
 	// leave at all (Assert fails), and telling a user their traffic is going
 	// out unanonymized when it is in fact being refused sends them chasing a
 	// leak that does not exist.
+	//
+	// And a fourth: --proxy. A live CONNECT through it is verified, but only
+	// that something answered — whatever the user pointed it at, Tor or not.
+	// It used to print TOR ✓ for a proxy that dialled nothing at all
+	// (CH-DEBATE 2026-10-19, D-1). The built-in path earns TOR because Up()
+	// checked the SOCKS listener identifies as tor.
 	posture := "DOWN ✋ (no egress permitted — fail-closed)"
 	switch {
+	case a.Net.Verified() && live.Proxy != "":
+		posture = "PROXY ⚠  (verified by a live CONNECT through --proxy; NOT proven to be Tor)"
 	case a.Net.Verified():
 		posture = "TOR ✓  (verified by a live CONNECT)"
 	case a.Net.Assert() == nil:
@@ -372,7 +380,7 @@ func (a *App) auditEgressLedger() {
 		fmt.Fprintf(a.out(), "  %-46s %d  %s\n", target, l.Targets[target], mark)
 	}
 	if l.Refused > 0 {
-		fmt.Fprintf(a.out(), "  %d plaintext attempt(s) refused by the bridge\n", l.Refused)
+		fmt.Fprintf(a.out(), "  %d request(s) refused by the bridge (plaintext, or not port 443)\n", l.Refused)
 	}
 	if l.Failed > 0 {
 		fmt.Fprintf(a.out(), "  %d tunnel(s) failed to open (dead exit, or a blocked one)\n", l.Failed)
@@ -580,9 +588,10 @@ type EgressLedger struct {
 	// Targets counts CONNECTs per "host:port".
 	Targets map[string]int
 
-	// Refused counts non-CONNECT requests the bridge rejected. Each one is a
-	// child process that tried to push PLAINTEXT through us — the loud failure
-	// the bridge prefers over quietly proxying it.
+	// Refused counts requests the bridge rejected: a non-CONNECT (a child
+	// process that tried to push PLAINTEXT through us — the loud failure the
+	// bridge prefers over quietly proxying it), or a CONNECT to a port other
+	// than 443 (something using the bridge as a relay).
 	Refused int
 
 	// Failed counts CONNECTs that never became a tunnel (a dead exit, a
