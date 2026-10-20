@@ -24,8 +24,6 @@ account, no login and no API key.
   - the Tor Browser, with `--tor-socks 127.0.0.1:9150`.
 - **Go 1.26.5 or newer**, to build it.
 
-chainsmoke is developed and tested on Windows 10 and on Ubuntu under WSL. The
-macOS builds compile but have not been tested.
 
 ## Build
 
