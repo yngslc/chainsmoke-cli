@@ -31,6 +31,7 @@ macOS builds compile but have not been tested.
 
 ```sh
 CGO_ENABLED=0 go build -trimpath -o chainsmoke ./cmd/chainsmoke
+sudo install -m755 chainsmoke /usr/local/bin/chainsmoke   # optional: run it as `chainsmoke`, from anywhere
 ```
 
 `CGO_ENABLED=0` makes the binary static, as release builds are. A build like
