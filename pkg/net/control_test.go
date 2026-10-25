@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-// fakeControl replays a scripted Tor control-port conversation so the reply
-// grammar can be tested without a tor binary.
 func fakeControl(t *testing.T, script map[string]string) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -51,13 +49,9 @@ func fakeControl(t *testing.T, script map[string]string) string {
 	return ln.Addr().String()
 }
 
-// TestReadReplyHandlesMultilineAndEvents is the bug this replaced: the old
-// Rotate read exactly one line per command and prefix-matched "250". A "250-"
-// continuation run, or an interleaved asynchronous 6xx event, desynchronized
-// the connection and made the next command read the previous reply's tail.
 func TestReadReplyHandlesMultilineAndEvents(t *testing.T) {
 	addr := fakeControl(t, map[string]string{
-		"PROTOCOLINFO": "650 CIRC 1 EXTENDED\r\n" + // async event BEFORE our reply
+		"PROTOCOLINFO": "650 CIRC 1 EXTENDED\r\n" +
 			"250-PROTOCOLINFO 1\r\n" +
 			`250-AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE="/run/tor/control.authcookie"` + "\r\n" +
 			"250-VERSION Tor=\"0.4.8.12\"\r\n" +
@@ -88,7 +82,6 @@ func TestReadReplyHandlesMultilineAndEvents(t *testing.T) {
 	}
 }
 
-// TestReadReplyDataBlock covers the "250+" form, terminated by a lone dot.
 func TestReadReplyDataBlock(t *testing.T) {
 	addr := fakeControl(t, map[string]string{
 		"GETINFO": "250+md/name/x=\r\nline one\r\nline two\r\n.\r\n250 OK\r\n",
@@ -109,7 +102,6 @@ func TestReadReplyDataBlock(t *testing.T) {
 	}
 }
 
-// TestReadReplyPropagatesErrors: a 5xx must surface, not be skipped as an event.
 func TestReadReplyPropagatesErrors(t *testing.T) {
 	addr := fakeControl(t, map[string]string{
 		"AUTHENTICATE": "515 Authentication failed: wrong length on authentication cookie\r\n",
@@ -125,8 +117,6 @@ func TestReadReplyPropagatesErrors(t *testing.T) {
 	}
 }
 
-// TestAuthenticateRejectsHashedPassword: rather than sending AUTHENTICATE ""
-// and failing obscurely, say what is wrong and what to do.
 func TestAuthenticateRejectsHashedPassword(t *testing.T) {
 	addr := fakeControl(t, map[string]string{
 		"PROTOCOLINFO": "250-PROTOCOLINFO 1\r\n" +
@@ -148,7 +138,6 @@ func TestAuthenticateRejectsHashedPassword(t *testing.T) {
 	}
 }
 
-// TestAuthenticateNullAuth: a control port with no auth must just work.
 func TestAuthenticateNullAuth(t *testing.T) {
 	addr := fakeControl(t, map[string]string{
 		"PROTOCOLINFO": "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=NULL\r\n250 OK\r\n",
@@ -163,8 +152,6 @@ func TestAuthenticateNullAuth(t *testing.T) {
 	}
 }
 
-// TestUnescapeCString: a Windows cookie path arrives with doubled backslashes.
-// Leaving them in place means the cookie file is never found.
 func TestUnescapeCString(t *testing.T) {
 	got := unescapeCString(`C:\\Users\\someone\\tor\\control_auth_cookie`)
 	want := `C:\Users\someone\tor\control_auth_cookie`
@@ -173,11 +160,6 @@ func TestUnescapeCString(t *testing.T) {
 	}
 }
 
-// --- T2.6: --proxy keeps the verified-up contract ----------------------------
-
-// TestCheckProxySchemeRejectsSOCKS is the partial-egress guard. yt-dlp accepts
-// socks5://, libavformat does not — so metadata would tunnel and audio would
-// not, which is worse than failing outright.
 func TestCheckProxySchemeRejectsSOCKS(t *testing.T) {
 	for _, raw := range []string{
 		"socks5://127.0.0.1:9050",
@@ -193,12 +175,10 @@ func TestCheckProxySchemeRejectsSOCKS(t *testing.T) {
 			t.Errorf("refusal should explain why, got %q", err)
 		}
 	}
-	// https:// is the same split: libavformat uses a proxy only when it starts
-	// with exactly "http://" and goes DIRECT otherwise (2026-10-01, N-2).
 	if err := checkProxyScheme("https://proxy.example:3128"); err == nil || !strings.Contains(err.Error(), "mpv/ffmpeg") {
 		t.Errorf("checkProxyScheme(https://…) = %v, want a refusal that explains why", err)
 	}
-	for _, raw := range []string{"http://127.0.0.1:8118", "HTTP://127.0.0.1:8118"} { // Up() lower-cases it
+	for _, raw := range []string{"http://127.0.0.1:8118", "HTTP://127.0.0.1:8118"} {
 		if err := checkProxyScheme(raw); err != nil {
 			t.Errorf("checkProxyScheme(%q) = %v, want nil", raw, err)
 		}
@@ -208,14 +188,8 @@ func TestCheckProxySchemeRejectsSOCKS(t *testing.T) {
 	}
 }
 
-// TestRotateIsQuietWhenReisolationWorks: re-isolating on the SOCKS port always
-// works and is what gives the next stream a fresh circuit; NEWNYM needs tor's
-// ControlPort, which most system tors (and this dev box) leave off. Rotate used
-// to try the control port on every retry and print two lines each time it
-// failed (dev's report, 2026-10-03). Now NEWNYM is a silent bonus, tried once
-// per process.
 func TestRotateIsQuietWhenReisolationWorks(t *testing.T) {
-	ctrl, err := net.Listen("tcp", "127.0.0.1:0") // a control port that refuses auth
+	ctrl, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,11 +231,6 @@ func TestRotateIsQuietWhenReisolationWorks(t *testing.T) {
 	}
 }
 
-// TestPrivateWritesNoNewnymStamp: --private promises the run writes nothing,
-// and the NEWNYM stamp is a file whose mtime records when you rotated. It was
-// written anyway, from pkg/net, out of sight of the Store's own --private test
-// (CH-DEBATE 2026-10-19, D-6). Without --private it is written, which shows
-// this test would see it.
 func TestPrivateWritesNoNewnymStamp(t *testing.T) {
 	ctrl := fakeControl(t, map[string]string{
 		"PROTOCOLINFO": "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=NULL\r\n250 OK\r\n",
@@ -279,15 +248,12 @@ func TestPrivateWritesNoNewnymStamp(t *testing.T) {
 	}
 }
 
-// TestProxyErrorsNeverEchoCredentials: a --proxy URL can carry a password, and
-// every refusal used to repeat the value verbatim, putting it on the terminal
-// (measured 2026-10-03, CH-DEBATE-2026-10-03 #8).
 func TestProxyErrorsNeverEchoCredentials(t *testing.T) {
 	for _, raw := range []string{
 		"https://alice:s3cretpw@127.0.0.1:1",
 		"socks5://alice:s3cretpw@127.0.0.1:1",
 		"ftp://alice:s3cretpw@127.0.0.1:1",
-		"http//alice:s3cretpw@127.0.0.1:1", // not a URL at all
+		"http//alice:s3cretpw@127.0.0.1:1",
 	} {
 		if err := checkProxyScheme(raw); err == nil || strings.Contains(err.Error(), "s3cretpw") {
 			t.Errorf("checkProxyScheme(%q) = %v, want a refusal without the password", raw, err)
@@ -302,14 +268,9 @@ func TestProxyErrorsNeverEchoCredentials(t *testing.T) {
 	}
 }
 
-// TestOverrideIsStoredWithALowercaseScheme: checkProxyScheme accepts HTTP://
-// (it compares case-insensitively), and Up() used to store the value as typed.
-// libavformat honours a proxy only when it starts with exactly "http://", so
-// mpv fetched the signed URL directly while the preflight went through the
-// proxy (measured 2026-10-01, report-debate/debaters-output.md claim 3).
 func TestOverrideIsStoredWithALowercaseScheme(t *testing.T) {
 	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
-		t.Setenv(k, "") // Up() exports the proxy; give the test process its own values back
+		t.Setenv(k, "")
 	}
 	addr := connectStub(t, "HTTP/1.1 200 Connection established\r\n\r\n")
 	b := New("HTTP://"+addr, false, "127.0.0.1:1", false)
@@ -321,8 +282,6 @@ func TestOverrideIsStoredWithALowercaseScheme(t *testing.T) {
 	}
 }
 
-// TestVerifyHTTPProxyCONNECT: --proxy must carry a real CONNECT, not merely
-// accept a TCP connection. A proxy that answers 403 must fail verification.
 func TestVerifyHTTPProxyCONNECT(t *testing.T) {
 	okAddr := connectStub(t, "HTTP/1.1 200 Connection established\r\n\r\n")
 	if err := verifyHTTPProxyCONNECT(okAddr, "api-v2.soundcloud.com:443"); err != nil {

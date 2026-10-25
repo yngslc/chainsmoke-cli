@@ -5,10 +5,6 @@ import (
 	"testing"
 )
 
-// TestNullDeviceIsNotATerminal: NUL and /dev/null are character devices, and
-// the character-device bit was all the old check looked at. So `play 1 <
-// /dev/null` (nohup, cron, a scheduled task) took the interactive path, read EOF
-// at the prompt, and stopped playback at once. A pipe must not count either.
 func TestNullDeviceIsNotATerminal(t *testing.T) {
 	null, err := os.Open(os.DevNull)
 	if err != nil {

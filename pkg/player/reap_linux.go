@@ -7,10 +7,6 @@ import (
 	"strings"
 )
 
-// daemons lists the mpv processes whose argv carries arg, read from /proc.
-// comm has to say mpv too, so a shell or grep that merely mentions the
-// endpoint is never taken for a daemon. A zombie has an empty cmdline, so one
-// already killed does not count as still running.
 func daemons(arg string) []int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {

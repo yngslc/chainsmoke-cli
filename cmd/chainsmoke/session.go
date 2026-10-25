@@ -13,54 +13,25 @@ import (
 	"chainsmoke/pkg/core"
 )
 
-// -----------------------------------------------------------------------------
-// Play session
-// -----------------------------------------------------------------------------
-//
-// The mpv daemon outlives `play`; the Tor path it streams through does not. The
-// CONNECT bridge lives in THIS process, and mpv opens each stream — and every
-// later HLS segment — asynchronously, after `loadfile` has already answered
-// "success". A `play` that returned at once took the bridge down before mpv had
-// connected: measured 2026-09-28, `httpproxy: ... -10054` → `Failed to open` →
-// daemon idle, while an identical run that kept its proxy alive played. So
-// `play` holds on for as long as the queue needs the bridge, and so the window
-// stays usable, it holds on as a prompt.
-
-// inSession marks the session's own cli.App (via Metadata): a `play` typed at
-// the prompt queues into the running session instead of nesting another, and
-// the banner stays off a window that already showed it.
 const inSession = "chainsmoke.session"
 
-// listKey carries the session's listQueue (queue.go) to a `play N` typed at
-// the prompt, so it replaces the list being walked instead of starting another.
 const listKey = "chainsmoke.list"
 
-// queueStartGrace bounds how long a non-interactive session waits to see the
-// daemon get busy at all — a load that fails fast is over before the first poll.
 const queueStartGrace = 15 * time.Second
 
-// playSession keeps this process — and so the bridge — alive after `play` has
-// queued. On a terminal it is a prompt; otherwise (a script, or
-// `echo URL | chainsmoke play`) it waits for the queue to drain. Either way,
-// ending early stops playback cleanly: the bridge closes when this process
-// exits, and a track cut at the next segment boundary is worse than a stop.
 func playSession(app *core.App, q *listQueue, in io.Reader, interactive bool, sig <-chan os.Signal, poll time.Duration) {
 	if interactive {
 		sessionPrompt(app, q, in, sig, poll)
 	} else if !waitForQueue(app.Play, q, sig, poll) {
-		return // the queue ran out on its own; nothing left to stop
+		return
 	}
 	if q.repeat == "one" || q.repeat == "all" {
-		_ = q.setRepeat("off") // the daemon outlives us; it must not keep looping
+		_ = q.setRepeat("off")
 	}
 	_, _ = app.Play.Command("stop")
 	fmt.Fprintln(os.Stderr, "chainsmoke: stopped — playback ends with the session that carries it")
 }
 
-// sessionPrompt runs verbs typed at the prompt against the live App: the same
-// bridge, daemon connection and result cache the queued tracks already use. It
-// returns on q/quit/exit, end of input, or Ctrl+C. Every poll it tops up the
-// list's preload, which is what follows mpv when a track ends on its own.
 func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Signal, poll time.Duration) {
 	lines := make(chan string)
 	done := make(chan struct{})
@@ -77,12 +48,6 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 		}
 	}()
 
-	// The scanner above is the ONLY reader of the session's input. A bare
-	// play/likes/playlist asks for its URL or handle on the next line; it used
-	// to read stdin itself, racing the scanner — the scanner won, the verb got
-	// nothing, and the line then ran as a command (2026-10-05 review, R3). Now
-	// a verb reads from the same lines channel. That needs no lock: while a
-	// verb reads, this loop is blocked inside repl.Run and is not reading.
 	prev := app.Stdin
 	app.Stdin = &sessionInput{lines: lines}
 	defer func() { app.Stdin = prev }()
@@ -97,14 +62,12 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 			fmt.Fprintln(os.Stderr)
 			return
 		case <-tick.C:
-			// A song ended and mpv moved on by itself: say so, on a line of its
-			// own, and put the prompt back under it.
 			if i, moved := q.follow(); moved {
 				fmt.Fprintln(os.Stderr)
 				q.announce(i)
 				fmt.Fprint(os.Stderr, "chainsmoke> ")
 			}
-		case p := <-q.loading: // nil, and never ready, when nothing is resolving
+		case p := <-q.loading:
 			if err := q.landed(p); err != nil {
 				fmt.Fprintln(os.Stderr)
 				fmt.Fprintln(os.Stderr, "chainsmoke:", err)
@@ -121,8 +84,6 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 			case args[0] == "q" || args[0] == "quit" || args[0] == "exit":
 				return
 			case args[0] == "next" || args[0] == "prev":
-				// Along the list (queue.go), not just mpv's own playlist, which
-				// holds only the track playing and the one preloaded.
 				move := q.next
 				if args[0] == "prev" {
 					move = q.prev
@@ -137,22 +98,14 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 					fmt.Fprintln(os.Stderr, "chainsmoke:", q.modes())
 				}
 			case notAtThePrompt[verbName(commands(app), args[0])]:
-				// Left out of the hint, and refused too: the prompt used to run
-				// them anyway, so `purge` wiped both stores and took the player
-				// down mid-session (2026-10-19 review, Fix 17).
 				fmt.Fprintf(os.Stderr, "chainsmoke: `%s` does not run at the prompt — q first, then run it on its own\n", args[0])
 			default:
-				// A fresh App per line: urfave mutates its command table while
-				// it runs, and nothing guarantees an App survives a second Run.
 				repl := &cli.App{
-					Name:        "chainsmoke",
-					Usage:       "session commands",
-					HideVersion: true,
-					Commands:    commands(app),
-					Metadata:    map[string]any{inSession: true, listKey: q},
-					// urfave exits the process on an ExitCoder — an unknown verb
-					// is exit 3 — which would skip the stop and drop the bridge
-					// mid-track. A typo must cost one line, not the session.
+					Name:           "chainsmoke",
+					Usage:          "session commands",
+					HideVersion:    true,
+					Commands:       commands(app),
+					Metadata:       map[string]any{inSession: true, listKey: q},
 					ExitErrHandler: func(*cli.Context, error) {},
 				}
 				if err := repl.Run(append([]string{"chainsmoke"}, args...)); err != nil {
@@ -164,8 +117,6 @@ func sessionPrompt(app *core.App, q *listQueue, in io.Reader, sig <-chan os.Sign
 	}
 }
 
-// sessionInput is the session's input as an io.Reader, one typed line at a
-// time, for a verb that reads stdin while running at the prompt.
 type sessionInput struct {
 	lines <-chan string
 	buf   []byte
@@ -184,17 +135,10 @@ func (s *sessionInput) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Prompting tells core.readLine a person is typing here, so it still prints
-// its "URL: " / "user handle: " prompt.
 func (*sessionInput) Prompting() bool { return true }
 
-// notAtThePrompt are the verbs the prompt neither offers nor runs: daemon and
-// purge would pull the player out from under the session, completion prints a
-// shell script, and get is still a stub (pkg/scrub).
 var notAtThePrompt = map[string]bool{"daemon": true, "purge": true, "completion": true, "get": true}
 
-// verbName maps an alias to its command's name (dl -> get), so no alias steps
-// around notAtThePrompt.
 func verbName(cmds []*cli.Command, verb string) string {
 	for _, c := range cmds {
 		if c.HasName(verb) {
@@ -204,8 +148,6 @@ func verbName(cmds []*cli.Command, verb string) string {
 	return verb
 }
 
-// sessionHint lists what the prompt accepts, built from the command table so a
-// verb added later shows up by itself, with q last.
 func sessionHint(cmds []*cli.Command) string {
 	var b strings.Builder
 	b.WriteString("chainsmoke: playing — this window stays a chainsmoke prompt:\n ")
@@ -223,8 +165,6 @@ func sessionHint(cmds []*cli.Command) string {
 	return b.String()
 }
 
-// setMode handles the prompt's own shuffle and repeat verbs. A bare `shuffle`
-// toggles it; a bare `repeat` only reports, since there are three modes.
 func setMode(q *listQueue, args []string) error {
 	arg := ""
 	if len(args) > 1 {
@@ -246,24 +186,21 @@ func setMode(q *listQueue, args []string) error {
 	}
 }
 
-// waitForQueue holds the bridge until mpv has nothing left to play. It reports
-// whether it was interrupted rather than drained. A track still resolving is
-// something left to play: mpv may sit idle for a moment waiting on it.
 func waitForQueue(p core.Player, q *listQueue, sig <-chan os.Signal, poll time.Duration) (interrupted bool) {
 	busy := false
 	for waited := time.Duration(0); ; waited += poll {
 		v, err := p.Command("get_property", "idle-active")
 		idle, ok := v.(bool)
 		if err != nil || !ok {
-			return false // no daemon we can read: no path worth holding open
+			return false
 		}
 		if !idle {
 			busy = true
-			if i, moved := q.follow(); moved { // keep the list going, one track ahead
+			if i, moved := q.follow(); moved {
 				q.announce(i)
 			}
 		} else if q.loading == nil && (busy || waited >= queueStartGrace) {
-			return false // drained — or it never started
+			return false
 		}
 		select {
 		case <-sig:

@@ -1,37 +1,4 @@
-// =============================================================================
-//  cmd/chainsmoke/main.go — `chainsmoke`, a privacy-focused SoundCloud CLI
-// -----------------------------------------------------------------------------
-//  This file is CLI SURFACE + WIRING ONLY. All logic lives in pkg/*:
-//
-//    pkg/core/core.go       <- Track model, the 5 interfaces, App + its methods,
-//                              runtime paths. Imports nothing else in the tree.
-//    pkg/net/bridge.go      <- Tor bridge, proxy env, NEWNYM, self-test
-//    pkg/resolver/ytdlp.go  <- the ONE egress chokepoint: yt-dlp wrapper
-//    pkg/player/mpv.go      <- mpv; Phase 5 makes it a daemon + JSON-IPC client
-//    pkg/scrub/ffmpeg.go    <- ffmpeg +bitexact -> retag -> xattr -> mat2
-//    pkg/store/store.go     <- Store interface, memory + disk backends
-//    cmd/chainsmoke/session.go <- play session: holds the bridge while the queue plays
-//    cmd/chainsmoke/queue.go   <- list playback: play N, next/prev along the results
-//    cmd/chainsmoke/tui.go  <- empty: the TUI left this project for its own
-//                              (TASKS.md Phase 10, 2026-10-05)
-//
-//  If you find yourself adding a type or an algorithm HERE, it belongs in a
-//  package. The rule that keeps this file honest: main.go may construct things
-//  and map verbs onto App methods, and nothing else.
-//
-//  Load-bearing invariants (retrofitting any of these is a rewrite):
-//    1. ONE Store interface, two backends. Every persisted byte goes through it.
-//    2. ONE egress chokepoint (Resolver). The Player only ever receives already
-//       resolved, already preflighted stream URLs — never a page URL.
-//    3. NO URLs in argv. The common path is `chainsmoke play <N>` against a cached
-//       result set; raw URLs arrive on stdin. argv is world-readable via /proc.
-//    4. EPHEMERAL by default. --remember opts into the disk Store; --private forces
-//       the memory Store for the whole run regardless of config.
-//
-//  When yt-dlp breaks (it will — client_id is scraped and rotates), the failure
-//  mode is a clear "run: yt-dlp -U" message, never a stack trace. Don't pin yt-dlp.
-// =============================================================================
-
+// chainsmoke is a privacy-focused SoundCloud command-line client.
 package main
 
 import (
@@ -55,19 +22,8 @@ import (
 	"chainsmoke/pkg/store"
 )
 
-// BuildVersion is stamped at build time (-ldflags "-X main.BuildVersion=...").
-var BuildVersion = "development"
+var BuildVersion = "v1.1.0-cli"
 
-// -----------------------------------------------------------------------------
-// Wiring
-// -----------------------------------------------------------------------------
-
-// wire builds the runtime from already-parsed flags. Taking plain values rather
-// than a *cli.Context keeps the constructor testable and keeps flag parsing in
-// exactly one place — urfave/cli — instead of the hand-rolled argv scanning this
-// replaces (TASKS.md T1.2). That scanning had real bugs: `hasFlag` matched any
-// argv token, so `chainsmoke search -- --remember` silently flipped the store to
-// disk, breaking ephemeral-by-default.
 func wire(app *core.App, remember, private bool, proxy, impersonate string, allowDirect bool, torSocks string) {
 	n := csnet.New(proxy, allowDirect, torSocks, private)
 	app.Net = n
@@ -77,8 +33,6 @@ func wire(app *core.App, remember, private bool, proxy, impersonate string, allo
 	app.Store = store.New(remember, private)
 	app.Version = BuildVersion
 
-	// The effective egress settings, handed down rather than re-read from argv
-	// deeper in (T1.2). Audit compares this against the saved config (T7.1).
 	app.Egress = core.Config{
 		TorSocks:    torSocks,
 		Proxy:       proxy,
@@ -87,22 +41,16 @@ func wire(app *core.App, remember, private bool, proxy, impersonate string, allo
 	}
 }
 
-// globalFlags is the app-level flag set, extracted from main() so it can be
-// tested (T9.1).
 func globalFlags() []cli.Flag {
 	return []cli.Flag{
 		&cli.BoolFlag{Name: "remember", Usage: "persist history/results to disk (default: ephemeral)"},
 		&cli.BoolFlag{Name: "private", Usage: "force memory-only for this run (overrides --remember)"},
 		&cli.StringFlag{Name: "proxy", Usage: "override egress proxy (else the built-in Tor bridge)"},
 		&cli.StringFlag{Name: "impersonate", Value: "chrome", Usage: "yt-dlp curl_cffi target ('' to disable)"},
-		&cli.BoolFlag{Name: "allow-direct", Usage: "permit UNANONYMIZED egress when Tor cannot be brought up (T0.2 escape hatch)"},
+		&cli.BoolFlag{Name: "allow-direct", Usage: "permit UNANONYMIZED egress when Tor cannot be brought up (escape hatch)"},
 		&cli.StringFlag{Name: "tor-socks", Value: "127.0.0.1:9050", Usage: "Tor SOCKS address (use 127.0.0.1:9150 for the Tor Browser bundle)"},
 	}
 }
-
-// -----------------------------------------------------------------------------
-// Commands
-// -----------------------------------------------------------------------------
 
 func commands(app *core.App) []*cli.Command {
 	return []*cli.Command{
@@ -119,9 +67,6 @@ func commands(app *core.App) []*cli.Command {
 				if c.Args().Len() == 0 {
 					return errors.New("usage: chainsmoke search <term>")
 				}
-				// T1.1: establish the chokepoint before the resolver runs, for
-				// parity with play/get. Search reaches SoundCloud like any other
-				// resolver call; it must not be the one verb that skips egress.
 				if err := app.Net.Up(); err != nil {
 					return err
 				}
@@ -133,7 +78,7 @@ func commands(app *core.App) []*cli.Command {
 				if err := app.Store.SaveResults(tracks); err != nil {
 					return err
 				}
-				app.PrintResults(tracks) // index + title only; permalinks stay cached
+				app.PrintResults(tracks)
 				return nil
 			},
 		},
@@ -158,7 +103,7 @@ func commands(app *core.App) []*cli.Command {
 				if err != nil {
 					return err
 				}
-				if err := app.Net.Up(); err != nil { // chokepoint before the resolver
+				if err := app.Net.Up(); err != nil {
 					return err
 				}
 				return app.Collect(url, c.Int("limit"))
@@ -201,10 +146,6 @@ func commands(app *core.App) []*cli.Command {
 				"URLs are never accepted in argv — the OS process list is world-readable.",
 			Before: banner,
 			Action: func(c *cli.Context) error {
-				// An index (or a URL refused in argv) is checked locally BEFORE
-				// Up(), so a typo never costs a circuit (TASKS.md:405, as likes
-				// and playlist already do). A URL from the prompt is asked for
-				// only AFTER Up(): nobody should paste one to learn Tor is down.
 				arg := c.Args().First()
 				var t core.Track
 				var err error
@@ -213,7 +154,7 @@ func commands(app *core.App) []*cli.Command {
 						return err
 					}
 				}
-				if err := app.Net.Up(); err != nil { // chokepoint before any egress
+				if err := app.Net.Up(); err != nil {
 					return err
 				}
 				if arg == "" {
@@ -221,23 +162,18 @@ func commands(app *core.App) []*cli.Command {
 						return err
 					}
 				}
-				// After the argument, so a typo does not leave a daemon behind.
 				if err := app.Play.Ensure(); err != nil {
 					return err
 				}
-				q, _ := c.App.Metadata[listKey].(*listQueue) // the session's, if typed at its prompt
+				q, _ := c.App.Metadata[listKey].(*listQueue)
 				if q == nil {
 					q = &listQueue{app: app}
 				}
 				if n, ierr := strconv.Atoi(arg); arg != "" && ierr == nil {
-					// A cached result: play it as part of its list, so next and
-					// prev walk the rest (queue.go).
 					if err := q.start(n); err != nil {
 						return err
 					}
 				} else {
-					// A URL: a track, or a set (an album, a playlist) to walk
-					// like any list (2026-10-05 review, R2).
 					entries, err := app.Res.Meta(t.Permalink)
 					if err != nil {
 						return core.YtdlpHint(err)
@@ -247,10 +183,8 @@ func commands(app *core.App) []*cli.Command {
 					}
 				}
 				if c.App.Metadata[inSession] == true {
-					return nil // typed at a session prompt, which already holds the bridge
+					return nil
 				}
-				// mpv streams through the bridge in THIS process, so returning
-				// now would cut it off before the first segment (session.go).
 				in, interactive := app.Stdin, false
 				if in == nil {
 					in, interactive = os.Stdin, core.StdinIsTerminal()
@@ -263,10 +197,8 @@ func commands(app *core.App) []*cli.Command {
 			},
 		},
 		{
-			Name:    "get",
-			Aliases: []string{"dl"},
-			// Hidden until download + scrub lands (TASKS.md "Deferred"): it
-			// still runs, and still answers "not implemented".
+			Name:      "get",
+			Aliases:   []string{"dl"},
 			Hidden:    true,
 			Usage:     "Download + scrub cached result N (or stdin URL)",
 			ArgsUsage: "[N]",
@@ -283,21 +215,16 @@ func commands(app *core.App) []*cli.Command {
 				if err != nil {
 					return err
 				}
-				// T1.6: no more hardcoded /tmp/in.m4a — that path does not exist
-				// on the Windows dev target and collides between concurrent runs.
-				// A per-run temp dir is created and removed here; the download
-				// that fills it is Phase 6 (T6.1).
 				dir, err := os.MkdirTemp("", "chainsmoke-")
 				if err != nil {
 					return fmt.Errorf("temp dir: %w", err)
 				}
 				defer os.RemoveAll(dir)
-				_ = t // TODO(impl): resolver download into dir (T6.1)
+				_ = t
 				return app.Scrub.Scrub(filepath.Join(dir, "in.m4a"), c.String("out"), c.Bool("nuclear"))
 			},
 		},
 
-		// --- transport controls: thin IPC pass-throughs -------------------------
 		{
 			Name: "np", Usage: "Now playing",
 			Action: func(*cli.Context) error {
@@ -316,9 +243,6 @@ func commands(app *core.App) []*cli.Command {
 		{
 			Name: "seek", Usage: "Seek ±N seconds", ArgsUsage: "<±N>",
 			Action: func(c *cli.Context) error {
-				// Validate before handing anything to the player: mpv would
-				// otherwise receive an empty or non-numeric argument and fail
-				// with a message about JSON, not about the user's typo.
 				raw := c.Args().First()
 				if raw == "" {
 					return errors.New("usage: chainsmoke seek <±N seconds>")
@@ -360,27 +284,15 @@ func commands(app *core.App) []*cli.Command {
 		},
 		{
 			Name: "stop", Usage: "Stop playback and clear the queue (daemon stays up)",
-			// mpv's own `stop` command does both halves — measured: playlist-count
-			// 2 -> 0 with the daemon still answering. Killing the daemon is
-			// `daemon stop`, which is a different thing to want (T5.5).
 			Action: func(*cli.Context) error { _, err := app.Play.Command("stop"); return err },
 		},
 
-		// --- privacy / lifecycle -----------------------------------------------
 		{
 			Name: "rotate", Usage: "New Tor circuit (re-isolated SOCKS credentials at the session prompt, NEWNYM otherwise)",
 			Action: func(c *cli.Context) error {
-				// At a session prompt it re-isolates the session's own bridge,
-				// which every stream of the session goes through (NEWNYM too, if
-				// tor has a ControlPort). On its own, `chainsmoke rotate` from
-				// another window has no such bridge: it used to build one with
-				// Up(), re-isolate that and exit — changing nothing for what was
-				// playing, yet saying the next stream had a fresh circuit
-				// (2026-10-19 review, A-3). Only NEWNYM reaches past this
-				// process, so on its own that is all it tries.
 				inSession := c.App.Metadata[inSession] == true
 				if inSession {
-					if err := app.Net.Up(); err != nil { // already up: a no-op
+					if err := app.Net.Up(); err != nil {
 						return err
 					}
 				}
@@ -399,25 +311,11 @@ func commands(app *core.App) []*cli.Command {
 			Name:  "audit",
 			Usage: "Show runtime privacy posture; --save records this setup as the one you want",
 			Flags: []cli.Flag{
-				&cli.BoolFlag{Name: "save", Usage: "save this run's egress config as your expected setup (T7.1)"},
+				&cli.BoolFlag{Name: "save", Usage: "save this run's egress config as your expected setup"},
 			},
 			Action: func(c *cli.Context) error {
-				// audit must PROBE, not print config (T7.1). Bringing egress up
-				// first is what makes the reported posture real; without it the
-				// proxy field reads "<down>" even when Tor is running.
-				//
-				// Up()'s refusal is REPORTED here rather than obeyed, which is
-				// the one place in the tool that is true. Every other verb must
-				// abort on it because it is about to send traffic; audit is a
-				// diagnostic that sends no SoundCloud traffic of its own (its
-				// local DNS probe asks a neutral name), and a diagnostic
-				// that refuses to run precisely when the thing it diagnoses is
-				// broken is useless. The exit code below still carries the
-				// failure, so nothing is laundered into a pass.
 				upErr := app.Net.Up()
 				if upErr != nil {
-					// Just a heads-up here; the error itself is returned below
-					// and printed once by main, rather than twice.
 					fmt.Fprintln(os.Stderr,
 						"chainsmoke: egress could not be brought up — reporting the state anyway:")
 				}
@@ -425,26 +323,17 @@ func commands(app *core.App) []*cli.Command {
 				auditErr := app.Audit()
 				if !c.Bool("save") {
 					if upErr != nil {
-						return upErr // the sharper of the two; already printed above
+						return upErr
 					}
 					return auditErr
 				}
 
-				// Refuse to record a setup that could not carry traffic at all.
-				// The point of saving is to have an expectation worth comparing
-				// against; a config saved out of a total egress failure would
-				// teach every future audit to call that failure "expected".
 				if upErr != nil {
 					fmt.Fprintln(os.Stderr,
 						"chainsmoke: NOT saving — this setup could not bring egress up, so there is nothing working to record")
 					return upErr
 				}
 
-				// Saved AFTER the probe, with the posture the probe proved, so
-				// what lands on disk is a setup that has carried traffic —
-				// never a wish. Saving an unanonymized one is allowed (someone
-				// running --proxy through their own VPN wants exactly that),
-				// but it is recorded and warned about, not silently blessed.
 				if err := core.SaveConfig(app.Egress, app.Net.Verified()); err != nil {
 					return err
 				}
@@ -453,16 +342,11 @@ func commands(app *core.App) []*cli.Command {
 					fmt.Fprintln(os.Stderr,
 						"chainsmoke: WARNING saved an UNANONYMIZED setup — future audits will call this one \"expected\"")
 				}
-				// The save succeeded; the audit may still have failed. Returning
-				// it keeps the exit code a statement about the SETUP, so adding
-				// --save can never turn a failing audit into a passing one.
 				return auditErr
 			},
 		},
 		{
 			Name: "purge", Usage: "Wipe transient/persistent state (both stores)",
-			// app.Purge, not app.Store.Purge: the player has to come down
-			// before the directory its IPC socket lives in is removed (T4.4).
 			Action: func(*cli.Context) error { return app.Purge() },
 		},
 		{
@@ -487,23 +371,15 @@ func commands(app *core.App) []*cli.Command {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Entry point
-// -----------------------------------------------------------------------------
-
 func main() {
 	app := &core.App{Version: BuildVersion}
 
 	cliApp := &cli.App{
 		Name:                 "chainsmoke",
-		Usage:                "A privacy-focused SoundCloud CLI over Tor: search, likes, playlists, playback",
+		Usage:                "Privacy-focused SoundCloud CLI over Tor: search, likes, playlists, playback",
 		Version:              BuildVersion,
 		EnableBashCompletion: true,
 		Flags:                globalFlags(),
-		// Before is the single place global flags are read. Constructing the
-		// runtime here (rather than in main, from raw argv) is what lets
-		// --proxy/--impersonate actually reach the subsystems — previously they
-		// were declared, parsed, and then ignored (TASKS.md T1.2).
 		Before: func(c *cli.Context) error {
 			wire(app,
 				c.Bool("remember"), c.Bool("private"),
@@ -511,17 +387,6 @@ func main() {
 				c.Bool("allow-direct"), c.String("tor-socks"))
 			return nil
 		},
-		// After runs on every exit path the CLI controls. Without it a private
-		// tor spawned by Up() is ORPHANED: the process exits, Down() never runs,
-		// and the daemon plus its temp DataDirectory outlive us forever. A
-		// DETECTED system tor is never touched — Down() only kills what we own.
-		//
-		// NOT covered: signals. A running play session traps Ctrl+C and returns
-		// through here (session.go); Ctrl+C, SIGTERM or a closed terminal
-		// anywhere else skips this. The private tor still goes — its torrc
-		// names this process as owner, so it exits ~12s after we do — and its
-		// DataDirectory goes at the next private-tor spawn, which sweeps the
-		// dirs of owners that are gone (T10.9; 2026-10-05 review, R10).
 		After: func(*cli.Context) error {
 			if app.Net != nil {
 				return app.Net.Down()
@@ -532,45 +397,26 @@ func main() {
 	}
 
 	if err := cliApp.Run(os.Args); err != nil {
-		// Clean, script-friendly failure. No stack traces in the user's face.
 		fmt.Fprintln(os.Stderr, "chainsmoke:", err)
 		os.Exit(1)
 	}
 }
 
-// banner is the Before hook on the verbs that reach SoundCloud or drive the
-// player session: search, likes, playlist, play, get, and daemon start/stop/
-// status. Everything else — help, --version, completion, the transport remote
-// controls, audit/rotate/purge — prints no art (dev's call, 2026-09-28).
-//
-// A hook rather than a print in main() so that urfave decides what counts as
-// help, not a hand-rolled argv scan: Command.Run returns for --help/-h and for
-// the completion protocol BEFORE it calls Before (command.go, v2.27.7), so
-// `search --help`, `daemon start --help` and TAB never reach it. It must sit on
-// the leaf commands, never on `daemon` itself: a parent's Before runs before
-// its subcommand has parsed --help.
-//
-// A piped stdout gets nothing, for the reason the results table becomes TSV
-// there (core.PrintResults): `chainsmoke search x | cut -f2` must read data,
-// not art. Any other Writer was handed to us deliberately — the tests.
 func banner(c *cli.Context) error {
 	w := c.App.Writer
 	if w == os.Stdout && !core.StdoutIsTerminal() {
 		return nil
 	}
 	if c.App.Metadata[inSession] == true {
-		return nil // the window that opened the session already shows it
+		return nil
 	}
 	printBanner(w)
 	return nil
 }
 
-// printBanner writes the logo and wordmark to w.
 func printBanner(w io.Writer) {
 	const outline = `==============================================================================`
 
-	// Raw string literals: the art contains backslashes, so it must never be
-	// re-quoted and must never contain a backtick (TASKS.md T10.11).
 	const logo = `                      ;:***;**;
                      *ff?????*****??;::
               ;;;*;**f?******?aaaI***??:   ;**:

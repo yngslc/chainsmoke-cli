@@ -14,18 +14,6 @@ import (
 	"chainsmoke/pkg/store"
 )
 
-// -----------------------------------------------------------------------------
-// Verb wiring (TASKS.md T9.1)
-// -----------------------------------------------------------------------------
-//
-// These test the WIRING, never the entry point. That distinction is deliberate:
-// T10.1/T10.2 will rewrite how a bare invocation is routed, so anything
-// asserting that would have to be written twice. The command table — including
-// which verbs open with the banner — wire(), and the order in which a verb
-// touches its subsystems are the parts Phase 10 leaves alone.
-
-// recordingNet counts Up() and can refuse it, which is how the fail-closed
-// ordering below gets proven rather than assumed.
 type recordingNet struct {
 	ups       int
 	upErr     error
@@ -43,8 +31,6 @@ func (n *recordingNet) ProxyURL() string { return n.proxy }
 func (n *recordingNet) Assert() error    { return n.assert }
 func (n *recordingNet) Verified() bool   { return n.assert == nil }
 
-// recordingResolver records whether SoundCloud was reached for. Every method
-// counts: the invariant is that NONE of them run before egress is up.
 type recordingResolver struct{ calls int }
 
 func (r *recordingResolver) Meta(string) ([]core.Track, error) {
@@ -76,9 +62,6 @@ type nopScrub struct{}
 
 func (nopScrub) Scrub(string, string, bool) error { return nil }
 
-// runVerb drives one verb through real urfave/cli parsing against a pre-wired
-// App. It deliberately sets no Before hook: wire() must not run and replace the
-// fakes with real subsystems.
 func runVerb(app *core.App, args ...string) error {
 	cliApp := &cli.App{
 		Name:      "chainsmoke",
@@ -97,18 +80,11 @@ func wiredApp() (*core.App, *recordingNet, *recordingResolver, *recordingPlayer)
 	app := &core.App{
 		Net: n, Res: r, Play: p, Store: nopStore{}, Scrub: nopScrub{},
 		Out:   &bytes.Buffer{},
-		Stdin: strings.NewReader(""), // never block on a prompt
+		Stdin: strings.NewReader(""),
 	}
 	return app, n, r, p
 }
 
-// TestEgressVerbsGateOnUp is the T0.2 invariant checked at the CLI layer, which
-// is the layer where it is easiest to lose: adding a verb means remembering to
-// call Net.Up() first, and nothing but a test enforces remembering. `search`
-// was once exactly this bug (T1.1) — it reached the resolver without ever
-// bringing the chokepoint up.
-//
-// With Up() refusing, the resolver must not be touched at all.
 func TestEgressVerbsGateOnUp(t *testing.T) {
 	refuse := errors.New("refusing to run unanonymized")
 
@@ -142,9 +118,6 @@ func TestEgressVerbsGateOnUp(t *testing.T) {
 	}
 }
 
-// TestNonEgressVerbsDoNotBringEgressUp: the transport verbs talk only to a
-// local mpv socket. Calling Up() there would spawn a Tor bootstrap to change
-// the volume, and on a machine with no Tor it would fail the verb outright.
 func TestNonEgressVerbsDoNotBringEgressUp(t *testing.T) {
 	for _, args := range [][]string{
 		{"np"}, {"toggle"}, {"vol", "50"}, {"next"}, {"prev"}, {"pause"}, {"stop"},
@@ -159,9 +132,6 @@ func TestNonEgressVerbsDoNotBringEgressUp(t *testing.T) {
 	}
 }
 
-// TestPlayRejectsBadInputBeforeStartingThePlayer: a `play` that is going to fail
-// on its argument must not spawn mpv first. It used to call Ensure() before
-// reading the argument, so every typo left a daemon running behind it.
 func TestPlayRejectsBadInputBeforeStartingThePlayer(t *testing.T) {
 	for name, args := range map[string][]string{
 		"URL in argv":        {"play", "https://soundcloud.com/artist/track"},
@@ -175,18 +145,12 @@ func TestPlayRejectsBadInputBeforeStartingThePlayer(t *testing.T) {
 		if p.ensures != 0 {
 			t.Errorf("%s: Ensure() ran %d times before the argument was rejected", name, p.ensures)
 		}
-		// An argv argument is checked before Up() too: a typo must not cost a
-		// circuit (TASKS.md:405). The stdin URL is read after Up() on purpose.
 		if wantUps := map[bool]int{true: 0, false: 1}[len(args) > 1]; n.ups != wantUps {
 			t.Errorf("%s: Net.Up() ran %d times, want %d", name, n.ups, wantUps)
 		}
 	}
 }
 
-// TestCommandTableIsWellFormed catches the class of mistake that breaks every
-// verb at once. A duplicate name or alias is the specific one that has bitten
-// this CLI before: urfave/cli resolves the FIRST match, so a second `pause`
-// silently shadows whatever it collides with.
 func TestCommandTableIsWellFormed(t *testing.T) {
 	app, _, _, _ := wiredApp()
 
@@ -214,24 +178,13 @@ func TestCommandTableIsWellFormed(t *testing.T) {
 	walk(commands(app), "")
 }
 
-// TestBannerClassification pins which commands open with the ASCII banner, and
-// it covers EVERY command path: a verb added later is missing from this table
-// and fails here until someone decides which side it is on. The rule (dev,
-// 2026-09-28): the banner is for reaching SoundCloud or driving the player
-// session — never help, completion, the remote controls, or maintenance.
 func TestBannerClassification(t *testing.T) {
 	want := map[string]bool{
-		// reaches SoundCloud
 		"search": true, "likes": true, "playlist": true, "play": true, "get": true,
-		// drives the player session
 		"daemon start": true, "daemon stop": true, "daemon status": true,
-		// The parent stays bare: its Before runs before the subcommand parses
-		// --help, so a hook here would print art above `daemon start --help`.
 		"daemon": false,
-		// remote controls: frequent, local, and would drown in art
-		"np": false, "toggle": false, "seek": false, "vol": false,
+		"np":     false, "toggle": false, "seek": false, "vol": false,
 		"next": false, "prev": false, "pause": false, "stop": false,
-		// maintenance and meta
 		"rotate": false, "audit": false, "purge": false, "completion": false,
 	}
 
@@ -261,11 +214,6 @@ func TestBannerClassification(t *testing.T) {
 	}
 }
 
-// TestBannerSkipsHelpAndCompletion runs real argv through urfave and checks
-// what reaches the writer. The table above says which commands carry the hook;
-// this proves urfave never calls it for help, --version or completion —
-// `chainsmoke --help` and `chainsmoke daemon --help` were the dev's two named
-// cases — and that an alias shares its command's hook.
 func TestBannerSkipsHelpAndCompletion(t *testing.T) {
 	var art bytes.Buffer
 	printBanner(&art)
@@ -275,10 +223,10 @@ func TestBannerSkipsHelpAndCompletion(t *testing.T) {
 		banner bool
 	}{
 		{[]string{"search", "x"}, true},
-		{[]string{"ls", "x"}, true}, // an alias is the same *cli.Command
+		{[]string{"ls", "x"}, true},
 		{[]string{"daemon", "start"}, true},
 
-		{nil, false}, // bare invocation shows help (until T10.1 routes it to the TUI)
+		{nil, false},
 		{[]string{"--help"}, false},
 		{[]string{"-h"}, false},
 		{[]string{"--version"}, false},
@@ -310,14 +258,6 @@ func TestBannerSkipsHelpAndCompletion(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Store selection: the remember/private matrix (T9.1)
-// -----------------------------------------------------------------------------
-
-// TestWireStoreSelection pins invariant #4 at the point the decision is made.
-// pkg/store proves each backend behaves correctly; this proves the FLAGS pick
-// the backend the user asked for — and that --private wins, which is the whole
-// reason it exists as a separate flag rather than an absence of --remember.
 func TestWireStoreSelection(t *testing.T) {
 	runtimeDir, stateDir := isolateStoreDirs(t)
 
@@ -346,9 +286,6 @@ func TestWireStoreSelection(t *testing.T) {
 	}
 }
 
-// TestWireHandsDownEgressFlags: the flags are read in exactly one place and
-// passed down (T1.2). Before that fix --proxy and --impersonate were parsed and
-// then ignored, so the values reaching the subsystems are worth asserting.
 func TestWireHandsDownEgressFlags(t *testing.T) {
 	isolateStoreDirs(t)
 
@@ -377,8 +314,6 @@ func TestWireHandsDownEgressFlags(t *testing.T) {
 	}
 }
 
-// isolateStoreDirs points both store directories at the test's own temp dir, so
-// wiring a disk store never touches the developer's real state.
 func isolateStoreDirs(t *testing.T) (runtimeDir, stateDir string) {
 	t.Helper()
 	root := t.TempDir()
@@ -387,16 +322,8 @@ func isolateStoreDirs(t *testing.T) (runtimeDir, stateDir string) {
 	return core.RuntimeDir(), core.StateDir()
 }
 
-// keep the store import honest: wire() returns core.Store, and this asserts the
-// concrete package still satisfies the describing interface the audit relies on.
 var _ core.Store = store.New(false, true)
 
-// TestRotateOnItsOwnBuildsNoBridge: a one-shot `chainsmoke rotate` used to
-// bring up a bridge of its own, re-isolate it and exit — changing nothing for
-// the session that was playing, while printing that the next stream had a
-// fresh circuit (2026-10-19 review, A-3). On its own it sends NEWNYM only, and
-// when that fails it says where rotating does work. At the prompt it rotates
-// the session's own bridge.
 func TestRotateOnItsOwnBuildsNoBridge(t *testing.T) {
 	app, n, _, _ := wiredApp()
 	n.rotateErr = errors.New("connection refused")

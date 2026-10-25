@@ -16,7 +16,6 @@ func TestLikesURL(t *testing.T) {
 	if want := "https://soundcloud.com/ghostinnafurcoat/likes"; got != want {
 		t.Errorf("LikesURL = %q, want %q", got, want)
 	}
-	// Surrounding slop is the user being helpful, not an attack.
 	if got, err := LikesURL("  /ghostinnafurcoat/ "); err != nil || !strings.HasSuffix(got, "/ghostinnafurcoat/likes") {
 		t.Errorf("LikesURL(padded) = %q, %v", got, err)
 	}
@@ -26,7 +25,7 @@ func TestSetURL(t *testing.T) {
 	const want = "https://soundcloud.com/ghostinnafurcoat/sets/late-night"
 	for _, in := range []string{
 		"ghostinnafurcoat/late-night",
-		"ghostinnafurcoat/sets/late-night", // the shape people actually copy
+		"ghostinnafurcoat/sets/late-night",
 		"ghostinnafurcoat/late-night/",
 	} {
 		got, err := SetURL(in)
@@ -39,7 +38,6 @@ func TestSetURL(t *testing.T) {
 		}
 	}
 
-	// One segment cannot name a set: slugs are unique per user, not globally.
 	if _, err := SetURL("ghostinnafurcoat"); err == nil {
 		t.Error("SetURL accepted a bare handle")
 	} else if !strings.Contains(err.Error(), "<user>/<set>") {
@@ -47,10 +45,6 @@ func TestSetURL(t *testing.T) {
 	}
 }
 
-// TestPageURLsCannotLeaveSoundCloud is the security property these two builders
-// exist to hold. They take user input and produce the URL handed to the ONE
-// egress chokepoint, so the host has to be soundcloud.com no matter what is
-// typed — every one of these must either be refused or come back pointing home.
 func TestPageURLsCannotLeaveSoundCloud(t *testing.T) {
 	hostile := []string{
 		"https://evil.com/x",
@@ -74,7 +68,7 @@ func TestPageURLsCannotLeaveSoundCloud(t *testing.T) {
 	check := func(t *testing.T, name, raw string, err error) {
 		t.Helper()
 		if err != nil {
-			return // refused: the other acceptable outcome
+			return
 		}
 		u, perr := url.Parse(raw)
 		if perr != nil {
@@ -97,9 +91,6 @@ func TestPageURLsCannotLeaveSoundCloud(t *testing.T) {
 	}
 }
 
-// TestPastedURLGetsTheInvariantMessage: someone who pastes the whole URL should
-// be told about invariant #3, not handed a puzzle about which character was
-// wrong.
 func TestPastedURLGetsTheInvariantMessage(t *testing.T) {
 	for _, in := range []string{
 		"https://soundcloud.com/ghostinnafurcoat/likes",
@@ -112,12 +103,10 @@ func TestPastedURLGetsTheInvariantMessage(t *testing.T) {
 			continue
 		}
 		if !strings.Contains(err.Error(), "world-readable") {
-			t.Errorf("LikesURL(%q) = %q, want the invariant-#3 explanation", in, err)
+			t.Errorf("LikesURL(%q) = %q, want the no-URLs-in-argv explanation", in, err)
 		}
 	}
 }
-
-// --- Collect ------------------------------------------------------------------
 
 type metaResolver struct {
 	tracks []Track
@@ -150,10 +139,6 @@ func collectTracks(n int) []Track {
 	return ts
 }
 
-// TestCollectCachesExactlyWhatItPrints is the one that matters: `play 3` indexes
-// into the CACHE, and the user chose 3 from the SCREEN. If the two ever diverge,
-// the wrong track plays — and it would look like a resolver bug, not a display
-// one.
 func TestCollectCachesExactlyWhatItPrints(t *testing.T) {
 	res := &metaResolver{tracks: collectTracks(5)}
 	st := &recordingStore{}
@@ -181,8 +166,6 @@ func TestCollectCachesExactlyWhatItPrints(t *testing.T) {
 	}
 }
 
-// TestCollectWithoutLimitKeepsEverything: a playlist IS the result set, so the
-// default has to be the whole thing rather than search's 10.
 func TestCollectWithoutLimitKeepsEverything(t *testing.T) {
 	res := &metaResolver{tracks: collectTracks(20)}
 	st := &recordingStore{}
@@ -199,9 +182,6 @@ func TestCollectWithoutLimitKeepsEverything(t *testing.T) {
 	}
 }
 
-// TestCollectAddsTheRecoveryHint routes Meta failures through the same taxonomy
-// `search` and `play` use, so a stale extractor reads the same whichever verb
-// hit it.
 func TestCollectAddsTheRecoveryHint(t *testing.T) {
 	boom := errors.New("HTTP Error 404")
 	app := &App{
@@ -218,8 +198,6 @@ func TestCollectAddsTheRecoveryHint(t *testing.T) {
 	}
 }
 
-// TestCollectDoesNotPrintWhenTheCacheFails: printing a numbered list that `play
-// N` cannot resolve is worse than printing nothing.
 func TestCollectDoesNotPrintWhenTheCacheFails(t *testing.T) {
 	var out bytes.Buffer
 	app := &App{
@@ -245,7 +223,6 @@ func TestHandleOrStdin(t *testing.T) {
 		t.Errorf("HandleOrStdin(stdin) = %q, %v", got, err)
 	}
 
-	// Closed stdin must produce the usage line, not a bare "EOF".
 	empty := &App{Stdin: strings.NewReader("")}
 	_, err := empty.HandleOrStdin("", "p: ", "usage: chainsmoke likes <user>")
 	if err == nil {

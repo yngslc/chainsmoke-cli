@@ -12,8 +12,6 @@ func render(ts []Track, width int, tty bool) string {
 	return b.String()
 }
 
-// lines returns the rendered rows with the horizontal rule dropped, since the
-// rule is decoration and every other assertion is about the columns.
 func lines(out string) []string {
 	var got []string
 	for _, ln := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
@@ -25,13 +23,6 @@ func lines(out string) []string {
 	return got
 }
 
-// TestTableColumnsAlign is the load-bearing one, and it is why the width
-// arithmetic exists at all. TIME is the last column and right-aligned, so with
-// correct display-width math EVERY row ends at exactly the same cell — a
-// property that survives being read by a machine, unlike squinting at output.
-//
-// The CJK and emoji rows are the point: len() and RuneCountInString both get
-// them wrong, in opposite directions.
 func TestTableColumnsAlign(t *testing.T) {
 	ts := []Track{
 		{Title: "Lemon Black", Uploader: "Roshina", Duration: 68},
@@ -59,11 +50,6 @@ func TestTableColumnsAlign(t *testing.T) {
 	}
 }
 
-// TestTableDropsColumnsTheDataDoesNotHave. Measured 2026-08-24 through Tor:
-// scsearch entries carry uploader and duration, but user pages (/likes,
-// /tracks) come back from --flat-playlist with only id, title and url. Two
-// columns of blanks on every row of a `likes` listing would be noise paid for
-// out of the title's width.
 func TestTableDropsColumnsTheDataDoesNotHave(t *testing.T) {
 	likes := []Track{
 		{Title: "Copper Chantilly"},
@@ -80,8 +66,6 @@ func TestTableDropsColumnsTheDataDoesNotHave(t *testing.T) {
 		t.Errorf("titles missing:\n%s", out)
 	}
 
-	// One row with a duration is enough to earn the column back — and the rows
-	// without one say "--" rather than "0:00".
 	mixed := append([]Track{{Title: "Known", Duration: 90}}, likes...)
 	out = render(mixed, 100, true)
 	if !strings.Contains(out, "TIME") {
@@ -92,9 +76,6 @@ func TestTableDropsColumnsTheDataDoesNotHave(t *testing.T) {
 	}
 }
 
-// TestTableNeverPrintsThePermalink pins invariant #3 at the last place a URL
-// could escape into a terminal, a scrollback buffer, or a screenshot. The same
-// shape of test guards the player's signed URLs.
 func TestTableNeverPrintsThePermalink(t *testing.T) {
 	const secret = "https://soundcloud.com/ghostinnafurcoat/lemon-black"
 	ts := []Track{{Title: "Lemon Black", Uploader: "Roshina", Duration: 68, Permalink: secret, ID: "2386417872"}}
@@ -107,10 +88,6 @@ func TestTableNeverPrintsThePermalink(t *testing.T) {
 	}
 }
 
-// TestCleanRejectsHostileTitles: titles are third-party text. A newline would
-// forge an extra numbered row (pointing `play N` at a track the user never
-// saw), a tab would wreck the TSV form, and an ESC would let a track title
-// repaint the terminal.
 func TestCleanRejectsHostileTitles(t *testing.T) {
 	ts := []Track{{
 		Title:    "Innocent\n  9  Totally Legit Track",
@@ -119,7 +96,7 @@ func TestCleanRejectsHostileTitles(t *testing.T) {
 	}}
 
 	out := render(ts, 100, true)
-	if n := len(lines(out)); n != 2 { // header + exactly one row
+	if n := len(lines(out)); n != 2 {
 		t.Errorf("a newline in a title forged rows: got %d lines\n%s", n, out)
 	}
 
@@ -133,8 +110,6 @@ func TestCleanRejectsHostileTitles(t *testing.T) {
 		t.Errorf("ESC survived into the output — a title can repaint the terminal:\n%q", esc)
 	}
 
-	// Past ASCII (2026-10-19 review, CQ-5): CSI's one-character form, a bidi
-	// override that reorders the row, and Unicode's own line separator.
 	for _, hostile := range []string{"a\u009b31mred", "song ‮kcart‬", "one two", "one\u0085two"} {
 		got := Clean(hostile)
 		if strings.ContainsAny(got, "\u009b‮‬ \u0085") {
@@ -146,9 +121,6 @@ func TestCleanRejectsHostileTitles(t *testing.T) {
 	}
 }
 
-// TestRenderTSVIsStable: a pipe gets the same four fields every time, whatever
-// the data looks like, because a script that has to detect the column count is
-// a script that breaks.
 func TestRenderTSVIsStable(t *testing.T) {
 	ts := []Track{
 		{Title: "Lemon Black", Uploader: "Roshina", Duration: 68},
@@ -161,7 +133,6 @@ func TestRenderTSVIsStable(t *testing.T) {
 	if out[0] != "1\tLemon Black\tRoshina\t68" {
 		t.Errorf("row 1 = %q", out[0])
 	}
-	// Empty, not 0: "SoundCloud did not say" is not "zero seconds long".
 	if out[1] != "2\tNo Metadata\t\t" {
 		t.Errorf("row 2 = %q, want empty uploader and empty duration", out[1])
 	}
@@ -172,7 +143,7 @@ func TestRenderTSVIsStable(t *testing.T) {
 
 func TestFormatDuration(t *testing.T) {
 	cases := map[int]string{
-		-1: "--", 0: "--", // unknown, never "0:00"
+		-1: "--", 0: "--",
 		5: "0:05", 68: "1:08", 599: "9:59", 600: "10:00",
 		3599: "59:59", 3600: "1:00:00", 4021: "1:07:01", 36000: "10:00:00",
 	}
@@ -187,12 +158,12 @@ func TestDisplayWidth(t *testing.T) {
 	cases := map[string]int{
 		"":        0,
 		"abc":     3,
-		"夜に駆ける":   10, // 5 wide runes
+		"夜に駆ける":   10,
 		"🎧":       2,
-		"é":      1, // combining acute adds no cell
-		"​hidden": 6, // zero-width space
+		"é":      1,
+		"​hidden": 6,
 		"Ünïcödé": 7,
-		"ＡＢ":      4, // fullwidth latin
+		"ＡＢ":      4,
 	}
 	for s, want := range cases {
 		if got := displayWidth(s); got != want {
@@ -201,9 +172,6 @@ func TestDisplayWidth(t *testing.T) {
 	}
 }
 
-// TestTruncateNeverExceedsItsBudget: the cut has to land on a rune boundary AND
-// respect cell width, or a CJK title clipped mid-character overflows the column
-// and breaks every row below it.
 func TestTruncateNeverExceedsItsBudget(t *testing.T) {
 	inputs := []string{
 		"short",
@@ -233,16 +201,12 @@ func TestOutputWidthPrefersColumns(t *testing.T) {
 	if got := OutputWidth(); got != 137 {
 		t.Errorf("OutputWidth() = %d, want 137 — an exported COLUMNS is an explicit intent", got)
 	}
-	// Garbage must fall through to detection/default rather than to zero, which
-	// would render a one-cell-wide table.
 	t.Setenv("COLUMNS", "not-a-number")
 	if got := OutputWidth(); got <= 0 {
 		t.Errorf("OutputWidth() = %d with a malformed COLUMNS, want a usable width", got)
 	}
 }
 
-// TestRenderEmptyIsSilent: `search` errors before it can hand us nothing, but a
-// panic here would take out the whole verb for a case that costs one line.
 func TestRenderEmptyIsSilent(t *testing.T) {
 	if out := render(nil, 80, true); out != "" {
 		t.Errorf("rendered %q for an empty set", out)

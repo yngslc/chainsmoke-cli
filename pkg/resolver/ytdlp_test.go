@@ -17,8 +17,6 @@ import (
 	"chainsmoke/pkg/core"
 )
 
-// fakeNet is a Net that never brings anything up. gate decides whether Assert
-// permits egress; rotates counts what the retry policy asked for.
 type fakeNet struct {
 	gate      error
 	proxy     string
@@ -34,9 +32,6 @@ func (n *fakeNet) ProxyURL() string { return n.proxy }
 func (n *fakeNet) Assert() error    { return n.gate }
 func (n *fakeNet) Verified() bool   { return n.gate == nil }
 
-// TestFailClosed is the T0.2 regression guard: with the gate shut, no resolver
-// entry point may reach the exec path. It passes on a machine with no yt-dlp
-// precisely because nothing should be run.
 func TestFailClosed(t *testing.T) {
 	r := New(&fakeNet{gate: errors.New("egress not verified")}, "chrome")
 
@@ -51,8 +46,6 @@ func TestFailClosed(t *testing.T) {
 	}
 }
 
-// TestProxyArgs pins the sentinel handling: ProxyURL returns prose, not a URL,
-// when there is no proxy, and "--proxy DIRECT (no proxy)" must never be built.
 func TestProxyArgs(t *testing.T) {
 	for _, tc := range []struct {
 		proxy string
@@ -70,8 +63,6 @@ func TestProxyArgs(t *testing.T) {
 	}
 }
 
-// TestClassify feeds classify the stderr real yt-dlp 2026.07.04 produced on the
-// dev target. Synthetic strings would only prove the matchers match themselves.
 func TestClassify(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -79,9 +70,6 @@ func TestClassify(t *testing.T) {
 		want   error
 	}{
 		{
-			// curl_cffi path (--impersonate): names the extractor, never the
-			// proxy. Classifying this as a stale extractor is the exact
-			// misdiagnosis T3.5 exists to prevent.
 			name:   "dead http proxy via curl_cffi",
 			stderr: "ERROR: [soundcloud] Unable to download webpage: Failed to perform, curl: (7) Failed to connect to 127.0.0.1 port 9 after 2038 ms: Could not connect to server.",
 			want:   core.ErrEgress,
@@ -92,7 +80,6 @@ func TestClassify(t *testing.T) {
 			want:   core.ErrEgress,
 		},
 		{
-			// The OS message is localized; only the number is stable.
 			name:   "dead socks proxy, localized OS error",
 			stderr: "ERROR: [soundcloud] Unable to download webpage: SocksHTTPSConnection(host='soundcloud.com', port=443): Failed to establish a new connection: [WinError 10061] Подключение не установлено",
 			want:   core.ErrEgress,
@@ -113,18 +100,11 @@ func TestClassify(t *testing.T) {
 			want:   core.ErrStaleExtractor,
 		},
 		{
-			// Found live 2026-08-24 on a yt-dlp without curl_cffi. Nothing left
-			// the machine, so the retry policy must not spend circuits on it and
-			// the hint must not blame SoundCloud.
 			name:   "rejected impersonate target",
 			stderr: "yt_dlp.utils.YoutubeDLError: Impersonate target \"smoke-invalid\" is not available. Use --list-impersonate-targets to see available targets. You may be missing dependencies required to support this target.",
 			want:   core.ErrImpersonate,
 		},
 		{
-			// Verbatim stderr from `chainsmoke likes` against a mistyped handle,
-			// 2026-08-24. The Python deprecation warning is deliberately kept in
-			// the fixture: it is what yt-dlp actually printed first, and it used
-			// to lead the message the user saw.
 			name: "no such user (404)",
 			stderr: "Deprecated Feature: Support for Python version 3.10 has been deprecated. Please update to Python 3.11 or above\n" +
 				"ERROR: [soundcloud:user] ktotyt: Unable to download JSON metadata: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)",
@@ -143,8 +123,6 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestClassifyTimeout: the killed process reports a generic status, so the
-// deadline has to be read off the context or it is reported as a yt-dlp fault.
 func TestClassifyTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
@@ -154,16 +132,11 @@ func TestClassifyTimeout(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("classify() = %v, want a timeout error", err)
 	}
-	// It must also be an egress fault: that is what makes run() rotate and
-	// retry rather than surrender, and what keeps the "yt-dlp -U" hint away
-	// from a failure yt-dlp cannot fix.
 	if !errors.Is(err, core.ErrEgress) {
 		t.Errorf("classify() = %v, want it to wrap core.ErrEgress", err)
 	}
 }
 
-// TestParseBothShapes covers T3.1's real requirement: `play <track-url>` and
-// `play <set-url>` hand Meta two different JSON documents.
 func TestParseBothShapes(t *testing.T) {
 	const set = `{"_type":"playlist","id":"98765","title":"a set",
 	  "entries":[
@@ -181,12 +154,11 @@ func TestParseBothShapes(t *testing.T) {
 	if len(tracks) != 2 {
 		t.Fatalf("set: got %d tracks, want 2", len(tracks))
 	}
-	// T1.11: entry 1 has only "url", entry 2 only "webpage_url".
 	if tracks[0].Permalink != "https://soundcloud.com/a/one" ||
 		tracks[1].Permalink != "https://soundcloud.com/a/two" {
 		t.Errorf("set: permalinks = %q, %q", tracks[0].Permalink, tracks[1].Permalink)
 	}
-	if tracks[0].Duration != 123 { // float in the JSON, seconds in core.Track
+	if tracks[0].Duration != 123 {
 		t.Errorf("set: duration = %d, want 123", tracks[0].Duration)
 	}
 
@@ -202,8 +174,6 @@ func TestParseBothShapes(t *testing.T) {
 		t.Fatalf("single: got %+v", tracks)
 	}
 
-	// An EMPTY set must not degrade into "one track whose URL is the set page":
-	// mpv would be handed an HTML page to play.
 	var empty ytResult
 	if err := json.Unmarshal([]byte(`{"_type":"playlist","id":"5","entries":[]}`), &empty); err != nil {
 		t.Fatalf("empty: %v", err)
@@ -213,8 +183,6 @@ func TestParseBothShapes(t *testing.T) {
 	}
 }
 
-// TestToTracksSkips: an entry with no URL is unplayable, but it must cost only
-// itself (T1.14), and a blank title must not print as a blank row.
 func TestToTracksSkips(t *testing.T) {
 	got := toTracks([]ytEntry{
 		{ID: "1", Title: "kept", URL: "https://soundcloud.com/a/1"},
@@ -229,10 +197,6 @@ func TestToTracksSkips(t *testing.T) {
 	}
 }
 
-// TestTitleFromSlug covers the shape that made `playlist` unusable. MEASURED
-// 2026-08-24: a SET's flat entries are `_type: "url_transparent"` and carry
-// album, id and url — and NO title — so every row printed "(untitled)" until
-// the slug became the fallback.
 func TestTitleFromSlug(t *testing.T) {
 	cases := map[string]string{
 		"https://soundcloud.com/changing-currents/like-a-star-x-bicycle-changing-currents-mashup": "Like a star x bicycle changing currents mashup",
@@ -252,10 +216,6 @@ func TestTitleFromSlug(t *testing.T) {
 	}
 }
 
-// TestSlugTitleIsNotAURL is the invariant-#3 half of the decision above. The
-// slug discloses exactly what a title column already discloses; what must never
-// escape is anything that reconstructs the address — the scheme, the host, the
-// user segment, or a pasteable link.
 func TestSlugTitleIsNotAURL(t *testing.T) {
 	const permalink = "https://soundcloud.com/ghostinnafurcoat/lemon-black"
 	got := toTracks([]ytEntry{{ID: "1", URL: permalink}})
@@ -273,8 +233,6 @@ func TestSlugTitleIsNotAURL(t *testing.T) {
 	}
 }
 
-// TestFirstLine: yt-dlp prints a deprecation warning before the ERROR line, and
-// diagnostics can carry a signed CDN URL — a credential.
 func TestFirstLine(t *testing.T) {
 	const stderr = "Deprecated Feature: Support for Python version 3.10 has been deprecated\n" +
 		"ERROR: unable to download https://cf-hls-media.sndcdn.com/x?Policy=abc&Signature=secret\n"
@@ -288,10 +246,6 @@ func TestFirstLine(t *testing.T) {
 	}
 }
 
-// TestClassifyImpersonate: a rejected --impersonate is our own flag failing
-// before any request leaves, and yt-dlp reports it as a Python traceback whose
-// first line ("Traceback (most recent call last):") says nothing. Real stderr
-// from yt-dlp 2026.07.04.
 func TestClassifyImpersonate(t *testing.T) {
 	const stderr = `Traceback (most recent call last):
   File "YoutubeDL.py", line 770, in __init__
@@ -306,8 +260,6 @@ yt_dlp.utils.YoutubeDLError: Impersonate target "smoke-invalid" is not available
 	if strings.Contains(err.Error(), "Traceback") {
 		t.Errorf("classify() surfaced the traceback header instead of the exception: %v", err)
 	}
-	// It is not a SoundCloud problem: none of the three sentinels may claim it,
-	// or the CLI hint sends the user to `yt-dlp -U` for a flag they set.
 	for _, sentinel := range []error{core.ErrEgress, core.ErrRateLimited, core.ErrStaleExtractor} {
 		if errors.Is(err, sentinel) {
 			t.Errorf("classify() = %v, must not be %v", err, sentinel)
@@ -315,8 +267,6 @@ yt_dlp.utils.YoutubeDLError: Impersonate target "smoke-invalid" is not available
 	}
 }
 
-// TestClassifyTorTimeout: over Tor the common failure is not a refusal but a
-// circuit that never completes. Real stderr from a live run through a bad exit.
 func TestClassifyTorTimeout(t *testing.T) {
 	const stderr = "ERROR: [soundcloud:search] Unable to download webpage: Failed to perform, " +
 		"curl: (28) Connection timed out after 20003 milliseconds."
@@ -327,10 +277,6 @@ func TestClassifyTorTimeout(t *testing.T) {
 	}
 }
 
-// TestParseLiveSearchShape pins the document SoundCloud actually returned
-// through Tor on 2026-08-19 (trimmed to the fields we read). The thumbnails
-// array is the trap it guards: entries carry nested "url" keys that must never
-// be mistaken for the permalink.
 func TestParseLiveSearchShape(t *testing.T) {
 	const live = `{"id": "roshina", "title": "roshina", "_type": "playlist", "entries": [
 	  {"_type": "url", "id": "2378008949", "title": "Shanghai Lullaby", "uploader": "Roshina",
@@ -353,15 +299,11 @@ func TestParseLiveSearchShape(t *testing.T) {
 	if tracks[0].Permalink != "https://soundcloud.com/ghostinnafurcoat/shanghai-lullaby" {
 		t.Errorf("permalink = %q — a nested thumbnail url must never win", tracks[0].Permalink)
 	}
-	// T8.1 needs both of these to fill its table; flat entries do carry them.
 	if tracks[0].Uploader != "Roshina" || tracks[0].Duration != 112 {
 		t.Errorf("uploader/duration = %q/%d, want Roshina/112", tracks[0].Uploader, tracks[0].Duration)
 	}
 }
 
-// stubbed returns a resolver whose exec is scripted: errs[i] is what attempt
-// i+1 returns, and a nil entry (or running past the end) succeeds. calls counts
-// attempts, so a test can assert that a retry did or did not happen.
 func stubbed(n *fakeNet, errs ...error) (r *YTDLP, calls *int) {
 	r = New(n, "")
 	count := 0
@@ -377,11 +319,6 @@ func stubbed(n *fakeNet, errs ...error) (r *YTDLP, calls *int) {
 	return r, &count
 }
 
-// TestListingsGetAListingBudget: Meta LISTS a page, and a user's likes arrive
-// a page at a time, each a Tor round-trip. Under the 45s cap sized for one
-// search request, a 1,700-track likes listing was killed mid-fetch on all
-// three attempts (dev's report, 2026-10-03). Search and Stream keep 45s; a dead
-// circuit is still caught by --socket-timeout either way.
 func TestListingsGetAListingBudget(t *testing.T) {
 	var budget time.Duration
 	r := New(&fakeNet{}, "")
@@ -405,9 +342,6 @@ func TestListingsGetAListingBudget(t *testing.T) {
 	}
 }
 
-// TestRetryPlan is the policy itself, checked against the two failure shapes
-// measured live on 2026-08-19 (see run's comment). Pure function, so the
-// 10-second distinction costs the test suite nothing.
 func TestRetryPlan(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -436,8 +370,6 @@ func TestRetryPlan(t *testing.T) {
 	}
 }
 
-// TestRetryRotatesOnBlockedExit: a 403 is SoundCloud's answer, not the path's,
-// so the second attempt must come from somewhere else.
 func TestRetryRotatesOnBlockedExit(t *testing.T) {
 	n := &fakeNet{}
 	r, calls := stubbed(n, fmt.Errorf("%w: boom", core.ErrRateLimited))
@@ -454,10 +386,6 @@ func TestRetryRotatesOnBlockedExit(t *testing.T) {
 	}
 }
 
-// TestRetryNoteIsOneShortLine: a retry used to print yt-dlp's whole error plus a
-// second line, every attempt — on a slow Tor draw, a screenful before anything
-// played (dev's report, 2026-10-03). The full error is still returned if every
-// attempt fails; the note in between only says what is happening.
 func TestRetryNoteIsOneShortLine(t *testing.T) {
 	raw := "ERROR: [soundcloud] Unable to download webpage: Failed to perform, curl: (28) Connection timed out after 15017 milliseconds"
 	for _, tc := range []struct {
@@ -475,8 +403,6 @@ func TestRetryNoteIsOneShortLine(t *testing.T) {
 	}
 }
 
-// TestRetryKeepsCircuitOnFastFailure: the stub fails instantly, which is the
-// warm-up shape. Rotating there would discard a circuit that was about to work.
 func TestRetryKeepsCircuitOnFastFailure(t *testing.T) {
 	n := &fakeNet{}
 	r, calls := stubbed(n, fmt.Errorf("%w: boom", core.ErrEgress))
@@ -489,8 +415,6 @@ func TestRetryKeepsCircuitOnFastFailure(t *testing.T) {
 	}
 }
 
-// TestNoRetryWhenRotationCannotHelp: a stale extractor is the same on every
-// circuit. Retrying it only doubles the wait before the real message lands.
 func TestNoRetryWhenRotationCannotHelp(t *testing.T) {
 	for _, cause := range []error{core.ErrStaleExtractor, ErrToolMissing} {
 		n := &fakeNet{}
@@ -505,8 +429,6 @@ func TestNoRetryWhenRotationCannotHelp(t *testing.T) {
 	}
 }
 
-// TestRetryStopsAtMaxAttempts: a persistently bad path must surface the error,
-// not loop forever.
 func TestRetryStopsAtMaxAttempts(t *testing.T) {
 	n := &fakeNet{}
 	boom := fmt.Errorf("%w: boom", core.ErrEgress)
@@ -520,9 +442,6 @@ func TestRetryStopsAtMaxAttempts(t *testing.T) {
 	}
 }
 
-// TestNoRetryWhenRotateFails: if the circuit could not be changed, the next
-// attempt would be identical. Surface the ORIGINAL cause, not the rotation's —
-// the user's problem is the blocked exit, not NEWNYM.
 func TestNoRetryWhenRotateFails(t *testing.T) {
 	n := &fakeNet{rotateErr: errors.New("no control port")}
 	r, calls := stubbed(n, fmt.Errorf("%w: boom", core.ErrRateLimited), nil)
@@ -535,9 +454,6 @@ func TestNoRetryWhenRotateFails(t *testing.T) {
 	}
 }
 
-// TestRetryPlanSkipsOurOwnMistakes: a rejected --impersonate is a flag WE
-// passed, so no number of fresh circuits can fix it. Retrying would spend three
-// Tor round-trips and ~50s to fail the same way.
 func TestRetryPlanSkipsOurOwnMistakes(t *testing.T) {
 	for _, err := range []error{
 		fmt.Errorf("%w: bad target", core.ErrImpersonate),
@@ -549,10 +465,6 @@ func TestRetryPlanSkipsOurOwnMistakes(t *testing.T) {
 	}
 }
 
-// TestUnclassifiedErrorLeadsWithTheErrorLine: the fallback branch used to join
-// ALL of stderr with "; ", so an unrecognised failure led with whatever noise
-// yt-dlp printed first — in the live 2026-08-24 case, a Python 3.10 deprecation
-// warning that had nothing to do with the failure.
 func TestUnclassifiedErrorLeadsWithTheErrorLine(t *testing.T) {
 	const stderr = "Deprecated Feature: Support for Python version 3.10 has been deprecated. Please update to Python 3.11 or above\n" +
 		"ERROR: [soundcloud] something we have never seen before"
@@ -567,26 +479,17 @@ func TestUnclassifiedErrorLeadsWithTheErrorLine(t *testing.T) {
 	}
 }
 
-// TestNotFoundIsNotRetried: a 404 is the same answer on every circuit, so
-// spending two more Tor round-trips (~30s) to be told again is pure loss. This
-// is the counterpart to the 403 case, which SHOULD rotate.
 func TestNotFoundIsNotRetried(t *testing.T) {
 	notFound := fmt.Errorf("%w: no such user", core.ErrNotFound)
 	if retry, rotate := retryPlan(notFound, 20*time.Second); retry || rotate {
 		t.Errorf("retryPlan(404) = retry:%v rotate:%v, want both false", retry, rotate)
 	}
-	// The contrast that makes the distinction meaningful.
 	blocked := fmt.Errorf("%w: 403", core.ErrRateLimited)
 	if retry, rotate := retryPlan(blocked, 20*time.Second); !retry || !rotate {
 		t.Errorf("retryPlan(403) = retry:%v rotate:%v, want both true", retry, rotate)
 	}
 }
 
-// TestTargetsReachYtdlpOnStdinNotArgv: every resolve put its target in
-// yt-dlp's argv, which any local user can read — the README promised track
-// URLs never reach a command line, and this was the line they reached
-// (2026-10-19 review, A-1; CH-DEBATE 2026-10-19, D-2). Each call shape must
-// end in the "-- <target>" tail that execOnce moves onto stdin.
 func TestTargetsReachYtdlpOnStdinNotArgv(t *testing.T) {
 	r := New(&fakeNet{}, "")
 	var got [][]string
@@ -626,8 +529,6 @@ func TestTargetsReachYtdlpOnStdinNotArgv(t *testing.T) {
 	}
 }
 
-// TestStdinBannerIsNotTheReason: with --batch-file -, yt-dlp opens stderr
-// with "Reading URLs from STDIN…". firstLine must still find the real line.
 func TestStdinBannerIsNotTheReason(t *testing.T) {
 	stderr := "Reading URLs from STDIN - EOF (Ctrl+Z) to end:\nsomething went wrong\n"
 	if got := firstLine(withoutStdinBanner(stderr)); got != "something went wrong" {
@@ -635,9 +536,6 @@ func TestStdinBannerIsNotTheReason(t *testing.T) {
 	}
 }
 
-// TestExecOnceKeepsTheTargetOutOfArgv runs the real exec path against a
-// stand-in yt-dlp — a copy of this test binary (TestMain) — the way the
-// debater measured the leak: what did the child's argv carry?
 func TestExecOnceKeepsTheTargetOutOfArgv(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {
@@ -674,10 +572,6 @@ func TestExecOnceKeepsTheTargetOutOfArgv(t *testing.T) {
 	}
 }
 
-// TestMain doubles as the stand-in yt-dlp for TestExecOnceKeepsTheTargetOutOfArgv.
-// It knows itself by its name, not by an environment variable: minimalEnv
-// hands yt-dlp nothing it does not list. It writes its argv and its stdin
-// beside itself, and prints a stream URL as `yt-dlp -g` would.
 func TestMain(m *testing.M) {
 	if exe, err := os.Executable(); err == nil && strings.HasPrefix(filepath.Base(exe), "yt-dlp") {
 		in, _ := io.ReadAll(os.Stdin)

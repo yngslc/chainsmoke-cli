@@ -7,9 +7,6 @@ import (
 	"testing"
 )
 
-// fakeNet is the probe half of audit. Everything audit prints about the live
-// path comes through this interface, which is exactly why T7.1 says "probed,
-// never printed from config" — swap the answers here and the report must change.
 type fakeNet struct {
 	verified  bool
 	proxy     string
@@ -25,7 +22,6 @@ func (n *fakeNet) ProxyURL() string { return n.proxy }
 func (n *fakeNet) Assert() error    { return n.assertErr }
 func (n *fakeNet) Verified() bool   { return n.verified }
 
-// auditingNet also implements EgressAuditor, the way *net.Bridge does.
 type auditingNet struct {
 	fakeNet
 	ledger EgressLedger
@@ -33,8 +29,6 @@ type auditingNet struct {
 
 func (n *auditingNet) EgressLedger() EgressLedger { return n.ledger }
 
-// describingStore implements StoreDescriber; the plain fakeStore in
-// core_test.go deliberately does not, so both branches are covered.
 type describingStore struct {
 	fakeStore
 	mode    string
@@ -43,7 +37,6 @@ type describingStore struct {
 
 func (s *describingStore) Describe() (string, int) { return s.mode, s.results }
 
-// runAudit runs Audit against an isolated config dir and returns what it wrote.
 func runAudit(t *testing.T, app *App) (string, error) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -55,14 +48,6 @@ func runAudit(t *testing.T, app *App) (string, error) {
 	return buf.String(), err
 }
 
-// TestAuditReportsProbedPosture: the posture line comes from Verified() and
-// Assert(), which only answer for what the live path actually did. A config
-// file can never make this line say TOR.
-//
-// Three states, because DIRECT and DOWN are not the same thing and the earlier
-// two-state version got the difference backwards: with egress down, nothing is
-// permitted to leave, and calling that "DIRECT — not anonymized" sends the user
-// hunting a leak that is not happening.
 func TestAuditReportsProbedPosture(t *testing.T) {
 	isolateConfig(t)
 
@@ -74,9 +59,6 @@ func TestAuditReportsProbedPosture(t *testing.T) {
 		deny   string
 	}{
 		{"verified tor", &fakeNet{verified: true, proxy: "http://127.0.0.1:1080"}, Config{}, "egress:      TOR", "DIRECT"},
-		// A CONNECT through --proxy proves something answered, not that it was
-		// Tor: a proxy that dialled nothing printed TOR ✓ (CH-DEBATE
-		// 2026-10-19, D-1).
 		{"verified --proxy", &fakeNet{verified: true, proxy: "http://127.0.0.1:8080"}, Config{Proxy: "http://127.0.0.1:8080"}, "egress:      PROXY", "TOR"},
 		{"permitted direct", &fakeNet{}, Config{}, "egress:      DIRECT", "DOWN"},
 		{"egress down", &fakeNet{assertErr: errors.New("fail-closed")}, Config{}, "egress:      DOWN", "DIRECT"},
@@ -94,7 +76,6 @@ func TestAuditReportsProbedPosture(t *testing.T) {
 		})
 	}
 
-	// The unanonymized states have to say so in words, not just in a symbol.
 	out, _ := runAudit(t, &App{Net: &fakeNet{}})
 	if !strings.Contains(out, "NOT anonymized") {
 		t.Errorf("DIRECT was not spelled out as unanonymized:\n%s", out)
@@ -105,12 +86,6 @@ func TestAuditReportsProbedPosture(t *testing.T) {
 	}
 }
 
-// TestAuditReturnsSelfTestError: audit exits non-zero when the live path is
-// broken. Printing a report and returning nil would make a failing setup look
-// like a passing one to any script that checks $?.
-// TestAuditNeverPrintsProxyCredentials: `--proxy http://user:pass@host` is a
-// valid proxy, and audit printed ProxyURL() verbatim, password included
-// (found 2026-10-03 beside CH-DEBATE-2026-10-03 #8).
 func TestAuditNeverPrintsProxyCredentials(t *testing.T) {
 	isolateConfig(t)
 	out, _ := runAudit(t, &App{Net: &fakeNet{verified: true, proxy: "http://alice:s3cretpw@127.0.0.1:8118"}})
@@ -132,8 +107,6 @@ func TestAuditReturnsSelfTestError(t *testing.T) {
 	}
 }
 
-// TestAuditWithoutSavedConfigPointsAtTheCommand: the first run must teach the
-// verb that fixes it rather than silently omitting the section.
 func TestAuditWithoutSavedConfigPointsAtTheCommand(t *testing.T) {
 	isolateConfig(t)
 
@@ -143,8 +116,6 @@ func TestAuditWithoutSavedConfigPointsAtTheCommand(t *testing.T) {
 	}
 }
 
-// TestAuditReportsMatchingConfig: settings equal to the saved ones is the happy
-// case, and it has to be visibly stated — silence would read as "no config".
 func TestAuditReportsMatchingConfig(t *testing.T) {
 	isolateConfig(t)
 	cfg := Config{TorSocks: "127.0.0.1:9050", Impersonate: "chrome"}
@@ -161,9 +132,6 @@ func TestAuditReportsMatchingConfig(t *testing.T) {
 	}
 }
 
-// TestAuditReportsDrift is the scenario the whole feature exists for: a --proxy
-// left in a shell alias. The probe is perfectly healthy; only the comparison
-// notices the user is no longer running what they chose.
 func TestAuditReportsDrift(t *testing.T) {
 	isolateConfig(t)
 	if err := SaveConfig(Config{TorSocks: "127.0.0.1:9050", Impersonate: "chrome"}, true); err != nil {
@@ -181,17 +149,13 @@ func TestAuditReportsDrift(t *testing.T) {
 	}
 }
 
-// TestAuditWarnsWhenSavedTorRunsDirect is the case field comparison alone gets
-// wrong. With --allow-direct saved as part of the setup, every field can match
-// while the outcome is a plain unanonymized connection.
 func TestAuditWarnsWhenSavedTorRunsDirect(t *testing.T) {
 	isolateConfig(t)
 	cfg := Config{TorSocks: "127.0.0.1:9050", AllowDirect: true}
-	if err := SaveConfig(cfg, true); err != nil { // saved while Tor was up
+	if err := SaveConfig(cfg, true); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
 	}
 
-	// Same flags, Tor now down: fields match, posture does not.
 	out, _ := runAudit(t, &App{Net: &fakeNet{verified: false}, Egress: cfg})
 	if !strings.Contains(out, "this run matches it") {
 		t.Fatalf("precondition: fields should still match:\n%s", out)
@@ -201,9 +165,6 @@ func TestAuditWarnsWhenSavedTorRunsDirect(t *testing.T) {
 	}
 }
 
-// TestAuditLedgerUnobservableIsNotZero: with someone else's proxy we cannot see
-// the traffic. "not observable" and "0 connections" are opposite claims and the
-// report must never substitute the second for the first.
 func TestAuditLedgerUnobservableIsNotZero(t *testing.T) {
 	isolateConfig(t)
 
@@ -218,8 +179,6 @@ func TestAuditLedgerUnobservableIsNotZero(t *testing.T) {
 	}
 }
 
-// TestAuditLedgerFlagsUnexpectedHosts: the ledger is only useful if a host we
-// have no business reaching is visibly different from one we do.
 func TestAuditLedgerFlagsUnexpectedHosts(t *testing.T) {
 	isolateConfig(t)
 
@@ -246,8 +205,6 @@ func TestAuditLedgerFlagsUnexpectedHosts(t *testing.T) {
 			t.Errorf("ledger report missing %q:\n%s", want, out)
 		}
 	}
-	// The two legitimate hosts must NOT be flagged — a report that cries wolf
-	// on its own audio CDN teaches the user to ignore it.
 	for _, line := range strings.Split(out, "\n") {
 		if strings.Contains(line, "soundcloud") && strings.Contains(line, "UNEXPECTED") {
 			t.Errorf("legitimate host flagged as unexpected: %s", line)
@@ -255,8 +212,6 @@ func TestAuditLedgerFlagsUnexpectedHosts(t *testing.T) {
 	}
 }
 
-// TestAuditDescribesTheStore answers "what does this machine still hold?" —
-// the third question audit exists to answer (T7.1).
 func TestAuditDescribesTheStore(t *testing.T) {
 	isolateConfig(t)
 
@@ -273,8 +228,6 @@ func TestAuditDescribesTheStore(t *testing.T) {
 	}
 }
 
-// TestAuditSurvivesAStoreThatCannotDescribeItself: StoreDescriber is optional,
-// so a Store without it must degrade to a shorter report, not a nil panic.
 func TestAuditSurvivesAStoreThatCannotDescribeItself(t *testing.T) {
 	isolateConfig(t)
 
@@ -290,9 +243,6 @@ func TestAuditSurvivesAStoreThatCannotDescribeItself(t *testing.T) {
 	}
 }
 
-// TestExpectedHost pins the classification. The suffix match is anchored on a
-// leading dot on purpose: "evilsoundcloud.com" ends in the same letters as the
-// real thing, and a naive HasSuffix would wave it through.
 func TestExpectedHost(t *testing.T) {
 	cases := []struct {
 		host string
@@ -302,11 +252,9 @@ func TestExpectedHost(t *testing.T) {
 		{"api-v2.soundcloud.com", true},
 		{"a1.sndcdn.com", true},
 		{"cf-hls-media.sndcdn.com", true},
-		// The December 2025 HLS/AAC migration host — TASKS.md T7.2's original
-		// "only *.soundcloud/*.sndcdn" wording would flag the tool's own audio.
 		{"playback.media-streaming.soundcloud.cloud", true},
-		{"SoundCloud.com", true},  // case
-		{"soundcloud.com.", true}, // trailing root dot
+		{"SoundCloud.com", true},
+		{"soundcloud.com.", true},
 		{"evilsoundcloud.com", false},
 		{"soundcloud.com.evil.net", false},
 		{"sndcdn.com.attacker.io", false},
@@ -320,8 +268,6 @@ func TestExpectedHost(t *testing.T) {
 	}
 }
 
-// TestUnexpectedTargetsIsSorted: audit prints this list, and unstable ordering
-// would make two identical runs look different.
 func TestUnexpectedTargetsIsSorted(t *testing.T) {
 	l := EgressLedger{Observed: true, Targets: map[string]int{
 		"zeta.example.com:443":      1,

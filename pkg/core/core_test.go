@@ -7,8 +7,6 @@ import (
 	"testing"
 )
 
-// log records the order subsystems were called in, which for purge is the
-// whole contract (T4.4 / bash lesson T1.13).
 type log struct{ calls []string }
 
 func (l *log) note(s string) { l.calls = append(l.calls, s) }
@@ -34,10 +32,6 @@ func (s *fakeStore) Results() ([]Track, error) { return nil, nil }
 func (s *fakeStore) Result(int) (Track, error) { return Track{}, nil }
 func (s *fakeStore) Purge() error              { s.log.note("store.Purge"); return s.purgeErr }
 
-// TestPurgeStopsThePlayerFirst: the mpv IPC socket lives inside the runtime
-// directory the store is about to delete. Reversing these two leaves an
-// unreachable daemon on unix and fails outright on Windows, where an open file
-// cannot be removed.
 func TestPurgeStopsThePlayerFirst(t *testing.T) {
 	l := &log{}
 	app := &App{Play: &fakePlayer{log: l}, Store: &fakeStore{log: l}}
@@ -50,9 +44,6 @@ func TestPurgeStopsThePlayerFirst(t *testing.T) {
 	}
 }
 
-// TestPurgeContinuesWhenThePlayerIsAlreadyGone: teardown failing must not
-// abandon the wipe. A purge that stops halfway leaves exactly the state the
-// user asked to destroy.
 func TestPurgeContinuesWhenThePlayerIsAlreadyGone(t *testing.T) {
 	l := &log{}
 	app := &App{
@@ -68,9 +59,6 @@ func TestPurgeContinuesWhenThePlayerIsAlreadyGone(t *testing.T) {
 	}
 }
 
-// TestPurgeReportsStoreFailure: the one failure that DOES matter is the wipe
-// itself — silently returning nil would tell the user their history is gone
-// when it is not.
 func TestPurgeReportsStoreFailure(t *testing.T) {
 	l := &log{}
 	app := &App{
@@ -83,12 +71,6 @@ func TestPurgeReportsStoreFailure(t *testing.T) {
 	}
 }
 
-// --- T1.7 / T3.5: one recovery action, and the RIGHT one ----------------------
-
-// TestYtdlpHintGivesTheFittingAdvice is the whole point of the taxonomy. Every
-// one of these failures used to end in "run: yt-dlp -U", and for three of the
-// four that is advice which cannot possibly help — the update fixes an
-// extractor, not a blocked exit, a dead bridge, or a flag we passed ourselves.
 func TestYtdlpHintGivesTheFittingAdvice(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -98,17 +80,9 @@ func TestYtdlpHintGivesTheFittingAdvice(t *testing.T) {
 	}{
 		{"stale extractor", fmt.Errorf("%w: x", ErrStaleExtractor), "yt-dlp -U", "rotate"},
 		{"blocked exit", fmt.Errorf("%w: x", ErrRateLimited), "chainsmoke rotate", "yt-dlp -U"},
-		// Found live 2026-08-24 on a yt-dlp without curl_cffi: nothing left the
-		// machine, so neither SoundCloud nor the extractor is implicated.
 		{"rejected impersonate", fmt.Errorf("%w: x", ErrImpersonate), "curl-cffi", "yt-dlp -U"},
-		// Found live 2026-08-24 running `likes` against a mistyped handle.
-		// SoundCloud answered and the extractor parsed the answer correctly;
-		// the answer was "no such page". Updating yt-dlp cannot change that.
 		{"mistyped handle", fmt.Errorf("%w: x", ErrNotFound), "check the spelling", "yt-dlp -U"},
-		// A dead bridge is pkg/net's problem and the error already says so;
-		// appending anything would point the user away from the real fault.
 		{"dead bridge", fmt.Errorf("%w: x", ErrEgress), "", "yt-dlp -U"},
-		// A stub must never send anyone chasing a dependency (T1.7).
 		{"stub", ErrNotImplemented, "", "yt-dlp -U"},
 	}
 	for _, tc := range cases {
@@ -126,19 +100,11 @@ func TestYtdlpHintGivesTheFittingAdvice(t *testing.T) {
 	if YtdlpHint(nil) != nil {
 		t.Error("YtdlpHint(nil) invented an error")
 	}
-	// Anything unclassified still gets the extractor hint: a resolve that failed
-	// for a reason we do not recognise is most often the extractor.
 	if got := YtdlpHint(errors.New("something new")).Error(); !strings.Contains(got, "yt-dlp -U") {
 		t.Errorf("unclassified hint = %q, want the extractor fallback", got)
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Index-vs-stdin resolution (TASKS.md T9.1)
-// -----------------------------------------------------------------------------
-
-// indexStore records which index was asked for, so the argv path can be
-// distinguished from the stdin path rather than inferred from the result.
 type indexStore struct {
 	asked int
 	err   error
@@ -155,18 +121,14 @@ func (s *indexStore) Result(n int) (Track, error) {
 	return Track{Title: "cached", Permalink: "https://soundcloud.com/a/cached"}, nil
 }
 
-// TestResolveIndexOrStdinRoutes covers the three-way branch that implements
-// invariant #3. Each row is a different CLASS of input, and getting the class
-// wrong is what makes the failure dangerous rather than merely annoying: a URL
-// that falls through to the stdin path would be silently accepted from argv.
 func TestResolveIndexOrStdinRoutes(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		arg       string
-		typed     bool // arg was typed at the session prompt, not argv
+		typed     bool
 		stdin     string
-		wantIndex int    // 0 = the store must not be consulted
-		wantPerma string // "" = expect an error
+		wantIndex int
+		wantPerma string
 		wantErr   string
 	}{
 		{name: "index reaches the store", arg: "3", wantIndex: 3,
@@ -220,10 +182,6 @@ func TestResolveIndexOrStdinRoutes(t *testing.T) {
 	}
 }
 
-// TestResolveIndexOrStdinRefusalNamesTheExposure: by the time we see a URL in
-// argv, the OS process list already has it. The message has to say so and give
-// the routes that leak nothing — telling the user "invalid argument" would let
-// them retype it and leak it twice.
 func TestResolveIndexOrStdinRefusalNamesTheExposure(t *testing.T) {
 	app := &App{Store: &indexStore{}, Stdin: strings.NewReader("")}
 
@@ -239,9 +197,6 @@ func TestResolveIndexOrStdinRefusalNamesTheExposure(t *testing.T) {
 	}
 }
 
-// TestResolveIndexOrStdinDoesNotConsultTheStoreForAURL: the store lookup is
-// skipped entirely on the argv-URL path. If it were consulted first, a cache
-// miss would mask the invariant-#3 message behind "no cached result".
 func TestResolveIndexOrStdinDoesNotConsultTheStoreForAURL(t *testing.T) {
 	st := &indexStore{err: errors.New("no cached result #0")}
 	app := &App{Store: st, Stdin: strings.NewReader("")}
@@ -255,8 +210,6 @@ func TestResolveIndexOrStdinDoesNotConsultTheStoreForAURL(t *testing.T) {
 	}
 }
 
-// TestResolveIndexOrStdinPropagatesStoreErrors: a real cache miss must surface
-// as itself, with the remediation the store wrote.
 func TestResolveIndexOrStdinPropagatesStoreErrors(t *testing.T) {
 	miss := errors.New("no cached result #7 — run `chainsmoke search <term>` first")
 	app := &App{Store: &indexStore{err: miss}, Stdin: strings.NewReader("")}

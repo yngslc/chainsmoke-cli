@@ -14,14 +14,11 @@ import (
 	"chainsmoke/pkg/core"
 )
 
-// playlistPlayer is a fake mpv playlist: append-play starts the first entry,
-// playlist-next/-prev move along it and fail past either end the way mpv does
-// ("error running command"), and stop clears it.
 type playlistPlayer struct {
 	recordingPlayer
-	list []string // titles, in playlist order
-	pos  int      // -1 when idle
-	sent []string // every command, as fmt %v renders it
+	list []string
+	pos  int
+	sent []string
 }
 
 func newPlaylistPlayer() *playlistPlayer { return &playlistPlayer{pos: -1} }
@@ -46,7 +43,7 @@ func (p *playlistPlayer) Command(args ...any) (any, error) {
 		return nil, nil
 	}
 	switch fmt.Sprintf("%v", args) {
-	case "[playlist-clear]": // all but the current entry (measured on mpv 0.41)
+	case "[playlist-clear]":
 		if p.pos >= 0 {
 			p.list, p.pos = []string{p.list[p.pos]}, 0
 		}
@@ -77,7 +74,6 @@ func (p *playlistPlayer) playing() string {
 	return p.list[p.pos]
 }
 
-// listStore is a cached result set of n tracks, t1..tn.
 type listStore struct{ n int }
 
 func (s listStore) SaveResults([]core.Track) error { return nil }
@@ -97,8 +93,6 @@ func (s listStore) Results() ([]core.Track, error) {
 	return ts, nil
 }
 
-// cacheStore is a result cache whose contents a test can replace mid-play,
-// the way a `search` typed at the prompt, or run in another window, does.
 type cacheStore struct{ ts []core.Track }
 
 func (s *cacheStore) SaveResults(ts []core.Track) error { s.ts = ts; return nil }
@@ -111,7 +105,6 @@ func (s *cacheStore) Result(i int) (core.Track, error) {
 	return s.ts[i-1], nil
 }
 
-// tracksNamed is a result set p1..pn.
 func tracksNamed(prefix string, n int) []core.Track {
 	var ts []core.Track
 	for i := 1; i <= n; i++ {
@@ -120,12 +113,6 @@ func tracksNamed(prefix string, n int) []core.Track {
 	return ts
 }
 
-// listResolver counts Meta and Stream separately: list playback must resolve
-// each track exactly once, with no Meta round-trip for a single track. It
-// keeps the URLs Meta was asked for, returns set from Meta when given one,
-// fails the permalinks in fail, and holds a Stream for a permalink in gate
-// until that channel closes. Preloads call Stream from a background
-// goroutine, hence the lock.
 type listResolver struct {
 	mu             sync.Mutex
 	metas, streams int
@@ -160,14 +147,12 @@ func (r *listResolver) Stream(permalink string) (string, error) {
 }
 func (r *listResolver) Search(string, int) ([]core.Track, error) { return nil, nil }
 
-// counts reads the call counters under the lock.
 func (r *listResolver) counts() (metas, streams int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.metas, r.streams
 }
 
-// urls reads the URLs Meta was asked for, under the lock.
 func (r *listResolver) urls() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -179,11 +164,6 @@ func listApp(n int) (*core.App, *playlistPlayer, *listResolver) {
 	return &core.App{Net: &recordingNet{}, Res: r, Play: p, Store: listStore{n}, Out: io.Discard}, p, r
 }
 
-// TestListPlaybackWalksTheResults: playing result N from likes (or a search, or
-// a playlist) used to queue N alone, so `next` failed with "playlist-next:
-// error running command" (dev's report, 2026-10-03). The cached results are a
-// playlist: next/prev walk them, one track is always preloaded so a skip is
-// instant, and each track is resolved exactly once.
 func TestListPlaybackWalksTheResults(t *testing.T) {
 	app, p, r := listApp(5)
 	q := &listQueue{app: app}
@@ -196,7 +176,7 @@ func TestListPlaybackWalksTheResults(t *testing.T) {
 			t.Fatalf("playing %s, want %s (playlist %v)", got, want, p.list)
 		}
 		if want != "t5" {
-			q.settle() // the preload resolves in the background now
+			q.settle()
 			if n := len(p.list) - 1 - p.pos; n != 1 {
 				t.Errorf("at %s, %d tracks preloaded, want 1 — next would wait on yt-dlp", want, n)
 			}
@@ -216,11 +196,6 @@ func TestListPlaybackWalksTheResults(t *testing.T) {
 	}
 }
 
-// TestListPlaybackIgnoresALaterSearch: the list being played is the one `play N`
-// started on. It used to read the shared result cache on every step, so a
-// `search`, `likes` or `playlist` typed at the prompt (or run in another
-// window) spliced a different result set into playback mid-session — and the
-// `next:` line named a track from it (2026-10-05 review, R1, reproduced live).
 func TestListPlaybackIgnoresALaterSearch(t *testing.T) {
 	for _, shuffle := range []bool{false, true} {
 		p, st := newPlaylistPlayer(), &cacheStore{ts: tracksNamed("a", 4)}
@@ -229,7 +204,7 @@ func TestListPlaybackIgnoresALaterSearch(t *testing.T) {
 		if err := q.start(1); err != nil {
 			t.Fatalf("shuffle=%v: start(1) = %v", shuffle, err)
 		}
-		_ = st.SaveResults(tracksNamed("b", 4)) // a search lands while a1 plays
+		_ = st.SaveResults(tracksNamed("b", 4))
 
 		for range 3 {
 			if err := q.next(); err != nil {
@@ -245,15 +220,10 @@ func TestListPlaybackIgnoresALaterSearch(t *testing.T) {
 	}
 }
 
-// TestBareVerbAtThePromptReadsTheNextLine: bare `play`, `likes` or `playlist`
-// at the prompt asks for its input on the next line. It used to read stdin
-// itself, racing the prompt's own reader: the prompt won, the verb got nothing,
-// and the URL then ran as a command — "No help topic for 'https://…'"
-// (2026-10-05 review, R3). The session's input is the only reader now.
 func TestBareVerbAtThePromptReadsTheNextLine(t *testing.T) {
 	app, _, r := listApp(3)
 	in := strings.NewReader("play\nhttps://soundcloud.com/a/b\nlikes\nsomeone\nq\n")
-	app.Stdin = in // as in production: verbs read app.Stdin, the session scans the same input
+	app.Stdin = in
 	playSession(app, &listQueue{app: app}, in, true, make(chan os.Signal), time.Millisecond)
 
 	want := []string{"https://soundcloud.com/a/b", "https://soundcloud.com/someone/likes"}
@@ -265,10 +235,6 @@ func TestBareVerbAtThePromptReadsTheNextLine(t *testing.T) {
 	}
 }
 
-// TestURLTypedAtThePromptIsPlayed: `play <url>` at the prompt was refused as
-// "already reached argv… treat it as exposed" — but a typed line never reaches
-// argv or the shell's history, the same exposure as the URL prompt itself
-// (2026-10-05 review, R4). Real argv is still refused (TestPlayRejectsBadInput…).
 func TestURLTypedAtThePromptIsPlayed(t *testing.T) {
 	app, _, r := listApp(3)
 	in := strings.NewReader("play https://soundcloud.com/a/typed\nq\n")
@@ -279,10 +245,6 @@ func TestURLTypedAtThePromptIsPlayed(t *testing.T) {
 	}
 }
 
-// TestPlayNKeepsTheOldTrackWhenTheNewOneFails: `play N` used to stop what was
-// playing before resolving N, so a resolve that failed (a DRM track, a bad
-// circuit) left silence (2026-10-05 review, R5). Nothing changes now until N
-// is in hand.
 func TestPlayNKeepsTheOldTrackWhenTheNewOneFails(t *testing.T) {
 	app, p, r := listApp(5)
 	r.fail = map[string]bool{"https://soundcloud.com/a/t3": true}
@@ -300,9 +262,6 @@ func TestPlayNKeepsTheOldTrackWhenTheNewOneFails(t *testing.T) {
 	}
 }
 
-// TestStdinSetPlaysAsAList: a set URL on stdin used to queue two tracks and
-// say "run `chainsmoke next` when this pair ends" — a next that then failed
-// (2026-10-05 review, R2). Its tracks are a list like any search now.
 func TestStdinSetPlaysAsAList(t *testing.T) {
 	app, p, r := listApp(0)
 	r.set = tracksNamed("s", 3)
@@ -320,8 +279,6 @@ func TestStdinSetPlaysAsAList(t *testing.T) {
 		t.Error("startList(nothing) = nil, want an error")
 	}
 
-	// Skip-not-abort (T1.14): a dead first track costs only itself, and a set
-	// where nothing plays is an error, not silence.
 	app, p, r = listApp(0)
 	r.fail = map[string]bool{"https://soundcloud.com/a/s1": true}
 	if err := (&listQueue{app: app}).startList(tracksNamed("s", 3)); err != nil || p.playing() != "s2" {
@@ -334,11 +291,6 @@ func TestStdinSetPlaysAsAList(t *testing.T) {
 	}
 }
 
-// TestPreloadRunsInTheBackground: the resolve of the next track used to run on
-// the prompt's own goroutine — up to 3 tracks × 3 attempts × 45s — so typing
-// was ignored and Ctrl+C waited for it (2026-10-05 review, R6, H5). Here t2's
-// resolve never finishes on its own: start must still return, announce what
-// is next at once, and the prompt must keep answering and still quit.
 func TestPreloadRunsInTheBackground(t *testing.T) {
 	app, p, r := listApp(5)
 	release := make(chan struct{})
@@ -366,8 +318,6 @@ func TestPreloadRunsInTheBackground(t *testing.T) {
 	}
 }
 
-// TestPreloadSkipsATrackThatWillNotResolve: one dead track costs only itself —
-// the rule EnqueueAhead used to pin (T1.14).
 func TestPreloadSkipsATrackThatWillNotResolve(t *testing.T) {
 	app, p, r := listApp(4)
 	r.fail = map[string]bool{"https://soundcloud.com/a/t2": true}
@@ -378,11 +328,6 @@ func TestPreloadSkipsATrackThatWillNotResolve(t *testing.T) {
 	}
 }
 
-// TestALandedPreloadNeverRestartsAStoppedPlayer: a `stop` — typed at the
-// prompt, or run in another window — clears mpv's playlist while the next
-// track is still resolving. Queuing that track when it lands would start
-// playback nobody asked for, so landed() drops it. That check had no test:
-// deleting it left the suite green (CH-DEBATE 2026-10-19, D-5).
 func TestALandedPreloadNeverRestartsAStoppedPlayer(t *testing.T) {
 	app, p, r := listApp(3)
 	release := make(chan struct{})
@@ -392,7 +337,7 @@ func TestALandedPreloadNeverRestartsAStoppedPlayer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _ = p.Command("stop") // while t2 is still resolving
+	_, _ = p.Command("stop")
 	close(release)
 	q.settle()
 
@@ -401,25 +346,18 @@ func TestALandedPreloadNeverRestartsAStoppedPlayer(t *testing.T) {
 	}
 }
 
-// TestStartingATrackUnpausesTheDaemon: the daemon keeps pause state between
-// sessions, so `play` unpauses — once, for the track asked for. It used to be
-// Enqueue that unpaused, and a background preload queues through Enqueue too:
-// a `pause` came undone the moment one landed (2026-10-19 review, CQ-1).
 func TestStartingATrackUnpausesTheDaemon(t *testing.T) {
 	app, p, _ := listApp(3)
 	q := &listQueue{app: app}
 	if err := q.start(1); err != nil {
 		t.Fatal(err)
 	}
-	q.settle() // t2 lands in the background
+	q.settle()
 	if n := strings.Count(strings.Join(p.sent, "\n"), "[set_property pause false]"); n != 1 {
 		t.Errorf("unpaused %d times, want once — for the track asked for: %v", n, p.sent)
 	}
 }
 
-// TestAnnounceScrubsHostileTitles: titles are third-party text on a terminal —
-// an ESC repaints it, a newline forges a line (the other rule EnqueueAhead
-// pinned).
 func TestAnnounceScrubsHostileTitles(t *testing.T) {
 	p, r := newPlaylistPlayer(), &listResolver{}
 	var out strings.Builder
@@ -431,8 +369,6 @@ func TestAnnounceScrubsHostileTitles(t *testing.T) {
 	}
 }
 
-// TestListPrevBeforeTheFirstQueued: `play 3` then prev must reach result 2,
-// which was never in mpv's playlist.
 func TestListPrevBeforeTheFirstQueued(t *testing.T) {
 	app, p, _ := listApp(5)
 	q := &listQueue{app: app}
@@ -448,15 +384,12 @@ func TestListPrevBeforeTheFirstQueued(t *testing.T) {
 	}
 }
 
-// TestListPreloadFollowsNaturalAdvance: when a track ends, mpv moves to the
-// preloaded one by itself. The session's next tick must queue the one after,
-// or playback stops two tracks in.
 func TestListPreloadFollowsNaturalAdvance(t *testing.T) {
 	app, p, _ := listApp(5)
 	q := &listQueue{app: app}
 	_ = q.start(1)
 	q.settle()
-	p.pos = 1 // t1 ended; mpv is on t2
+	p.pos = 1
 	q.preload()
 	q.settle()
 	if len(p.list) != 3 || p.list[2] != "t3" {
@@ -464,9 +397,6 @@ func TestListPreloadFollowsNaturalAdvance(t *testing.T) {
 	}
 }
 
-// TestListShufflePlaysTheRestOnce: shuffle (dev's request, 2026-10-03) plays the
-// rest of the list in random order, every track once, starting with the very
-// next one — the track already preloaded in order is swapped out.
 func TestListShufflePlaysTheRestOnce(t *testing.T) {
 	app, p, _ := listApp(20)
 	q := &listQueue{app: app}
@@ -486,7 +416,7 @@ func TestListShufflePlaysTheRestOnce(t *testing.T) {
 		seen[p.playing()] = true
 		inOrder = inOrder && p.playing() == fmt.Sprintf("t%d", k)
 	}
-	if inOrder { // 1 in 19! for a real shuffle
+	if inOrder {
 		t.Error("shuffle played t2..t20 in list order")
 	}
 	if err := q.next(); err == nil || !strings.Contains(err.Error(), "end of the list") {
@@ -494,8 +424,6 @@ func TestListShufflePlaysTheRestOnce(t *testing.T) {
 	}
 }
 
-// TestListRepeatAllWrapsAround: with repeat all, the last track is followed by
-// the first, not by "end of the list".
 func TestListRepeatAllWrapsAround(t *testing.T) {
 	app, p, _ := listApp(3)
 	q := &listQueue{app: app}
@@ -510,9 +438,6 @@ func TestListRepeatAllWrapsAround(t *testing.T) {
 	}
 }
 
-// TestRepeatOneLoopsInMpv: repeat one is mpv's loop-file, and turning repeat
-// off clears it — a daemon left on loop-file would replay one track forever in
-// the next session too.
 func TestRepeatOneLoopsInMpv(t *testing.T) {
 	app, p, _ := listApp(3)
 	q := &listQueue{app: app}
@@ -526,9 +451,6 @@ func TestRepeatOneLoopsInMpv(t *testing.T) {
 	}
 }
 
-// TestListAnnouncesANaturalAdvance: a track that ended on its own used to start
-// the next one silently, so the dev hit `next` thinking nothing was playing and
-// skipped a song (2026-10-03). The move is announced, with what follows it.
 func TestListAnnouncesANaturalAdvance(t *testing.T) {
 	app, p, _ := listApp(5)
 	var out strings.Builder
@@ -541,7 +463,7 @@ func TestListAnnouncesANaturalAdvance(t *testing.T) {
 	q.settle()
 
 	out.Reset()
-	p.pos = 1 // t1 ended; mpv moved to t2 by itself
+	p.pos = 1
 	i, moved := q.follow()
 	if !moved || i != 1 {
 		t.Fatalf("follow() = %d, %v — want the move to t2 noticed", i, moved)
@@ -555,9 +477,6 @@ func TestListAnnouncesANaturalAdvance(t *testing.T) {
 	}
 }
 
-// TestSessionPromptTakesShuffleAndRepeat: both are prompt commands (the dev got
-// "No help topic for 'shuffle'"), and the session's end undoes repeat so the
-// daemon does not loop in a later session.
 func TestSessionPromptTakesShuffleAndRepeat(t *testing.T) {
 	app, p, _ := listApp(5)
 	q := &listQueue{app: app}
@@ -574,9 +493,6 @@ func TestSessionPromptTakesShuffleAndRepeat(t *testing.T) {
 	}
 }
 
-// TestPlayIndexPlaysFromTheList: `play N` goes through the list, not through
-// Meta + EnqueueAhead, which spent a yt-dlp round-trip over Tor re-describing a
-// track the cache already described.
 func TestPlayIndexPlaysFromTheList(t *testing.T) {
 	app, p, r := listApp(5)
 	if err := runVerb(app, "play", "2"); err != nil {
@@ -587,7 +503,6 @@ func TestPlayIndexPlaysFromTheList(t *testing.T) {
 	}
 }
 
-// purgeStore remembers whether it was purged.
 type purgeStore struct {
 	listStore
 	purged bool
@@ -595,10 +510,6 @@ type purgeStore struct {
 
 func (s *purgeStore) Purge() error { s.purged = true; return nil }
 
-// TestPromptRefusesVerbsThatEndTheSession: purge and daemon would pull the
-// player out from under the session, so the hint left them out — and the
-// prompt ran them anyway (2026-10-19 review, Fix 17). An alias (dl for get)
-// must not get around it.
 func TestPromptRefusesVerbsThatEndTheSession(t *testing.T) {
 	app, _, _ := listApp(3)
 	st, n := &purgeStore{listStore: listStore{3}}, &recordingNet{}
@@ -614,15 +525,13 @@ func TestPromptRefusesVerbsThatEndTheSession(t *testing.T) {
 	}
 }
 
-// TestSessionHintNamesEveryPromptVerb: the hint is built from the command
-// table, so a verb added later shows up without anyone remembering to.
 func TestSessionHintNamesEveryPromptVerb(t *testing.T) {
 	app, _, _ := listApp(1)
 	hint := sessionHint(commands(app))
 	if !strings.HasSuffix(hint, "q stops") {
 		t.Errorf("hint does not end with q stops:\n%s", hint)
 	}
-	for _, own := range []string{"shuffle", "repeat one|all|off"} { // the prompt's own verbs
+	for _, own := range []string{"shuffle", "repeat one|all|off"} {
 		if !strings.Contains(hint, own) {
 			t.Errorf("hint is missing %q:\n%s", own, hint)
 		}

@@ -8,9 +8,6 @@ import (
 	"testing"
 )
 
-// isolateConfig points ConfigDir at a temp dir for the duration of one test.
-// XDG_CONFIG_HOME is checked first on every platform, so one Setenv covers both
-// targets — no build tags, and the Windows path is exercised in CI too.
 func isolateConfig(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -18,9 +15,6 @@ func isolateConfig(t *testing.T) string {
 	return filepath.Join(dir, "chainsmoke")
 }
 
-// TestLoadConfigMissingIsNotAnError: never having run `audit --save` is the
-// ordinary state, not a failure. If it came back as an error, audit would print
-// a scary line at every first-time user.
 func TestLoadConfigMissingIsNotAnError(t *testing.T) {
 	isolateConfig(t)
 
@@ -36,9 +30,6 @@ func TestLoadConfigMissingIsNotAnError(t *testing.T) {
 	}
 }
 
-// TestSaveConfigRoundTrip pins the fields that matter and the permissions. The
-// file names a proxy the user relies on; 0644 would let any local process read
-// which SOCKS port this machine anonymizes through.
 func TestSaveConfigRoundTrip(t *testing.T) {
 	dir := isolateConfig(t)
 
@@ -67,7 +58,6 @@ func TestSaveConfigRoundTrip(t *testing.T) {
 		t.Errorf("SavedPosture = %q, want TOR when the probe verified", got.SavedPosture)
 	}
 
-	// Through --proxy, verified means something answered, not Tor.
 	want.Proxy = "http://127.0.0.1:8080"
 	if err := SaveConfig(want, true); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
@@ -79,7 +69,7 @@ func TestSaveConfigRoundTrip(t *testing.T) {
 		t.Error("SavedAt is zero; audit has nothing to date the config by")
 	}
 
-	if runtime.GOOS != "windows" { // Windows has no POSIX mode bits to assert
+	if runtime.GOOS != "windows" {
 		fi, err := os.Stat(ConfigPath())
 		if err != nil {
 			t.Fatalf("stat config: %v", err)
@@ -97,13 +87,9 @@ func TestSaveConfigRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSaveConfigRecordsProvenPostureNotIntent is the point of passing `verified`
-// in rather than reading AllowDirect. A config saved while Tor was down must not
-// come back later claiming to be an anonymized setup.
 func TestSaveConfigRecordsProvenPostureNotIntent(t *testing.T) {
 	isolateConfig(t)
 
-	// Everything about the intent says Tor: no --proxy, no --allow-direct.
 	if err := SaveConfig(Config{TorSocks: "127.0.0.1:9050"}, false); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
 	}
@@ -116,8 +102,6 @@ func TestSaveConfigRecordsProvenPostureNotIntent(t *testing.T) {
 	}
 }
 
-// TestLoadConfigCorruptTellsTheUserWhatToDo: a half-written file must produce
-// an actionable message, not a bare json syntax error.
 func TestLoadConfigCorruptTellsTheUserWhatToDo(t *testing.T) {
 	dir := isolateConfig(t)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -136,9 +120,6 @@ func TestLoadConfigCorruptTellsTheUserWhatToDo(t *testing.T) {
 	}
 }
 
-// TestConfigDiff walks the four egress fields. The empty-string cases matter
-// most: "" for Proxy means the built-in bridge and "" for Impersonate means
-// disabled, and a diff that printed blanks would be unreadable.
 func TestConfigDiff(t *testing.T) {
 	saved := Config{TorSocks: "127.0.0.1:9050", Impersonate: "chrome"}
 
@@ -170,8 +151,6 @@ func TestConfigDiff(t *testing.T) {
 	}
 }
 
-// TestConfigDiffIgnoresSaveMetadata: SavedAt/SavedPosture describe the saving,
-// not the settings. Comparing them would report drift on every single run.
 func TestConfigDiffIgnoresSaveMetadata(t *testing.T) {
 	saved := Config{TorSocks: "127.0.0.1:9050", SavedPosture: "TOR"}
 	live := Config{TorSocks: "127.0.0.1:9050"}

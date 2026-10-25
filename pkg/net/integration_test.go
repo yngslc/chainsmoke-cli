@@ -1,17 +1,5 @@
 //go:build integration
 
-// Integration tests for the egress chain (TASKS.md T9.2).
-//
-// These need a LIVE Tor and they leave the machine, which is why they sit
-// behind a build tag rather than a t.Short() check: the default `go test ./...`
-// — the one CI runs and the one a contributor runs by reflex — must never open
-// a circuit or touch SoundCloud. Opting in is explicit:
-//
-//	go test -tags integration ./pkg/net/
-//
-// Every test here SKIPS rather than fails when its dependency is absent. A
-// missing Tor is not a broken build, and a red suite that means "you do not
-// have tor installed" teaches people to ignore red suites.
 package net
 
 import (
@@ -23,9 +11,6 @@ import (
 	"chainsmoke/pkg/core"
 )
 
-// torSocksAddrForTest lets the rig point somewhere other than the default —
-// the Tor Browser bundle listens on 9150, and on this project's dev box tor
-// runs inside WSL.
 func torSocksAddrForTest() string {
 	if a := os.Getenv("CHAINSMOKE_TOR_SOCKS"); a != "" {
 		return a
@@ -44,13 +29,6 @@ func requireTor(t *testing.T) string {
 	return addr
 }
 
-// TestIntegrationEgressChain is the acceptance test the unit suite cannot be:
-// fakeSocks proves the bridge speaks SOCKS5 correctly, but only a real circuit
-// proves the whole chain — bridge, Tor, exit, SoundCloud — carries bytes.
-//
-// Note what it asserts and what it does not. Up() succeeding means traffic
-// moved; Verified() means it moved through a path we proved, which is the
-// distinction T0.2 rests on.
 func TestIntegrationEgressChain(t *testing.T) {
 	addr := requireTor(t)
 
@@ -70,9 +48,6 @@ func TestIntegrationEgressChain(t *testing.T) {
 		t.Errorf("SelfTest() = %v", err)
 	}
 
-	// The ledger must have recorded the self-test tunnel (T7.2). An empty
-	// ledger here would mean the accounting misses the one tunnel every run
-	// opens, which is what made a bare `audit` report nothing at all.
 	l := b.EgressLedger()
 	if !l.Observed {
 		t.Fatal("EgressLedger().Observed = false while we own the bridge")
@@ -91,10 +66,6 @@ func TestIntegrationEgressChain(t *testing.T) {
 	}
 }
 
-// TestIntegrationRemoteDNS is the leak test that only a real circuit can run.
-// The unit suite proves the hostname leaves as ATYP=0x03 bytes; this proves
-// that the resulting connection actually works, i.e. that Tor resolved it at
-// the exit rather than us resolving it here and Tor merely connecting.
 func TestIntegrationRemoteDNS(t *testing.T) {
 	addr := requireTor(t)
 
@@ -109,10 +80,6 @@ func TestIntegrationRemoteDNS(t *testing.T) {
 	}
 }
 
-// TestIntegrationRotateChangesCircuit exercises the rotation path for real.
-// It asserts only that rotation REPORTS success, not that the exit IP changed:
-// Tor may legitimately hand back an equivalent circuit, and asserting on the
-// exit would make this flaky for a reason that is not a defect.
 func TestIntegrationRotateChangesCircuit(t *testing.T) {
 	addr := requireTor(t)
 
@@ -122,9 +89,6 @@ func TestIntegrationRotateChangesCircuit(t *testing.T) {
 	}
 	defer b.Down()
 
-	// Rotate is allowed to fall back to re-isolating SOCKS credentials when no
-	// ControlPort is available — that is the documented behavior on a system
-	// tor, and it must still leave a usable path.
 	if err := b.Rotate(); err != nil {
 		t.Fatalf("Rotate() = %v, want nil (NEWNYM or credential re-isolation)", err)
 	}

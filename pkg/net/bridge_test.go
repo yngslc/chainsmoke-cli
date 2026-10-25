@@ -17,12 +17,9 @@ import (
 	"time"
 )
 
-// fakeSocks stands in for Tor: it completes a SOCKS5 handshake, records what it
-// was asked to connect to, and then echoes. No network, no tor, no mpv — so
-// these run in CI and on Windows (TASKS.md T9.1/T9.2).
 type fakeSocks struct {
 	ln       net.Listener
-	gotHost  string // destination as it arrived on the wire
+	gotHost  string
 	gotATYP  byte
 	gotUser  string
 	wantAuth bool
@@ -55,7 +52,6 @@ func (f *fakeSocks) serve() {
 func (f *fakeSocks) handle(c net.Conn) {
 	defer c.Close()
 
-	// greeting: ver, nmethods, methods...
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(c, hdr); err != nil {
 		return
@@ -68,7 +64,6 @@ func (f *fakeSocks) handle(c net.Conn) {
 		if _, err := c.Write([]byte{0x05, 0x02}); err != nil {
 			return
 		}
-		// RFC1929: ver, ulen, uname, plen, passwd
 		a := make([]byte, 2)
 		if _, err := io.ReadFull(c, a); err != nil {
 			return
@@ -92,7 +87,6 @@ func (f *fakeSocks) handle(c net.Conn) {
 		return
 	}
 
-	// CONNECT: ver, cmd, rsv, atyp, addr, port
 	req := make([]byte, 4)
 	if _, err := io.ReadFull(c, req); err != nil {
 		return
@@ -116,19 +110,15 @@ func (f *fakeSocks) handle(c net.Conn) {
 		}
 		f.gotHost = net.IP(ip).String()
 	}
-	if _, err := io.ReadFull(c, make([]byte, 2)); err != nil { // port
+	if _, err := io.ReadFull(c, make([]byte, 2)); err != nil {
 		return
 	}
-	// success reply, ATYP=IPv4 0.0.0.0:0
 	if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}
-	_, _ = io.Copy(c, c) // echo, so the tunnel can be proven to carry bytes
+	_, _ = io.Copy(c, c)
 }
 
-// TestConnectBridgeTunnelsAndKeepsDNSRemote is the load-bearing one: it proves
-// the hostname reaches Tor as ATYP=0x03 bytes and is never resolved locally.
-// That is the DNS-leak guarantee (T2.5) asserted rather than assumed.
 func TestConnectBridgeTunnelsAndKeepsDNSRemote(t *testing.T) {
 	fs := newFakeSocks(t, false)
 	b, err := StartConnectBridge(fs.addr(), false)
@@ -161,8 +151,6 @@ func TestConnectBridgeTunnelsAndKeepsDNSRemote(t *testing.T) {
 	}
 }
 
-// TestConnectBridgeRefusesPlaintextProxying: an absolute-form GET means a child
-// is about to push cleartext through us. Refusing makes a leak a loud failure.
 func TestConnectBridgeRefusesPlaintextProxying(t *testing.T) {
 	fs := newFakeSocks(t, false)
 	b, err := StartConnectBridge(fs.addr(), false)
@@ -189,9 +177,6 @@ func TestConnectBridgeRefusesPlaintextProxying(t *testing.T) {
 	}
 }
 
-// TestConnectBridgeNegotiatesIsolation: with isolate on, the bridge must offer
-// ONLY username/password. Offering 0x00 as well would let Tor pick no-auth and
-// silently share a circuit — the thing IsolateSOCKSAuth exists to prevent.
 func TestConnectBridgeNegotiatesIsolation(t *testing.T) {
 	fs := newFakeSocks(t, true)
 	b, err := StartConnectBridge(fs.addr(), true)
@@ -208,13 +193,6 @@ func TestConnectBridgeNegotiatesIsolation(t *testing.T) {
 	}
 }
 
-// TestConnectRequestNeverResolvesHostnames pins the encoder directly: a
-// hostname must go out as a domain, an IP literal as an IP.
-// TestPrivateTorDiesWithItsOwner: Ctrl+C reaches tor through the process group
-// and it exits, but a closed terminal sends SIGHUP, which tor treats as a
-// reload and survives re-parented. kill, SIGKILL and crashes skip every
-// handler too (measured 2026-10-03, CH-DEBATE-2026-10-03 #2). Naming us as the
-// owning process makes tor exit on its own once we are gone, however we went.
 func TestPrivateTorDiesWithItsOwner(t *testing.T) {
 	want := fmt.Sprintf("__OwningControllerProcess %d\n", os.Getpid())
 	if rc := privateTorrc(9999, 9998, "data"); !strings.Contains(rc, want) {
@@ -222,13 +200,8 @@ func TestPrivateTorDiesWithItsOwner(t *testing.T) {
 	}
 }
 
-// TestStaleTorDirsAreSwept: tor exits once its owner is gone, but its
-// DataDirectory stayed in the temp dir whenever the owner died before Down()
-// (2026-10-05 review, R10). The next spawn deletes a dir whose owner is dead —
-// and only that: a live owner's, this process's own, and names it cannot read
-// are kept.
 func TestStaleTorDirsAreSwept(t *testing.T) {
-	exited := exec.Command(os.Args[0], "-test.run=^$") // runs no tests, exits
+	exited := exec.Command(os.Args[0], "-test.run=^$")
 	if err := exited.Run(); err != nil {
 		t.Fatal(err)
 	}
@@ -238,11 +211,11 @@ func TestStaleTorDirsAreSwept(t *testing.T) {
 	}
 
 	tmp := t.TempDir()
-	dirs := map[string]bool{ // name -> swept
+	dirs := map[string]bool{
 		fmt.Sprintf("%s%d-123", torDirPrefix, dead):         true,
 		fmt.Sprintf("%s%d-456", torDirPrefix, os.Getpid()):  false,
-		fmt.Sprintf("%s%d-789", torDirPrefix, os.Getppid()): false, // `go test`, alive
-		"chainsmoke-tor-1234567":                            false, // named before the pid was: the digits are random
+		fmt.Sprintf("%s%d-789", torDirPrefix, os.Getppid()): false,
+		"chainsmoke-tor-1234567":                            false,
 		"chainsmoke-tor-pjunk-1":                            false,
 	}
 	for name := range dirs {
@@ -258,12 +231,6 @@ func TestStaleTorDirsAreSwept(t *testing.T) {
 	}
 }
 
-// TestNamedTorSocksNeverSpawnsATor: --tor-socks names a specific tor. Nothing
-// listening there used to fall through to spawning a private tor that
-// bootstraps onto the network, which is how smoke's "offline" $noTor rows
-// would leave the box on a machine with tor on PATH (CH-DEBATE-2026-10-03 #3).
-// The fake tor here is not an executable, so a spawn attempt fails loudly
-// instead of bootstrapping.
 func TestNamedTorSocksNeverSpawnsATor(t *testing.T) {
 	dir := t.TempDir()
 	name := "tor"
@@ -282,8 +249,6 @@ func TestNamedTorSocksNeverSpawnsATor(t *testing.T) {
 	}
 }
 
-// listenWith answers every connection with reply, after reading what the client
-// sent, and hangs up. An empty reply is a server that just hangs up.
 func listenWith(t *testing.T, reply string) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -308,15 +273,8 @@ func listenWith(t *testing.T, reply string) string {
 	return ln.Addr().String()
 }
 
-// torHTTPReply is how a real tor SocksPort answers HTTP — the start of it, as
-// measured 2026-10-19 on this box's tor.
 const torHTTPReply = "HTTP/1.0 501 Tor is not an HTTP Proxy\r\nContent-Type: text/html; charset=iso-8859-1\r\n\r\n<html>"
 
-// TestIsTorSocksKnowsTorFromOtherListeners: something listening on the tor
-// port used to be all the proof of tor there was, so ssh -D, a v2ray client or
-// a stale tunnel on 9050 carried every request while audit said TOR
-// (CH-DEBATE 2026-10-19, D-1). Tor identifies itself, locally, when spoken to
-// in HTTP; the others hang up or answer something else.
 func TestIsTorSocksKnowsTorFromOtherListeners(t *testing.T) {
 	for _, tc := range []struct {
 		name, addr string
@@ -332,8 +290,6 @@ func TestIsTorSocksKnowsTorFromOtherListeners(t *testing.T) {
 	}
 }
 
-// TestUpRefusesASocksListenerThatIsNotTor: fail closed, and say why — "no
-// listener" would send the user looking for a tor that is not the problem.
 func TestUpRefusesASocksListenerThatIsNotTor(t *testing.T) {
 	err := New("", false, listenWith(t, ""), false).Up()
 	if err == nil || !strings.Contains(err.Error(), "is not a Tor SocksPort") ||
@@ -342,10 +298,6 @@ func TestUpRefusesASocksListenerThatIsNotTor(t *testing.T) {
 	}
 }
 
-// TestBridgeCarriesPort443Only: a play session holds the bridge open,
-// unauthenticated, until q, and it used to tunnel to any port for anyone —
-// SMTP, IRC, plaintext HTTP inside the tunnel (CH-DEBATE 2026-10-19, D-3,
-// measured on the real bridge). Everything chainsmoke fetches is on 443.
 func TestBridgeCarriesPort443Only(t *testing.T) {
 	cb, err := StartConnectBridge(newFakeSocks(t, false).addr(), false)
 	if err != nil {
@@ -369,9 +321,6 @@ func TestBridgeCarriesPort443Only(t *testing.T) {
 	}
 }
 
-// deafSocks grants every CONNECT and then never closes its side, not even
-// after ours is gone: the peer that waiting on both directions of a tunnel
-// depended on never meeting. It lets go when the test ends.
 func deafSocks(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -389,32 +338,28 @@ func deafSocks(t *testing.T) string {
 			go func(c net.Conn) {
 				defer c.Close()
 				buf := make([]byte, 262)
-				if _, err := io.ReadFull(c, buf[:2]); err != nil { // greeting
+				if _, err := io.ReadFull(c, buf[:2]); err != nil {
 					return
 				}
 				if _, err := io.ReadFull(c, buf[:buf[1]]); err != nil {
 					return
 				}
 				_, _ = c.Write([]byte{0x05, 0x00})
-				if _, err := io.ReadFull(c, buf[:5]); err != nil { // CONNECT, ATYP=0x03
+				if _, err := io.ReadFull(c, buf[:5]); err != nil {
 					return
 				}
 				if _, err := io.ReadFull(c, buf[:int(buf[4])+2]); err != nil {
 					return
 				}
 				_, _ = c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-				_, _ = io.Copy(io.Discard, c) // reads to the end...
-				<-quit                        // ...and still never closes
+				_, _ = io.Copy(io.Discard, c)
+				<-quit
 			}(c)
 		}
 	}()
 	return ln.Addr().String()
 }
 
-// TestTunnelEndsAtTheFirstEOF: once the client is done — mpv stopped, a
-// preflight timed out — the tunnel ends, whatever the peer does. It used to
-// wait for both directions, and against a peer that never closed it never
-// ended (CH-DEBATE 2026-10-19, D-4).
 func TestTunnelEndsAtTheFirstEOF(t *testing.T) {
 	cb, err := StartConnectBridge(deafSocks(t), false)
 	if err != nil {
@@ -440,9 +385,6 @@ func TestTunnelEndsAtTheFirstEOF(t *testing.T) {
 	}
 }
 
-// TestCloseSeversLiveTunnels: Close runs on every exit path, from main's
-// After. It used to wait for tunnels to end on their own, so a stream still
-// playing — a session whose stop never reached mpv — held the process open.
 func TestCloseSeversLiveTunnels(t *testing.T) {
 	cb, err := StartConnectBridge(deafSocks(t), false)
 	if err != nil {
@@ -462,7 +404,7 @@ func TestCloseSeversLiveTunnels(t *testing.T) {
 	}
 
 	closed := make(chan error, 1)
-	go func() { closed <- cb.Close() }() // the client is still connected
+	go func() { closed <- cb.Close() }()
 	select {
 	case <-closed:
 	case <-time.After(2 * time.Second):
@@ -475,10 +417,6 @@ func TestCloseSeversLiveTunnels(t *testing.T) {
 }
 
 func TestDNSProbeNeverAsksForSoundCloud(t *testing.T) {
-	// `audit` used to resolve soundcloud.com and sndcdn.com through the system
-	// resolver to ask whether such a lookup would be visible, which sent that
-	// very lookup on every run (2026-10-01, review N-4). The probe may ask the
-	// local resolver anything except the names it exists to protect.
 	for _, protected := range []string{"soundcloud", "sndcdn"} {
 		if strings.Contains(strings.ToLower(probeName), protected) {
 			t.Errorf("audit's local DNS probe resolves %q — a plaintext lookup of a protected name", probeName)
@@ -510,11 +448,6 @@ func TestConnectRequestNeverResolvesHostnames(t *testing.T) {
 	}
 }
 
-// --- T2.3: fail-closed gate ---------------------------------------------------
-
-// TestAssertFailsClosed pins the direction of the gate. An earlier draft had
-// `if !b.verify == false`, which returned the error exactly when egress WAS
-// verified — a security check that failed open. This test would have caught it.
 func TestAssertFailsClosed(t *testing.T) {
 	cases := []struct {
 		name             string
@@ -542,8 +475,6 @@ func TestAssertFailsClosed(t *testing.T) {
 	}
 }
 
-// TestUpRefusesDirectWithoutOptIn: with no tor reachable and no --allow-direct,
-// Up must return an error rather than warn and continue. This is T0.2.
 func TestUpRefusesDirectWithoutOptIn(t *testing.T) {
 	b := &Bridge{}
 	b.allowDirect = false
@@ -566,14 +497,6 @@ func TestUpRefusesDirectWithoutOptIn(t *testing.T) {
 	}
 }
 
-// TestUpIsIdempotent: a play session runs several verbs in one process, and each
-// calls Up(). The track already playing rides the FIRST bridge, and Down() only
-// closes b.cb and kills b.torCmd — so a second Up() that started a new bridge
-// would leak the old one, and one that spawned a second private tor would orphan
-// the first along with its DataDirectory. Once egress is up, Up() is a no-op.
-//
-// torSocks points at a dead port, so without the guard this Up() would go
-// looking for Tor, find none, and refuse — i.e. fail a session mid-song.
 func TestUpIsIdempotent(t *testing.T) {
 	b := &Bridge{verified: true, proxy: "http://127.0.0.1:1", torSocks: "127.0.0.1:1"}
 	if err := b.Up(); err != nil {
@@ -584,8 +507,6 @@ func TestUpIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestSocksErrorCarriesCode: waitUsable branches on the raw reply byte, so the
-// code has to survive wrapping. String matching would be fragile.
 func TestSocksErrorCarriesCode(t *testing.T) {
 	wrapped := fmt.Errorf("egress self-test failed: %w", &socksError{Code: socksGeneralFailure})
 	var se *socksError
@@ -600,9 +521,6 @@ func TestSocksErrorCarriesCode(t *testing.T) {
 	}
 }
 
-// TestWaitUsableStopsOnTerminalError: 0x01 means "still booting, retry"; every
-// other code is a real fault and must abort immediately rather than burn the
-// 45s budget. A fake SOCKS server that always answers 0x04 must fail fast.
 func TestWaitUsableStopsOnTerminalError(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -624,7 +542,7 @@ func TestWaitUsableStopsOnTerminalError(t *testing.T) {
 				if _, err := io.ReadFull(c, make([]byte, hdr[1])); err != nil {
 					return
 				}
-				_, _ = c.Write([]byte{0x05, 0x00}) // no-auth
+				_, _ = c.Write([]byte{0x05, 0x00})
 				req := make([]byte, 4)
 				if _, err := io.ReadFull(c, req); err != nil {
 					return
@@ -636,7 +554,6 @@ func TestWaitUsableStopsOnTerminalError(t *testing.T) {
 				if _, err := io.ReadFull(c, make([]byte, int(l[0])+2)); err != nil {
 					return
 				}
-				// 0x04 host unreachable — terminal, not a warmup symptom
 				_, _ = c.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			}(c)
 		}
@@ -661,9 +578,6 @@ func TestWaitUsableStopsOnTerminalError(t *testing.T) {
 	}
 }
 
-// TestReisolate is the T3.5 retry's foundation: a new credential is what buys a
-// new circuit, so a re-roll that produced the same pair would silently retry on
-// the very exit we are trying to escape.
 func TestReisolate(t *testing.T) {
 	d := &socks5Dialer{user: "chainsmoke", pass: isolationPass()}
 	u1, p1 := d.creds()
@@ -679,8 +593,6 @@ func TestReisolate(t *testing.T) {
 		t.Error("password unchanged — Tor would hand back the SAME circuit")
 	}
 
-	// 200 rolls, no collisions: a time-derived key could repeat inside one
-	// coarse Windows clock tick, which is exactly the bug this guards.
 	seen := map[string]bool{p1: true, p2: true}
 	for i := 0; i < 200; i++ {
 		d.reisolate()
@@ -692,10 +604,8 @@ func TestReisolate(t *testing.T) {
 	}
 }
 
-// TestReisolateWithoutIsolation: a bridge built without isolation has nothing
-// to roll, and must say so rather than let a caller claim a fresh circuit.
 func TestReisolateWithoutIsolation(t *testing.T) {
-	d := &socks5Dialer{} // no-auth dialer
+	d := &socks5Dialer{}
 	if d.reisolate() {
 		t.Error("reisolate() = true with isolation off, want false")
 	}
@@ -704,9 +614,6 @@ func TestReisolateWithoutIsolation(t *testing.T) {
 	}
 }
 
-// TestReisolateConcurrent: Reisolate runs while the bridge is serving, so the
-// credentials are read by in-flight dials as they are rewritten. Meaningful
-// under -race; harmless without it.
 func TestReisolateConcurrent(t *testing.T) {
 	d := &socks5Dialer{user: "chainsmoke", pass: isolationPass()}
 	done := make(chan struct{})

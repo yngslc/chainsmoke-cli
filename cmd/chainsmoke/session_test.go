@@ -13,14 +13,12 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-// sessionPlayer records what a play session sends the daemon, and answers
-// idle-active from a script (the last answer repeats).
 type sessionPlayer struct {
 	recordingPlayer
 	sent     []string
 	enqueued int
 	idle     []bool
-	gone     bool // no daemon: every command fails
+	gone     bool
 }
 
 func (p *sessionPlayer) Enqueue(string, string) error { p.enqueued++; return nil }
@@ -29,7 +27,7 @@ func (p *sessionPlayer) Command(args ...any) (any, error) {
 	if p.gone {
 		return nil, errors.New("mpv IPC unreachable")
 	}
-	switch fmt.Sprintf("%v", args) { // what play N's switch asks (queue.go)
+	switch fmt.Sprintf("%v", args) {
 	case "[get_property playlist-count]":
 		return float64(p.enqueued), nil
 	case "[get_property playlist-pos]":
@@ -54,16 +52,8 @@ func (p *sessionPlayer) count(cmd string) (n int) {
 	return n
 }
 
-// TestPlaySessionPrompt drives the prompt the way a user would. Verbs run
-// against the live App; a typo costs one line, not the session (urfave would
-// otherwise os.Exit(3) on an unknown verb and kill this test binary); a `play`
-// typed at the prompt queues into THIS session rather than nesting another —
-// nesting would send a second stop; and nothing after `q` runs.
 func TestPlaySessionPrompt(t *testing.T) {
 	app, _, _, _ := wiredApp()
-	// A nested session would be a non-terminal one here (the fake App's stdin is
-	// a reader), and only that kind polls idle-active — so any poll means `play`
-	// at the prompt nested. The script lets such a poll finish instead of hang.
 	p := &sessionPlayer{idle: []bool{false, true}}
 	app.Play = p
 
@@ -80,8 +70,6 @@ func TestPlaySessionPrompt(t *testing.T) {
 	if p.enqueued != 1 {
 		t.Errorf("`play 1` at the prompt enqueued %d tracks, want 1", p.enqueued)
 	}
-	// One stop, from q. `play 1` at the prompt switches without stopping:
-	// nothing changes until the new track is in hand (queue.go, review R5).
 	if n := p.count("[stop]"); n != 1 {
 		t.Errorf("sent stop %d times, want exactly 1 (at q): %v", n, p.sent)
 	}
@@ -93,8 +81,6 @@ func TestPlaySessionPrompt(t *testing.T) {
 	}
 }
 
-// TestPlaySessionStopsOnEOFAndCtrlC: the two other ways out of the prompt. Both
-// must stop playback, because the bridge closes with this process.
 func TestPlaySessionStopsOnEOFAndCtrlC(t *testing.T) {
 	for name, run := range map[string]func(*sessionPlayer){
 		"eof": func(p *sessionPlayer) {
@@ -105,7 +91,7 @@ func TestPlaySessionStopsOnEOFAndCtrlC(t *testing.T) {
 		"ctrl-c": func(p *sessionPlayer) {
 			app, _, _, _ := wiredApp()
 			app.Play = p
-			r, w := io.Pipe() // never written: only the signal can end this
+			r, w := io.Pipe()
 			defer w.Close()
 			sig := make(chan os.Signal, 1)
 			sig <- os.Interrupt
@@ -120,9 +106,6 @@ func TestPlaySessionStopsOnEOFAndCtrlC(t *testing.T) {
 	}
 }
 
-// TestWaitForQueue: the non-terminal session. It holds the bridge while mpv is
-// busy and lets go once the queue drains — without a stop, because nothing is
-// left to cut off. Interrupted, it stops; with no daemon it does not wait.
 func TestWaitForQueue(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -156,8 +139,6 @@ func TestWaitForQueue(t *testing.T) {
 	}
 }
 
-// TestBannerStaysOffInsideASession: verbs typed at the prompt carry the banner
-// hook too, and the window that opened the session already showed it once.
 func TestBannerStaysOffInsideASession(t *testing.T) {
 	app, _, _, _ := wiredApp()
 	var out bytes.Buffer

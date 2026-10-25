@@ -1,5 +1,7 @@
 # chainsmoke
 
+![logo](chainsmokelogo.jpg)
+
 A command-line SoundCloud player that sends everything over Tor.
 
 chainsmoke searches SoundCloud, lists a user's likes or a playlist, and plays

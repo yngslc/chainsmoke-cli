@@ -8,59 +8,11 @@ import (
 	"time"
 )
 
-// DNS-leak assertion (T2.5).
-//
-// The strong half of this property is STRUCTURAL, not tested at runtime:
-// connectRequest encodes the destination as SOCKS5 ATYP=0x03 and hands the
-// hostname to Tor as bytes, so the exit performs the lookup and no local
-// resolver is ever consulted. That is what socks5h:// means, made structural
-// rather than configured, and TestConnectRequestNeverResolvesHostnames pins it.
-// Nothing in the data path can regress without that test going red.
-//
-// So what is left for a runtime check? Not "did we leak" — we cannot leak by
-// construction. What remains is a weaker question: does this host have a
-// working local resolver at all? If it does, anything on this machine that
-// bypasses the bridge (a child process misconfigured, a future code path using
-// http.Get directly) would be visible to it. It is asked with a neutral name
-// (probeName), never a SoundCloud one, and the answer is approximate: split
-// DNS can send SoundCloud names to a different resolver, and a hosts-file
-// entry answers them with no query at all (CH-DEBATE-2026-10-03 #7). Kept
-// anyway — dev's call, 2026-10-03: approximate, cheap, and honest about it.
-//
-// SCOPE — read before trusting this:
-//
-//	Covers:     what THIS host's resolver is able to see.
-//	Does NOT:   prove child processes (yt-dlp, mpv, ffmpeg) route DNS through
-//	            the bridge. They have their own resolvers and never consult
-//	            ours; they are covered only by inheriting http_proxy, which is
-//	            precisely the unverified assumption T7.3 exists to close.
-//
-// The real assertion — a tshark capture proving zero plaintext DNS for
-// *.sndcdn.com / soundcloud.com left the host during a play — is a CI job
-// (T7.2). A process cannot prove that about itself; do not pretend otherwise.
-
-// probeName is what `audit` resolves to answer "would a lookup that bypassed
-// the bridge be visible to a local resolver?". It is deliberately NOT a
-// SoundCloud name. This probe used to resolve soundcloud.com and sndcdn.com,
-// i.e. send on every `audit` the exact plaintext query INSTRUCTIONS.md:128 says
-// must fail the build (found 2026-10-01: review N-4, debate claim 4). A
-// neutral name still shows whether a local resolver answers, without telling
-// it anything — approximately, since split DNS and hosts files can treat
-// SoundCloud names differently (see the comment at the top of this file).
 var probeName = "example.com"
 
-// dnsProbeTimeout keeps `audit` responsive on a host with no working resolver,
-// where a lookup would otherwise sit through the full system retry schedule.
 const dnsProbeTimeout = 2 * time.Second
 
 // CheckLocalDNSVisibility asks whether this host's resolver can see a name.
-//
-// Interpretation is the subtle part, so it is stated rather than implied: a
-// successful local resolution is NOT proof of a leak in chainsmoke's data path
-// — the stream still goes through the bridge. It IS proof that the local
-// resolver (and whoever operates it: ISP, DNS provider, corporate middlebox) is
-// in a position to observe a lookup should anything ever bypass the bridge.
-// That is a finding to report, not a failure to abort on.
 func CheckLocalDNSVisibility(ctx context.Context, host string) (visible bool, detail string) {
 	ctx, cancel := context.WithTimeout(ctx, dnsProbeTimeout)
 	defer cancel()
@@ -81,8 +33,7 @@ func CheckLocalDNSVisibility(ctx context.Context, host string) (visible bool, de
 	}
 }
 
-// AuditDNS probes the local resolver with probeName. Returns whether it
-// answered, plus one report line.
+// AuditDNS probes the local resolver with probeName.
 func AuditDNS(ctx context.Context) (visible bool, lines []string) {
 	v, detail := CheckLocalDNSVisibility(ctx, probeName)
 	return v, []string{detail}

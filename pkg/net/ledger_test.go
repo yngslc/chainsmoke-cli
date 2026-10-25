@@ -10,9 +10,6 @@ import (
 	"time"
 )
 
-// connectVia drives one raw CONNECT through the bridge and returns the status
-// code. Raw rather than via http.Transport because the point of these tests is
-// what the BRIDGE recorded, not whether Go's client is happy.
 func connectVia(t *testing.T, b *ConnectBridge, request string) int {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", strings.TrimPrefix(b.ProxyURL(), "http://"), 2*time.Second)
@@ -32,9 +29,6 @@ func connectVia(t *testing.T, b *ConnectBridge, request string) int {
 	return resp.StatusCode
 }
 
-// deadAddr returns an address nothing is listening on: bind an ephemeral port,
-// then give it back. Hardcoding one would make the test depend on what else
-// this machine happens to be running.
 func deadAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -46,9 +40,6 @@ func deadAddr(t *testing.T) string {
 	return addr
 }
 
-// TestEgressLedgerRecordsTunnels is T7.2's core claim: the bridge can account
-// for every tunnel it opened, because a CONNECT that did not pass through here
-// was not proxied at all.
 func TestEgressLedgerRecordsTunnels(t *testing.T) {
 	fs := newFakeSocks(t, false)
 	cb, err := StartConnectBridge(fs.addr(), false)
@@ -81,17 +72,12 @@ func TestEgressLedgerRecordsTunnels(t *testing.T) {
 		t.Errorf("Refused/Failed = %d/%d, want 0/0 on a clean run", l.Refused, l.Failed)
 	}
 
-	// The classification is what makes the ledger readable: a host we have no
-	// business reaching must stand out, and the SoundCloud one must not.
 	unexpected := l.UnexpectedTargets()
 	if len(unexpected) != 1 || unexpected[0] != "cdn.example.net:443" {
 		t.Errorf("UnexpectedTargets() = %v, want [cdn.example.net:443]", unexpected)
 	}
 }
 
-// TestEgressLedgerSnapshotIsACopy: audit formats the ledger while the bridge
-// may still be serving. Handing out the live map would race, and -race in CI is
-// where that surfaces, so pin the copy explicitly.
 func TestEgressLedgerSnapshotIsACopy(t *testing.T) {
 	l := newLedger()
 	l.connect("api-v2.soundcloud.com:443")
@@ -104,9 +90,6 @@ func TestEgressLedgerSnapshotIsACopy(t *testing.T) {
 	}
 }
 
-// TestEgressLedgerRecordsRefusals: a non-CONNECT request is a child trying to
-// push plaintext through us. The bridge already refuses it (T2.2); T7.2 is the
-// part that lets audit say how often that happened.
 func TestEgressLedgerRecordsRefusals(t *testing.T) {
 	fs := newFakeSocks(t, false)
 	cb, err := StartConnectBridge(fs.addr(), false)
@@ -128,9 +111,6 @@ func TestEgressLedgerRecordsRefusals(t *testing.T) {
 	}
 }
 
-// TestEgressLedgerRecordsFailures separates "SoundCloud is blocked on this
-// circuit" from "nothing was ever attempted". Both leave Targets looking
-// unremarkable; only Failed tells them apart.
 func TestEgressLedgerRecordsFailures(t *testing.T) {
 	cb, err := StartConnectBridge(deadAddr(t), false)
 	if err != nil {
@@ -146,16 +126,11 @@ func TestEgressLedgerRecordsFailures(t *testing.T) {
 	if l.Failed != 1 {
 		t.Errorf("Failed = %d, want 1", l.Failed)
 	}
-	// Attempted still counts as attempted: the destination was disclosed to the
-	// dialer even though no tunnel came of it.
 	if got := l.Targets["api-v2.soundcloud.com:443"]; got != 1 {
 		t.Errorf("Targets[api-v2...] = %d, want 1 — a failed CONNECT was still an attempt", got)
 	}
 }
 
-// TestEgressLedgerNormalizesPort: the bridge defaults a portless authority to
-// 443 before dialing, so the ledger must record what was actually dialed rather
-// than what was typed.
 func TestEgressLedgerNormalizesPort(t *testing.T) {
 	fs := newFakeSocks(t, false)
 	cb, err := StartConnectBridge(fs.addr(), false)
@@ -174,15 +149,11 @@ func TestEgressLedgerNormalizesPort(t *testing.T) {
 	}
 }
 
-// TestEgressLedgerUnobservableWithoutOwnBridge is the honesty test. With a
-// user-supplied --proxy or in DIRECT mode we own no bridge and can see nothing;
-// reporting that as an empty ledger would render in audit as "nothing left this
-// machine", which is a lie.
 func TestEgressLedgerUnobservableWithoutOwnBridge(t *testing.T) {
 	for _, b := range []*Bridge{
-		{},                                  // fresh, Up never called
-		{override: "http://127.0.0.1:8118"}, // user --proxy
-		{direct: true, allowDirect: true},   // DIRECT with opt-in
+		{},
+		{override: "http://127.0.0.1:8118"},
+		{direct: true, allowDirect: true},
 	} {
 		l := b.EgressLedger()
 		if l.Observed {
@@ -194,11 +165,6 @@ func TestEgressLedgerUnobservableWithoutOwnBridge(t *testing.T) {
 	}
 }
 
-// TestVerifyIsAccountedFor: the self-test dials the SOCKS dialer directly
-// instead of looping through our own listener, so it is the one tunnel that can
-// silently escape the ledger. It is also the ONLY tunnel a bare `chainsmoke
-// audit` opens — that verb runs no yt-dlp and no mpv — so missing it would make
-// audit's ledger permanently, and misleadingly, empty.
 func TestVerifyIsAccountedFor(t *testing.T) {
 	fs := newFakeSocks(t, false)
 	cb, err := StartConnectBridge(fs.addr(), false)
@@ -220,9 +186,6 @@ func TestVerifyIsAccountedFor(t *testing.T) {
 	}
 }
 
-// TestVerifyFailureIsAccountedFor: a self-test that could not reach Tor still
-// disclosed the destination to the dialer, and telling "Tor is down" apart from
-// "nothing was attempted" is exactly what Failed is for.
 func TestVerifyFailureIsAccountedFor(t *testing.T) {
 	cb, err := StartConnectBridge(deadAddr(t), false)
 	if err != nil {

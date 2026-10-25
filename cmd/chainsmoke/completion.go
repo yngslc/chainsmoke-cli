@@ -7,19 +7,6 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-// -----------------------------------------------------------------------------
-// Shell completion (TASKS.md T8.3)
-// -----------------------------------------------------------------------------
-//
-// urfave/cli already answers the completion PROTOCOL: with EnableBashCompletion
-// set, `chainsmoke <words> --generate-bash-completion` prints the candidates for
-// that position. What it does not ship is anything a user can install, only two
-// files in its own repo — so `chainsmoke completion bash` emits the glue here.
-//
-// Fish is different and gets the library's real generator: fish completions are
-// declarative, so ToFishCompletion writes out every verb, alias and flag with
-// its usage text, which is strictly better than a callback.
-
 func completionCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "completion",
@@ -38,7 +25,6 @@ func completionCommand() *cli.Command {
 			case "zsh":
 				fmt.Print(zshCompletion)
 			case "fish":
-				// The library's generator: declarative, with usage strings.
 				s, err := c.App.ToFishCompletion()
 				if err != nil {
 					return fmt.Errorf("generate fish completion: %w", err)
@@ -59,14 +45,6 @@ func completionCommand() *cli.Command {
 	}
 }
 
-// bashCompletion re-asks the binary at every keystroke rather than baking a
-// list in, so it does not go stale when a verb is added. Adapted from
-// urfave/cli's autocomplete/bash_autocomplete (MIT).
-//
-// -o bashdefault -o default let filenames still complete after `play < `.
-// urfave's own script adds -o nospace; it is left off here because every
-// completion this CLI offers is a whole word, and suppressing the trailing
-// space makes each one need an extra keystroke.
 const bashCompletion = `# chainsmoke bash completion
 _chainsmoke_complete() {
     local cur opts
@@ -85,8 +63,6 @@ _chainsmoke_complete() {
 complete -o bashdefault -o default -F _chainsmoke_complete chainsmoke
 `
 
-// zshCompletion mirrors the bash one through zsh's completion system. Adapted
-// from urfave/cli's autocomplete/zsh_autocomplete (MIT).
 const zshCompletion = `#compdef chainsmoke
 # chainsmoke zsh completion
 

@@ -9,10 +9,6 @@ import (
 	"chainsmoke/pkg/core"
 )
 
-// isolate points both store directories at the test's own temp dir. Setting the
-// XDG vars is what keeps this test off the developer's real cache — and it
-// works on Windows too, because core's path helpers check the env FIRST and only
-// then fall back to %TEMP% / %LOCALAPPDATA%.
 func isolate(t *testing.T) (runtime, state string) {
 	t.Helper()
 	root := t.TempDir()
@@ -29,11 +25,6 @@ var sample = []core.Track{
 		Permalink: "https://soundcloud.com/ghostinnafurcoat/pola-woman"},
 }
 
-// TestRuntimeStoreSurvivesTheProcess is T4.1's whole reason to exist: `search`
-// and `play N` are two short-lived processes under T0.1(a), so a second Store
-// built from scratch — as the next invocation would — has to see the first
-// one's results. An in-memory slice cannot do this, which is why it was a
-// documented gap before Phase 4.
 func TestRuntimeStoreSurvivesTheProcess(t *testing.T) {
 	isolate(t)
 
@@ -41,7 +32,7 @@ func TestRuntimeStoreSurvivesTheProcess(t *testing.T) {
 		t.Fatalf("SaveResults: %v", err)
 	}
 
-	next := New(false, false) // a fresh process would build exactly this
+	next := New(false, false)
 	got, err := next.Result(2)
 	if err != nil {
 		t.Fatalf("Result(2): %v", err)
@@ -49,15 +40,11 @@ func TestRuntimeStoreSurvivesTheProcess(t *testing.T) {
 	if got.Permalink != sample[1].Permalink {
 		t.Errorf("Result(2).Permalink = %q, want %q", got.Permalink, sample[1].Permalink)
 	}
-	// The permalink is the field that matters: it never reaches the terminal
-	// (invariant #3), so the store is the only thing carrying it to `play N`.
 	if got.Title != "Pola Woman" || got.Uploader != "Roshina" || got.Duration != 160 {
 		t.Errorf("round-trip lost fields: %+v", got)
 	}
 }
 
-// TestRuntimeStoreIsWhereT4_1SaysItIs: the file has to land in the runtime dir,
-// 0700, or the "wiped by logout" property the design leans on is not true.
 func TestRuntimeStoreLocationAndMode(t *testing.T) {
 	runtimeDir, stateDir := isolate(t)
 
@@ -73,7 +60,6 @@ func TestRuntimeStoreLocationAndMode(t *testing.T) {
 	assertPrivateMode(t, runtimeDir)
 }
 
-// TestDiskStore covers T4.2: --remember writes to the state dir and only there.
 func TestDiskStore(t *testing.T) {
 	runtimeDir, stateDir := isolate(t)
 
@@ -97,9 +83,6 @@ func TestDiskStore(t *testing.T) {
 	assertPrivateMode(t, stateDir)
 }
 
-// TestPrivateWritesNothing is T4.3, and it asserts the property rather than the
-// implementation: after a --private run, the filesystem must be untouched. The
-// bash prototype passed a "has a guard" review and failed this one (T1.8).
 func TestPrivateWritesNothing(t *testing.T) {
 	runtimeDir, stateDir := isolate(t)
 
@@ -113,8 +96,6 @@ func TestPrivateWritesNothing(t *testing.T) {
 		}
 	}
 
-	// Within the run it still works, so `search --private` can print numbered
-	// results; across processes it deliberately cannot.
 	if got, err := s.Result(1); err != nil || got.Title != "Shanghai Lullaby" {
 		t.Errorf("in-process Result(1) = %+v, %v; want the saved track", got, err)
 	}
@@ -123,8 +104,6 @@ func TestPrivateWritesNothing(t *testing.T) {
 	}
 }
 
-// TestPrivateOverridesRemember: invariant #4. Asking for memory-only while
-// --remember is also set must not persist a single byte.
 func TestPrivateOverridesRemember(t *testing.T) {
 	runtimeDir, stateDir := isolate(t)
 
@@ -138,9 +117,6 @@ func TestPrivateOverridesRemember(t *testing.T) {
 	}
 }
 
-// TestResultsIsTheWholeSet: the play session snapshots its list with Results()
-// (cmd/chainsmoke/queue.go), so it must return exactly the saved set, in
-// order, from disk and from --private's memory alike.
 func TestResultsIsTheWholeSet(t *testing.T) {
 	want := []core.Track{{Title: "one", Permalink: "p1"}, {Title: "two", Permalink: "p2"}}
 	for name, s := range map[string]*Store{"disk": {dir: t.TempDir()}, "private": {}} {
@@ -154,9 +130,6 @@ func TestResultsIsTheWholeSet(t *testing.T) {
 	}
 }
 
-// TestPurgeWipesBothStores is T4.4: purge is not "purge whichever store this
-// process happens to be using". A user who ran --remember yesterday and purges
-// today without the flag must still lose the persisted set.
 func TestPurgeWipesBothStores(t *testing.T) {
 	runtimeDir, stateDir := isolate(t)
 
@@ -176,15 +149,11 @@ func TestPurgeWipesBothStores(t *testing.T) {
 		}
 	}
 
-	// And the tool still works afterwards: purge removes state, not the app.
 	if err := New(false, false).SaveResults(sample); err != nil {
 		t.Errorf("SaveResults after purge: %v", err)
 	}
 }
 
-// TestPurgeOnAnEmptyMachine: purging before anything was ever stored is the
-// common case for a privacy tool, and it must be silent success, not an error
-// about a missing directory.
 func TestPurgeOnAnEmptyMachine(t *testing.T) {
 	isolate(t)
 	if err := New(false, false).Purge(); err != nil {
@@ -192,8 +161,6 @@ func TestPurgeOnAnEmptyMachine(t *testing.T) {
 	}
 }
 
-// TestResultBounds pins the two messages the CLI leans on — smoke.ps1 matches
-// "no cached result", and a user who searched 5 things wants to know that.
 func TestResultBounds(t *testing.T) {
 	isolate(t)
 	s := New(false, false)
@@ -211,8 +178,6 @@ func TestResultBounds(t *testing.T) {
 	}
 }
 
-// TestCorruptCacheIsRecoverable: a half-written or hand-edited file must not
-// wedge the tool. Searching again is the fix, so the error has to say so.
 func TestCorruptCacheIsRecoverable(t *testing.T) {
 	runtimeDir, _ := isolate(t)
 	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
@@ -231,9 +196,6 @@ func TestCorruptCacheIsRecoverable(t *testing.T) {
 	}
 }
 
-// TestSaveIsAtomic: a reader must never see a partial file. The observable
-// proof is that no stray temp file survives a save — a leaked one would also be
-// an unprotected copy of the user's permalinks.
 func TestSaveLeavesNoTempFiles(t *testing.T) {
 	runtimeDir, _ := isolate(t)
 	s := New(false, false)
@@ -255,12 +217,10 @@ func TestSaveLeavesNoTempFiles(t *testing.T) {
 	}
 }
 
-// assertPrivateMode checks the 0700 the design leans on. Windows reports a
-// synthesized mode, so the assertion is unix-only rather than wrong everywhere.
 func assertPrivateMode(t *testing.T, dir string) {
 	t.Helper()
 	if os.PathSeparator == '\\' {
-		return // Windows: the directory ACL, not the mode bits, is the control
+		return
 	}
 	fi, err := os.Stat(dir)
 	if err != nil {
@@ -278,12 +238,6 @@ func assertPrivateMode(t *testing.T, dir string) {
 	}
 }
 
-// --- T7.1: describing the store for `audit` -----------------------------------
-
-// TestDescribeNamesTheBackendAndCount: `audit` answers "what does this machine
-// still hold?", and the answer differs for each of the three modes. Getting the
-// mode wrong here would tell a --private user their permalinks are on disk, or
-// worse, tell a --remember user they are not.
 func TestDescribeNamesTheBackendAndCount(t *testing.T) {
 	runtimeDir, stateDir := isolate(t)
 
@@ -295,8 +249,6 @@ func TestDescribeNamesTheBackendAndCount(t *testing.T) {
 	}{
 		{"runtime", false, false, "runtime (ephemeral)", runtimeDir, len(sample)},
 		{"disk", true, false, "disk (--remember)", stateDir, len(sample)},
-		// --private reads nothing, so it must report 0 even though the other two
-		// stores on this machine are full — that is T4.3's isolation, restated.
 		{"private", false, true, "memory (--private", "", 0},
 	}
 	for _, tc := range cases {
@@ -321,8 +273,6 @@ func TestDescribeNamesTheBackendAndCount(t *testing.T) {
 	}
 }
 
-// TestDescribeOnAnEmptyMachine: never having searched is not an error, and
-// `audit` must not fail on a fresh install.
 func TestDescribeOnAnEmptyMachine(t *testing.T) {
 	isolate(t)
 
@@ -335,9 +285,6 @@ func TestDescribeOnAnEmptyMachine(t *testing.T) {
 	}
 }
 
-// TestDescribeSurvivesACorruptCache: a half-written results.json already
-// degrades to "no results" for `play` (TestCorruptCacheIsRecoverable). Audit
-// must degrade the same way instead of reporting a count it could not read.
 func TestDescribeSurvivesACorruptCache(t *testing.T) {
 	runtimeDir, _ := isolate(t)
 
@@ -358,11 +305,6 @@ func TestDescribeSurvivesACorruptCache(t *testing.T) {
 	}
 }
 
-// describer asserts through core.StoreDescriber rather than calling the method
-// on *Store directly. Audit reaches the store as an interface value and skips
-// the whole section when the assertion fails, so a New() that stopped returning
-// a describing store would silently shorten the report — this is where that
-// gets caught.
 func describer(t *testing.T, s core.Store) core.StoreDescriber {
 	t.Helper()
 	d, ok := s.(core.StoreDescriber)

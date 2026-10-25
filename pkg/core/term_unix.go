@@ -8,16 +8,10 @@ import (
 	"unsafe"
 )
 
-// winsize mirrors struct winsize from <sys/ioctl.h>. Only Col is read, but the
-// whole struct has to be passed or the kernel writes past our buffer.
 type winsize struct {
 	Row, Col, Xpixel, Ypixel uint16
 }
 
-// isTerminal asks the tty driver, which answers only for a real terminal:
-// /dev/null is a character device as well, so the device bit alone would call
-// it one. TIOCGWINSZ rather than TCGETS because it is spelled the same on every
-// target this file builds for.
 func isTerminal(f *os.File) bool {
 	var ws winsize
 	_, _, errno := syscall.Syscall(
@@ -29,13 +23,6 @@ func isTerminal(f *os.File) bool {
 	return errno == 0
 }
 
-// terminalWidth asks the tty how wide it is, returning 0 when stdout is not one.
-//
-// Done with a raw ioctl rather than golang.org/x/term to keep the dependency
-// set at one module (see table.go for why that matters here). The
-// uintptr(unsafe.Pointer(&ws)) form is the sanctioned syscall idiom — vet's
-// unsafeptr check permits it precisely in a syscall argument, because the
-// pointer cannot be moved across the call.
 func terminalWidth() int {
 	var ws winsize
 	_, _, errno := syscall.Syscall(
