@@ -15,7 +15,7 @@ account, no login and no API key.
 
 ## Requirements
 
-- **mpv**. Tested with mpv 0.41.
+- **mpv**. 
 - **yt-dlp** with curl_cffi, for browser TLS impersonation:
   `pip install "yt-dlp[default,curl-cffi]"`. Without curl_cffi, pass
   `--impersonate ''`.
@@ -26,8 +26,6 @@ account, no login and no API key.
   - the Tor Browser, with `--tor-socks 127.0.0.1:9150`.
 - **Go 1.26.5 or newer**, to build it.
 
-chainsmoke is developed and tested on Windows 10 and on Ubuntu under WSL. The
-macOS builds compile but have not been tested.
 
 ## Build
 
@@ -36,10 +34,6 @@ CGO_ENABLED=0 go build -trimpath -o chainsmoke ./cmd/chainsmoke
 sudo install -m755 chainsmoke /usr/local/bin/chainsmoke   # optional: run it as `chainsmoke`, from anywhere
 ```
 
-`CGO_ENABLED=0` makes the binary static, as release builds are. A build like
-this reports its version as `development`. For
-release builds, `build.ps1 -Version X` stamps the version, and `-All`
-cross-builds Windows, Linux and macOS (amd64 and arm64) into `dist/`.
 
 ## Usage
 
@@ -76,8 +70,7 @@ prompt:
 While a track plays, the next one resolves in the background, so `next`
 usually starts at once. If it has not finished resolving, `next` waits for it,
 and `play N`, or a `prev` from before where the list started, resolves its
-track first. Over Tor one resolve can take a minute. When a track ends by
-itself, the prompt says what is playing now and what comes next.
+track first. Over Tor one resolve can take a minute.
 
 With a URL piped in, there is no prompt. The session plays to the end of the
 track or set, and Ctrl+C stops it.
